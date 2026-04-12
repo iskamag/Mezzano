@@ -782,6 +782,38 @@ The values in the other lanes of the vector are indeterminate and may not be zer
   "MOVDQU"
   (setf (%%object-ref-sse-vector/128-unscaled object (the fixnum (* index 16))) value))
 
+(declaim (inline u32.4-aref (setf u32.4-aref)))
+
+(defun u32.4-aref (object &optional (index 0))
+  (check-type object (simple-array (unsigned-byte 32) (*)))
+  (make-sse-vector (logior (aref object (+ index 0))
+                           (ash (aref object (+ index 1)) 32)
+                           (ash (aref object (+ index 2)) 64)
+                           (ash (aref object (+ index 3)) 96))))
+
+(defun (setf u32.4-aref) (value object &optional (index 0))
+  (check-type object (simple-array (unsigned-byte 32) (*)))
+  (check-type value sse-vector)
+  (let ((raw-value (sse-vector-value value)))
+    (setf (aref object (+ index 0)) (ldb (byte 32 0) raw-value)
+          (aref object (+ index 1)) (ldb (byte 32 32) raw-value)
+          (aref object (+ index 2)) (ldb (byte 32 64) raw-value)
+          (aref object (+ index 3)) (ldb (byte 32 96) raw-value)))
+  value)
+
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (export 'u32.4-aref)
+  (c::define-transform u32.4-aref ((vector (simple-array (unsigned-byte 32) (*)) array-type) (index fixnum index-type))
+      ((:optimize (= safety 0) (= speed 3)))
+    `(the sse-vector (progn
+                       ,(c::insert-bounds-check vector array-type index index-type :adjust 3)
+                       (c::call %%object-ref-sse-vector/128-unscaled ,vector (c::call c::%fast-fixnum-* ,index '4)))))
+  (c::define-transform (setf u32.4-aref) ((sse-vector sse-vector) (vector (simple-array (unsigned-byte 32) (*)) array-type) (index fixnum index-type))
+      ((:optimize (= safety 0) (= speed 3)))
+    `(the sse-vector (progn
+                       ,(c::insert-bounds-check vector array-type index index-type :adjust 3)
+                       (c::call (setf %%object-ref-sse-vector/128-unscaled) ,sse-vector ,vector (c::call c::%fast-fixnum-* ,index '4))))))
+
 (defmethod print-object ((object sse-vector) stream)
   (print-unreadable-object (object stream :type t)
     (format stream "~32,'0X" (sse-vector-value object))))
