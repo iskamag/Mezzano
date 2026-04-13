@@ -25,9 +25,6 @@
     (:align (- (first (inst-operands inst)) (logand (dis:inst-offset inst) (1- (first (inst-operands inst))))))
     (t 4)))
 
-(defun load/store-exclusive (context word)
-  (values nil :load/store-exclusive))
-
 (defconstant +v-bit+ 26)
 (defconstant +l-bit+ 22)
 
@@ -95,6 +92,14 @@
           :v16 :v17 :v18 :v19 :v20 :v21 :v22 :v23
           :v24 :v25 :v26 :v27 :v28 :v29 :v30 :v31)
         register-number))
+
+(defun decode-cas (context word)
+  (values nil :cas))
+
+(defun load/store-exclusive (context word)
+  (if (logbitp 21 word)
+      (decode-cas context word)
+      (values nil :load/store-exclusive)))
 
 ;; Load/store no-allocate pair (offset)
 ;; Load/store register pair (post-indexed)

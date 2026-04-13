@@ -290,4 +290,9 @@ Make sure there is a virtio-net NIC attached.~%")
 ;; Ditch the debugger hook that was established earlier.
 (setf mezzano.debug:*global-debugger* nil)
 
+(when (mezzano.supervisor:running-in-ci-p)
+  (mezzano.supervisor:debug-print-line "****")
+  (mezzano.supervisor:debug-print-line "CI build completed successfully!")
+  (mezzano.supervisor:ci-exit))
+
 ;; Done.

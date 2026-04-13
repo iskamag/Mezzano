@@ -2009,6 +2009,8 @@
 
 (define-atomic-ops swp #b1000)
 (define-atomic-ops ldadd #b000 :allow-zr t)
+(define-atomic-ops ldset #b011 :allow-zr t)
+(define-atomic-ops ldeor #b010 :allow-zr t)
 
 (define-instruction movi.v (type dst imm &optional (shift :lsl) (amount 0))
   (check-register-class dst :fp-128)

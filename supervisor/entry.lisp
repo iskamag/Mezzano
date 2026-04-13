@@ -12,6 +12,12 @@
 
 ;;; <<<<<<
 
+;; Cold-generator will set this to T if we build in CI.
+(sys.int::defglobal sys.int::*running-in-ci*)
+
+(defun running-in-ci-p ()
+  (boundp 'sys.int::*running-in-ci*))
+
 (sys.int::defglobal *boot-information-page*)
 
 (defconstant +virtual-address-bits+ 48)

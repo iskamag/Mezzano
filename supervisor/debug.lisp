@@ -352,6 +352,7 @@
     (when (and (boundp '*panic-in-progress*)
                *panic-in-progress*)
       (arch-pre-panic)
+      (ci-exit t)
       (loop (%arch-panic-stop)))
     ;; Stop the world, just in case printing the backtrace requires paging stuff in.
     (setf *world-stopper* (current-thread)
@@ -368,6 +369,7 @@
       (when extra
         (funcall extra)))
     (debug-dump)
+    (ci-exit t)
     (loop (%arch-panic-stop))))
 
 (defmacro ensure (condition &rest things)

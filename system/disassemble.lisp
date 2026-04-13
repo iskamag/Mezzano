@@ -41,7 +41,8 @@
            #:label
 
            #:decode-object-from-integer
-           #:slot-to-thread-slot-name))
+           #:slot-to-thread-slot-name
+           #:type-tag-to-name))
 
 (in-package :mezzano.disassemble)
 

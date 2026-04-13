@@ -1824,3 +1824,29 @@ Remaining values describe the effective address: base index scale disp rip-relat
 (define-prefetch-instruction prefetcht1 #x18 2)
 (define-prefetch-instruction prefetcht2 #x18 3)
 (define-prefetch-instruction prefetchw #x0D 1)
+
+;; Non-temporal stores
+(define-instruction movnti32 (dst src)
+  (when (memory-operand-p dst)
+    (modrm :gpr-32 dst src '(#x0F #xC3))))
+
+(define-instruction movnti64 (dst src)
+  (when (memory-operand-p dst)
+    (modrm :gpr-64 dst src '(#x0F #xC3))))
+
+(define-instruction movntdq (dst src)
+  (when (and (memory-operand-p dst)
+             (eql (reg-class src) :xmm))
+    (emit #x66)
+    (modrm :xmm dst src '(#x0F #xE7))))
+
+(define-instruction movntps (dst src)
+  (when (and (memory-operand-p dst)
+             (eql (reg-class src) :xmm))
+    (modrm :xmm dst src '(#x0F #x2B))))
+
+(define-instruction movntpd (dst src)
+  (when (and (memory-operand-p dst)
+             (eql (reg-class src) :xmm))
+    (emit #x66)
+    (modrm :xmm dst src '(#x0F #x2B))))

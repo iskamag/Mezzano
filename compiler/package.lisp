@@ -617,6 +617,8 @@
            #:stop-profiling
            #:virtualbox-read-event
            #:virtualbox-graphics-update-framebuffer
+           #:running-in-ci-p
+           #:ci-exit
 
            #:platform-irq
            #:irq-attach
@@ -1220,3 +1222,8 @@
    #:weak-alist-assoc
    #:weak-alist-rassoc
    #:weak-alist-value))
+
+(defpackage :mezzano.fast-eval
+  (:export #:eval-in-lexenv
+           #:*lazy-lambda-evaluation*)
+  (:use :cl))

@@ -365,16 +365,16 @@
   (declare (type fixnum destination-address source-address count)
            (optimize speed (safety 0) (debug 1)))
   (when (plusp count)
-    (loop for i of-type fixnum below count by 2
+    (loop for i of-type fixnum below (logand count -2) by 2
           do (multiple-value-bind (v1 v2)
                  (sys.int::memref-t-pair source-address)
                (setf (sys.int::memref-t-pair destination-address)
                      (values v1 v2)))
              (setf destination-address (the fixnum (+ destination-address 16)))
              (setf source-address (the fixnum (+ source-address 16))))
-    (when (eq (the fixnum (logand count 1)) 1) ; copy last odd word
-      (setf (sys.int::memref-t destination-address 0)
-            (sys.int::memref-t source-address 0))))
+    (unless (eq (the fixnum (logand count 1)) 0) ; copy last odd word
+      (setf (sys.int::memref-t destination-address)
+            (sys.int::memref-t source-address))))
   (values))
 
 (defun sys.int::%fill-words (destination-address value count)
@@ -386,7 +386,7 @@
       (setf (sys.int::memref-t destination-address) value)
       (setf destination-address (the fixnum (+ destination-address 8)))
       (decf count))
-    (loop for i of-type fixnum below count by 2
+    (loop for i of-type fixnum below (logand count -2) by 2
           do (setf (sys.int::memref-t-pair destination-address)
                    (values value value))
              (setf destination-address (the fixnum (+ destination-address 16))))

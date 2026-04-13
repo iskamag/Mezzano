@@ -219,47 +219,31 @@
                               :inputs (list lhs rhs)
                               :outputs (list result))))))
 
-(define-builtin mezzano.runtime::%fixnum-logand ((lhs rhs) result)
-  (emit (make-instance 'arm64-instruction
-                       :opcode 'lap:and
-                       :operands (list result lhs rhs)
-                       :inputs (list lhs rhs)
-                       :outputs (list result))))
-
-(define-builtin mezzano.compiler::%fast-fixnum-logand ((lhs rhs) result)
-  (emit (make-instance 'arm64-instruction
-                       :opcode 'lap:and
-                       :operands (list result lhs rhs)
-                       :inputs (list lhs rhs)
-                       :outputs (list result))))
-
-(define-builtin mezzano.runtime::%fixnum-logior ((lhs rhs) result)
-  (emit (make-instance 'arm64-instruction
-                       :opcode 'lap:orr
-                       :operands (list result lhs rhs)
-                       :inputs (list lhs rhs)
-                       :outputs (list result))))
-
-(define-builtin mezzano.compiler::%fast-fixnum-logior ((lhs rhs) result)
-  (emit (make-instance 'arm64-instruction
-                       :opcode 'lap:orr
-                       :operands (list result lhs rhs)
-                       :inputs (list lhs rhs)
-                       :outputs (list result))))
-
-(define-builtin mezzano.runtime::%fixnum-logxor ((lhs rhs) result)
-  (emit (make-instance 'arm64-instruction
-                       :opcode 'lap:eor
-                       :operands (list result lhs rhs)
-                       :inputs (list lhs rhs)
-                       :outputs (list result))))
-
-(define-builtin mezzano.compiler::%fast-fixnum-logxor ((lhs rhs) result)
-  (emit (make-instance 'arm64-instruction
-                       :opcode 'lap:eor
-                       :operands (list result lhs rhs)
-                       :inputs (list lhs rhs)
-                       :outputs (list result))))
+;; Bitwise ops
+(macrolet ((def (name inst)
+             `(define-builtin ,name ((lhs rhs) result)
+                (cond ((and (constant-value-p rhs 'integer)
+                            (lap:encodable-bit-mask-p (ash (fetch-constant-value rhs)
+                                                           sys.int::+n-fixnum-bits+)
+                                                      64))
+                       (emit (make-instance 'arm64-instruction
+                                            :opcode ',inst
+                                            :operands (list result lhs (ash (fetch-constant-value rhs)
+                                                                            sys.int::+n-fixnum-bits+))
+                                            :inputs (list lhs)
+                                            :outputs (list result))))
+                      (t
+                       (emit (make-instance 'arm64-instruction
+                                            :opcode ',inst
+                                            :operands (list result lhs rhs)
+                                            :inputs (list lhs rhs)
+                                            :outputs (list result))))))))
+  (def mezzano.runtime::%fixnum-logand lap:and)
+  (def mezzano.compiler::%fast-fixnum-logand lap:and)
+  (def mezzano.runtime::%fixnum-logior lap:orr)
+  (def mezzano.compiler::%fast-fixnum-logior lap:orr)
+  (def mezzano.runtime::%fixnum-logxor lap:eor)
+  (def mezzano.compiler::%fast-fixnum-logxor lap:eor))
 
 (define-builtin mezzano.runtime::%fixnum-< ((lhs rhs) :lt)
   (emit (make-instance 'arm64-instruction

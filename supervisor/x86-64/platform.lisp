@@ -51,3 +51,14 @@
   ;; Give up. Trash the IDT and trigger a page-fault to triple-fault the CPU.
   (%lidt 0 0)
   (sys.int::memref-unsigned-byte-8 0 0))
+
+(defconstant +isa-debug-exit-port+ #xF4
+  "I/O port for the QEMU isa-debug-exit device.")
+
+(defun ci-exit (&optional errorp)
+  (when (running-in-ci-p)
+    (setf (sys.int::io-port/8 +isa-debug-exit-port+)
+          ;; Annoyingly qemu will transform this code
+          ;; with (logior (ash code 1) 1) being the actual exit code.
+          ;; Effectively 3 for success, 1 for error.
+          (if errorp #x00 #x01))))

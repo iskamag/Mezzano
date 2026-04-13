@@ -432,7 +432,7 @@
                        :source object
                        :destination :x1))
   (emit (make-instance 'arm64-atomic-instruction
-                       :opcode 'lap:ldadd
+                       :opcode 'lap:ldaddal
                        :old-value result
                        :index offset
                        :rhs delta)))
@@ -446,7 +446,7 @@
                        :source object
                        :destination :x1))
   (emit (make-instance 'arm64-atomic-instruction
-                       :opcode 'lap:swp
+                       :opcode 'lap:swpal
                        :old-value result
                        :index offset
                        :rhs new)))
@@ -471,3 +471,29 @@
                        :result result
                        :current-value slot-value
                        :index offset)))
+
+;; (defun fixnum-logior (object slot value)
+;;   (prog1 (%object-ref-t object slot)
+;;     (setf (%object-ref-t object slot) (logior (%object-ref-t object slot) value)))
+(define-builtin sys.int::%atomic-fixnum-logior-object ((object offset delta) result)
+  (emit (make-instance 'ir:move-instruction
+                       :source object
+                       :destination :x1))
+  (emit (make-instance 'arm64-atomic-instruction
+                       :opcode 'lap:ldsetal
+                       :old-value result
+                       :index offset
+                       :rhs delta)))
+
+;; (defun fixnum-logxor (object slot value)
+;;   (prog1 (%object-ref-t object slot)
+;;     (setf (%object-ref-t object slot) (logxor (%object-ref-t object slot) value)))
+(define-builtin sys.int::%atomic-fixnum-logxor-object ((object offset delta) result)
+  (emit (make-instance 'ir:move-instruction
+                       :source object
+                       :destination :x1))
+  (emit (make-instance 'arm64-atomic-instruction
+                       :opcode 'lap:ldeoral
+                       :old-value result
+                       :index offset
+                       :rhs delta)))

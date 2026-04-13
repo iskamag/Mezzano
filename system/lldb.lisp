@@ -45,7 +45,8 @@
     mezzano.supervisor::%call-on-wired-stack-without-interrupts
     mezzano.supervisor::call-with-mutex
     ;; Hidden to prevent infinite rehash loops, printing instructions can cause GC cycles.
-    sys.int::find-hash-table-slot
+    sys.int::%find-hash-table-slot-standard-eq
+    sys.int::%find-hash-table-slot-standard-eql
     ))
 
 (defun single-step-wrapper (&rest args &closure call-me)
@@ -300,9 +301,9 @@ If TRIM-STEPPER-NOISE is true, then instructions executed as part of the trace p
                           (*trace-output* trace-output)
                           (*debug-io* debug-io)
                           (*query-io* query-io)
-                          (*the-debugger* (lambda (condition)
-                                            (declare (ignore condition))
-                                            (throw 'mezzano.supervisor:terminate-thread nil))))
+                          (*global-debugger* (lambda (condition)
+                                               (declare (ignore condition))
+                                               (throw 'mezzano.supervisor:terminate-thread nil))))
                       (loop
                          (when stopped
                            (return))
@@ -356,7 +357,15 @@ If TRIM-STEPPER-NOISE is true, then instructions executed as part of the trace p
                       (in-single-step-wrapper
                        (when (and (eql fn #'single-step-wrapper)
                                   (< single-step-wrapper-sp (mezzano.supervisor:thread-state-rsp thread))
-                                  (logtest #x8 (mezzano.supervisor:thread-state-rsp thread)))
+                                  ;; Look for a return by stack misalignment just before a ret
+                                  #+x86-64
+                                  (logtest #x8 (mezzano.supervisor:thread-state-rsp thread))
+                                  ;; Look for a ret instruction
+                                  #+arm64
+                                  (and (eql (function-code-byte fn offset) #xC0)
+                                       (eql (function-code-byte fn (+ offset 1)) #x03)
+                                       (eql (function-code-byte fn (+ offset 2)) #x5F)
+                                       (eql (function-code-byte fn (+ offset 3)) #xD6)))
                          (setf in-single-step-wrapper nil)))
                       (t
                        (when (and prev-fn

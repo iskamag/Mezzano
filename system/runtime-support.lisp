@@ -911,7 +911,8 @@ VALUE may be nil to make the fref unbound."
                                             docstring
                                             nil)
                                     nil
-                                    #+x86-64 :x86-64))
+                                    #+x86-64 :x86-64
+                                    #+arm64 :arm64))
        ',name)))
 
 (macrolet ((def (op)

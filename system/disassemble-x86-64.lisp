@@ -32,7 +32,7 @@
                           (eql (ea-disp (first (inst-operands instruction))) (- sys.int::+tag-object+))
                           (integerp (second (inst-operands instruction)))))
              ;; Probably a type check.
-             (let ((type-tag (type-tag-to-name (second (inst-operands instruction)))))
+             (let ((type-tag (dis:type-tag-to-name (second (inst-operands instruction)))))
                (when type-tag
                  (push type-tag annotations))))
            (dolist (operand (inst-operands instruction))
@@ -643,7 +643,7 @@
     nil ; 28
     nil
     (decode-cvt-2a)
-    nil
+    (decode-qq-pq sys.lap-x86:movntps sys.lap-x86:movntpd nil nil)
     (decode-cvt-2c)
     (decode-cvt-2d)
     (decode-v-w sys.lap-x86:ucomiss sys.lap-x86:ucomisd nil nil)
@@ -795,7 +795,7 @@
     (decode-eb-gb sys.lap-x86:xadd8) ; C0
     (decode-ev-gv sys.lap-x86:xadd16 sys.lap-x86:xadd32 sys.lap-x86:xadd64)
     (decode-sse-cmp)
-    nil
+    (decode-movnti)
     nil
     nil
     (decode-v-w-ib sys.lap-x86:shufps sys.lap-x86:shufpd nil nil)
@@ -831,7 +831,7 @@
     (decode-pq-qq sys.lap-x86:pmulhuw sys.lap-x86:pmulhuw nil nil)
     (decode-pq-qq sys.lap-x86:pmulhw sys.lap-x86:pmulhw nil nil)
     nil
-    nil
+    (decode-qq-pq nil sys.lap-x86:movntdq nil nil)
     (decode-pq-qq sys.lap-x86:psubsb sys.lap-x86:psubsb nil nil) ; E8
     (decode-pq-qq sys.lap-x86:psubsw sys.lap-x86:psubsw nil nil)
     (decode-pq-qq sys.lap-x86:pminsw sys.lap-x86:pminsw nil nil)
@@ -1450,6 +1450,17 @@
                         (32 (decode-gpr32 reg (rex-r info)))
                         (16 (decode-gpr16 reg (rex-r info))))
                       (decode-gpr32-or-mem r/m (rex-b info)))))
+
+(defun decode-movnti (context info)
+  (multiple-value-bind (reg r/m)
+      (disassemble-modr/m context info)
+    (ecase (operand-size info)
+      (64 (make-instruction 'sys.lap-x86:movnti64
+                            (decode-gpr64 reg (rex-r info))
+                            (decode-gpr64-or-mem r/m (rex-b info))))
+      (32 (make-instruction 'sys.lap-x86:movnti32
+                            (decode-gpr32 reg (rex-r info))
+                            (decode-gpr32-or-mem r/m (rex-b info)))))))
 
 (defun decode-xchg+r (context info)
   (declare (ignore context))

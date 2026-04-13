@@ -186,6 +186,9 @@ If NAME does not name a struct accessor, then NIL is returned."
                         when (eq ,cas-form ,old-sym)
                         return ,,(if no-result '(values) 'old-sym)))))))))))
 
+;; TODO: We've got atomic ops that perform these operations directly. Use
+;; them instead of expanding to CAS loops.
+
 (define-atomic-rmw-operation atomic-incf (&optional (delta 1))
   wrapping-fixnum-+
   %atomic-fixnum-add-symbol

@@ -38,9 +38,7 @@
 ;; the fast assembly allocation functions can use it directly.
 (defglobal *young-gen-newspace-bit-raw*)
 ;; Used to track the last address that was scanned in newspace
-(defglobal *scavenge-general-young-finger*)
 (defglobal *scavenge-general-old-finger*)
-(defglobal *scavenge-cons-young-finger*)
 (defglobal *scavenge-cons-old-finger*)
 
 (defglobal *gc-force-major-cycle* nil)
@@ -2351,7 +2349,7 @@ No type information will be provided."
                 (setf (%object-ref-t weak-pointer +weak-pointer-key+) new-key)
                 (scavengef (%object-ref-t weak-pointer +weak-pointer-value+) :major)
                 t)
-               (key-livep
+               (value-livep
                 ;; Value is live, scav key.
                 (setf (%object-ref-t weak-pointer +weak-pointer-value+) new-value)
                 (scavengef (%object-ref-t weak-pointer +weak-pointer-key+) :major)

@@ -1,10 +1,63 @@
 ;;;; The fast evaluator, passes most forms to the compiler
 
-(defpackage :mezzano.fast-eval
-  (:export #:eval-in-lexenv)
-  (:use :cl))
-
 (in-package :mezzano.fast-eval)
+
+(defparameter *lazy-lambda-evaluation* nil)
+
+;; Rather than immediately compiling lambda forms, we can defer compilation
+;; until the form is called, and compile then.
+(defclass lazy-eval-function ()
+  ((form :initarg :form :reader lazy-eval-function-form)
+   (env :initarg :env :reader lazy-eval-function-env)
+   (pathname :initarg :pathname :reader lazy-eval-function-pathname)
+   (tlf :initarg :tlf :reader lazy-eval-function-tlf)
+   (function :initform nil))
+  (:metaclass mezzano.clos:funcallable-standard-class))
+
+(defun lazy-eval-function-function (lazy-eval-function)
+  (with-slots (function) lazy-eval-function
+    (cond ((eql function :in-progress)
+           ;; This function is being compiled but the compiler is being invoked
+           ;; recursively on it, fall back to full-eval to avoid a recursive
+           ;; call into the compiler.
+           (mezzano.full-eval:eval-in-lexenv
+            (lazy-eval-function-form lazy-eval-function)
+            (lazy-eval-function-env lazy-eval-function)))
+          (function
+           ;; Already compiled.
+           function)
+          (t
+           (setf function :in-progress)
+           (let ((new-function
+                   (let ((*compile-file-pathname*
+                           (lazy-eval-function-pathname lazy-eval-function))
+                         (mezzano.internals::*top-level-form-number*
+                           (lazy-eval-function-tlf lazy-eval-function)))
+                     (eval-compile (lazy-eval-function-form lazy-eval-function)
+                                   (lazy-eval-function-env lazy-eval-function)))))
+             (mezzano.clos:set-funcallable-instance-function
+              lazy-eval-function new-function)
+             (setf function new-function))))))
+
+(defmethod mezzano.internals::funcallable-instance-lambda-expression ((function lazy-eval-function))
+  (function-lambda-expression
+   (lazy-eval-function-function function)))
+
+(defmethod mezzano.internals::funcallable-instance-debug-info ((function lazy-eval-function))
+  (mezzano.internals::function-debug-info
+   (lazy-eval-function-function function)))
+
+(defmethod mezzano.internals::funcallable-instance-compiled-function-p ((function lazy-eval-function))
+  t)
+
+(defmethod mezzano.debug:function-lambda-list ((function lazy-eval-function))
+  (mezzano.debug:function-lambda-list
+   (lazy-eval-function-function function)))
+
+(defmethod mezzano.debug:function-source-location ((function lazy-eval-function) &key offset)
+  (mezzano.debug:function-source-location
+   (lazy-eval-function-function function)
+   :offset offset))
 
 (defun eval-compile (form env)
   (let ((mezzano.compiler::*load-time-value-hook* 'mezzano.compiler::eval-load-time-value)
@@ -44,6 +97,9 @@
            (eval-setq rest env))
           (t (eval-one-setq var val env)))))
 
+(defun invoke-lazy-function (instance args)
+  (apply (lazy-eval-function-function instance) args))
+
 (defun eval-cons (form env)
   (case (first form)
     ((if)
@@ -61,7 +117,18 @@
          (rest form)
        (cond ((and (consp name)
                    (eql (first name) 'lambda))
-              (eval-compile form env))
+              (if *lazy-lambda-evaluation*
+                  (let ((instance (make-instance 'lazy-eval-function
+                                                 :form name
+                                                 :env env
+                                                 :pathname (or *compile-file-pathname*
+                                                               *load-pathname*)
+                                                 :tlf mezzano.internals::*top-level-form-number*)))
+                    (mezzano.clos:set-funcallable-instance-function
+                     instance (lambda (&rest args)
+                                (invoke-lazy-function instance args)))
+                    instance)
+                  (eval-compile form env)))
              (t (fdefinition name)))))
     ((progn)
      (eval-progn-body (rest form) env))

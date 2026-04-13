@@ -99,3 +99,21 @@
                (initialize-arm-rtc child address-cells size-cells)))
             (t
              (debug-print-line "unknown fdt node at " child " on simple-bus"))))))
+
+(sys.int::define-lap-function %semihosting-exit ((reason code))
+  ;; Set up parameter block at [sp]
+  (mezzano.lap.arm64:add :x0 :xzr :x0 :asr #.sys.int::+n-fixnum-bits+)
+  (mezzano.lap.arm64:add :x1 :xzr :x1 :asr #.sys.int::+n-fixnum-bits+)
+  (mezzano.lap.arm64:stp :x0 :x1 (:pre :sp -16))
+  ;; Do semihosting call
+  (mezzano.lap.arm64:mov :x0 #x18) ; SYS_EXIT
+  (mezzano.lap.arm64:add :x1 :sp 0)
+  (mezzano.lap.arm64:hlt #xF000)
+  ;; Drop parameter block and return
+  (mezzano.lap.arm64:add :sp :sp 16)
+  (mezzano.lap.arm64:ret))
+
+(defun ci-exit (&optional errorp)
+  (when (running-in-ci-p)
+    (%semihosting-exit #x20026 ; ADP_Stopped_ApplicationExit
+                       (if errorp #x01 #x00)))) ; error code

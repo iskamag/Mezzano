@@ -364,7 +364,8 @@ Returns NIL if the function captures no variables."
 
 (defun debugger-main (&optional condition)
   (with-standard-io-syntax
-    (let* ((*print-readably* nil)
+    (let* ((mezzano.fast-eval:*lazy-lambda-evaluation* nil)
+           (*print-readably* nil)
            (*standard-input* *debug-io*)
            (*standard-output* *debug-io*)
            (debug-level *debugger-depth*)

@@ -16,6 +16,10 @@
   (test 'eql :type (member eq eql equal equalp) :read-only t)
   (test-function (error "Unreachable, missing test-function") :type function :read-only t)
   (hash-function (error "Unreachable, missing hash-function") :type function :read-only t)
+  (gethash-fn nil :type (or null function))
+  (puthash-fn nil :type (or null function))
+  (cashash-fn nil :type (or null function))
+  (remhash-fn nil :type (or null function))
   (%count 0)
   (used 0)
   (rehash-size 1 :type (or (integer 1 *) (float (1.0) *)))
@@ -78,31 +82,43 @@
          (pathnamep object)))))
 
 (defun hash-table-size (hash-table)
-  (if (hash-table-weakness hash-table)
-      (%object-header-data (hash-table-storage hash-table))
-      (strong-hash-table-size hash-table)))
+  (let ((storage (hash-table-storage hash-table)))
+    (if (hash-table-weakness hash-table)
+        (weak-hash-table-size storage)
+        (strong-hash-table-size storage))))
 
 (defun hash-table-count (hash-table)
   (hash-table-%count hash-table))
 
-(defun strong-hash-table-size (hash-table)
-  (ash (%object-header-data (hash-table-storage hash-table)) -1))
+(declaim (inline strong-hash-table-size))
+(defun strong-hash-table-size (storage)
+  (the fixnum (ash (the fixnum (%object-header-data storage)) -1)))
+
+(defun weak-hash-table-size (storage)
+  (%object-header-data storage))
 
 ;; For strong hash-tables only.
+(declaim (inline hash-table-key-at (setf hash-table-key-at)
+                 hash-table-value-at (setf hash-table-value-at)))
 (defun hash-table-key-at (hash-table index)
-  (svref (hash-table-storage hash-table) (* index 2)))
-
-;; For strong hash-tables only.
+  (aref (hash-table-storage hash-table) (the fixnum (ash index 1))))
 (defun (setf hash-table-key-at) (value hash-table index)
-  (setf (svref (hash-table-storage hash-table) (* index 2)) value))
-
-;; For strong hash-tables only.
+  (setf (aref (hash-table-storage hash-table) (the fixnum (ash index 1))) value))
 (defun hash-table-value-at (hash-table index)
-  (svref (hash-table-storage hash-table) (1+ (* index 2))))
-
-;; For strong hash-tables only.
+  (aref (hash-table-storage hash-table) (the fixnum (1+ (the fixnum (ash index 1))))))
 (defun (setf hash-table-value-at) (value hash-table index)
-  (setf (svref (hash-table-storage hash-table) (1+ (* index 2))) value))
+  (setf (aref (hash-table-storage hash-table) (the fixnum (1+ (the fixnum (ash index 1))))) value))
+
+(defun weak-hash-table-entry-at (hash-table slot)
+  (aref (hash-table-storage hash-table) slot))
+
+;; Value should be either the unbound value, tombstone, or a weak pointer.
+(defun (setf weak-hash-table-entry-at) (value hash-table slot)
+  (setf (aref (hash-table-storage hash-table) slot) value))
+
+(defun set-full-weak-hash-table-entry (hash-table slot key value)
+  (setf (weak-hash-table-entry-at hash-table slot)
+        (make-weak-pointer key :value value :weakness (hash-table-weakness hash-table))))
 
 (defun hash-table-test-hash-function (test)
   (ecase test
@@ -113,6 +129,19 @@
 
 (defun hash-table-enforce-gc-invariant-keys (hash-table)
   (eql (hash-table-gc-invariant hash-table) :mandatory))
+
+(defmacro with-hash-table-lock ((hash-table) &body body)
+  (let ((sym (gensym)))
+    `(let ((,sym ,hash-table))
+       (flet ((doit ()
+                (block nil
+                  ,@body)))
+         (declare (dynamic-extent #'doit))
+         (if (hash-table-synchronized ,sym)
+             (mezzano.supervisor:without-footholds ()
+               (mezzano.supervisor:with-mutex ((hash-table-lock ,sym))
+                 (doit)))
+             (doit))))))
 
 ;;; Unsynchronized hash-tables are safe for use with concurrent readers
 ;;; as long as they only contains gc-invariant keys.
@@ -141,20 +170,43 @@
                               :weakness weakness)))
     (when synchronized
       (setf (hash-table-lock ht) (mezzano.supervisor:make-mutex ht)))
+    (multiple-value-bind (fast-gethash fast-puthash fast-cashash fast-remhash)
+        (if weakness
+            (ecase test
+              ((eq) (values #'weak-gethash-standard-eq #'weak-puthash-standard-eq #'weak-cashash-standard-eq #'weak-remhash-standard-eq))
+              ((eql) (values #'weak-gethash-standard-eql #'weak-puthash-standard-eql #'weak-cashash-standard-eql #'weak-remhash-standard-eql))
+              ((equal) (values #'weak-gethash-standard-equal #'weak-puthash-standard-equal #'weak-cashash-standard-equal #'weak-remhash-standard-equal))
+              ((equalp) (values #'weak-gethash-standard-equalp #'weak-puthash-standard-equalp #'weak-cashash-standard-equalp #'weak-remhash-standard-equalp)))
+            (ecase test
+              ((eq) (values #'gethash-standard-eq #'puthash-standard-eq #'cashash-standard-eq #'remhash-standard-eq))
+              ((eql) (values #'gethash-standard-eql #'puthash-standard-eql #'cashash-standard-eql #'remhash-standard-eql))
+              ((equal) (values #'gethash-standard-equal #'puthash-standard-equal #'cashash-standard-equal #'remhash-standard-equal))
+              ((equalp) (values #'gethash-standard-equalp #'puthash-standard-equalp #'cashash-standard-equalp #'remhash-standard-equalp))))
+      (setf (hash-table-gethash-fn ht) (if synchronized
+                                           (lambda (key hash-table default)
+                                             (declare (lambda-name fast-gethash-with-lock))
+                                             (with-hash-table-lock (hash-table)
+                                               (funcall fast-gethash key hash-table default)))
+                                           fast-gethash)
+            (hash-table-puthash-fn ht) (if synchronized
+                                           (lambda (value key hash-table)
+                                             (declare (lambda-name fast-puthash-with-lock))
+                                             (with-hash-table-lock (hash-table)
+                                               (funcall fast-puthash value key hash-table)))
+                                           fast-puthash)
+            (hash-table-cashash-fn ht) (if synchronized
+                                           (lambda (old-value new-value key hash-table default)
+                                             (declare (lambda-name fast-cashash-with-lock))
+                                             (with-hash-table-lock (hash-table)
+                                               (funcall fast-cashash old-value new-value key hash-table default)))
+                                           fast-cashash)
+            (hash-table-remhash-fn ht) (if synchronized
+                                           (lambda (key hash-table)
+                                             (declare (lambda-name fast-remhash-with-lock))
+                                             (with-hash-table-lock (hash-table)
+                                               (funcall fast-remhash key hash-table)))
+                                           fast-remhash)))
     ht))
-
-(defmacro with-hash-table-lock ((hash-table) &body body)
-  (let ((sym (gensym)))
-    `(let ((,sym ,hash-table))
-       (flet ((doit ()
-                (block nil
-                  ,@body)))
-         (declare (dynamic-extent #'doit))
-         (if (hash-table-synchronized ,sym)
-             (mezzano.supervisor:without-footholds ()
-               (mezzano.supervisor:with-mutex ((hash-table-lock ,sym))
-                 (doit)))
-             (doit))))))
 
 (defun hash-table-update-gc-invariant (hash-table key)
   (when (and (hash-table-gc-invariant hash-table)
@@ -167,116 +219,29 @@
 
 (defun gethash (key hash-table &optional default)
   (check-type hash-table hash-table)
-  (with-hash-table-lock (hash-table)
-    (when (hash-table-weakness hash-table)
-      (return (gethash-weak key hash-table default)))
-    (let ((slot (find-hash-table-slot key hash-table)))
-      (if slot
-          (values (hash-table-value-at hash-table slot) t)
-          (values default nil)))))
+  (let ((fast-fn (hash-table-gethash-fn hash-table)))
+    (declare (optimize speed (safety 0)))
+    (funcall (the function fast-fn) key hash-table default)))
 
 (defun (setf gethash) (value key hash-table &optional default)
+  (declare (ignore default))
   (check-type hash-table hash-table)
-  (with-hash-table-lock (hash-table)
-    (when (hash-table-weakness hash-table)
-      (return (setf (gethash-weak key hash-table default) value)))
-    (multiple-value-bind (slot free-slot)
-        (find-hash-table-slot key hash-table)
-      ;; Finding the slot can cause a rehash, which can reset the invariant state.
-      ;; So update the invariant state *after* finding it, to avoid the update getting lost.
-      ;; This can occur if this is the first key being put in an a hash table that
-      ;; was created in an older GC epoch.
-      (hash-table-update-gc-invariant hash-table key)
-      (cond
-        (slot
-         ;; Replacing an existing entry
-         (setf (hash-table-value-at hash-table slot) value))
-        ;; Adding a new entry.
-        ((or (and (eq (hash-table-key-at hash-table free-slot) *hash-table-unbound-value*)
-                  (= (1+ (hash-table-used hash-table)) (strong-hash-table-size hash-table)))
-             (>= (/ (float (hash-table-%count hash-table)) (float (strong-hash-table-size hash-table)))
-                 (hash-table-rehash-threshold hash-table)))
-         ;; There must always be at least one unbound slot in the hash table.
-         (hash-table-rehash hash-table t)
-         (multiple-value-bind (slot free-slot)
-             (find-hash-table-slot key hash-table)
-           (declare (ignore slot))
-           (when (and (eq (hash-table-key-at hash-table free-slot) *hash-table-unbound-value*)
-                      (= (1+ (hash-table-used hash-table)) (strong-hash-table-size hash-table)))
-             ;; Can't happen. Resizing the hash-table adds new slots.
-             (error "Impossible!"))
-           (unless (eql (hash-table-key-at hash-table free-slot) *hash-table-tombstone*)
-             (incf (hash-table-used hash-table)))
-           (incf (hash-table-%count hash-table))
-           (setf (hash-table-key-at hash-table free-slot) key
-                 (hash-table-value-at hash-table free-slot) value)))
-        ;; No rehash/resize needed. Insert directly.
-        (t (unless (eql (hash-table-key-at hash-table free-slot) *hash-table-tombstone*)
-             (incf (hash-table-used hash-table)))
-           (incf (hash-table-%count hash-table))
-           (setf (hash-table-key-at hash-table free-slot) key
-                 (hash-table-value-at hash-table free-slot) value))))))
+  (let ((fast-fn (hash-table-puthash-fn hash-table)))
+    (declare (optimize speed (safety 0)))
+    (funcall (the function fast-fn) value key hash-table))
+  value)
 
 (defun (cas gethash) (old-value new-value key hash-table &optional default)
   (check-type hash-table hash-table)
-  (with-hash-table-lock (hash-table)
-    (when (hash-table-weakness hash-table)
-      (return (cas (gethash-weak key hash-table default) old-value new-value)))
-    (multiple-value-bind (slot free-slot)
-        (find-hash-table-slot key hash-table)
-      (hash-table-update-gc-invariant hash-table key)
-      (cond
-        (slot
-         ;; Replacing an existing entry
-         (let ((current (hash-table-value-at hash-table slot)))
-           (when (eq current old-value)
-             (setf (hash-table-value-at hash-table slot) new-value))
-           current))
-        ;; Adding a new entry.
-        ((or (and (eq (hash-table-key-at hash-table free-slot) *hash-table-unbound-value*)
-                  (= (1+ (hash-table-used hash-table)) (strong-hash-table-size hash-table)))
-             (>= (/ (float (hash-table-%count hash-table)) (float (strong-hash-table-size hash-table)))
-                 (hash-table-rehash-threshold hash-table)))
-         (when (not (eq old-value default))
-           (return-from gethash default))
-         ;; There must always be at least one unbound slot in the hash table.
-         (hash-table-rehash hash-table t)
-         (multiple-value-bind (slot free-slot)
-             (find-hash-table-slot key hash-table)
-           (declare (ignore slot))
-           (when (and (eq (hash-table-key-at hash-table free-slot) *hash-table-unbound-value*)
-                      (= (1+ (hash-table-used hash-table)) (strong-hash-table-size hash-table)))
-             ;; Can't happen. Resizing the hash-table adds new slots.
-             (error "Impossible!"))
-           (unless (eql (hash-table-key-at hash-table free-slot) *hash-table-tombstone*)
-             (incf (hash-table-used hash-table)))
-           (incf (hash-table-%count hash-table))
-           (setf (hash-table-key-at hash-table free-slot) key
-                 (hash-table-value-at hash-table free-slot) new-value)
-           default))
-        ;; No rehash/resize needed. Insert directly.
-        (t
-         (when (not (eq old-value default))
-           (return-from gethash default))
-         (unless (eql (hash-table-key-at hash-table free-slot) *hash-table-tombstone*)
-           (incf (hash-table-used hash-table)))
-         (incf (hash-table-%count hash-table))
-         (setf (hash-table-key-at hash-table free-slot) key
-               (hash-table-value-at hash-table free-slot) new-value)
-         default)))))
+  (let ((fast-fn (hash-table-cashash-fn hash-table)))
+    (declare (optimize speed (safety 0)))
+    (funcall (the function fast-fn) old-value new-value key hash-table default)))
 
 (defun remhash (key hash-table)
   (check-type hash-table hash-table)
-  (with-hash-table-lock (hash-table)
-    (when (hash-table-weakness hash-table)
-      (return (remhash-weak key hash-table)))
-    (let ((slot (find-hash-table-slot key hash-table)))
-      (when slot
-        ;; Entry exists.
-        (setf (hash-table-key-at hash-table slot) *hash-table-tombstone*
-              (hash-table-value-at hash-table slot) *hash-table-tombstone*)
-        (decf (hash-table-%count hash-table))
-        t))))
+  (let ((fast-fn (hash-table-remhash-fn hash-table)))
+    (declare (optimize speed (safety 0)))
+    (funcall (the function fast-fn) key hash-table)))
 
 (defun clrhash (hash-table)
   (check-type hash-table hash-table)
@@ -289,78 +254,314 @@
                                                       :initial-element *hash-table-unbound-value*))
     hash-table))
 
-(defun find-hash-table-slot-1 (key hash-table)
-  (do* ((free-slot nil)
-        (hash (funcall (hash-table-hash-function hash-table) key))
-        (size (strong-hash-table-size hash-table))
-        (test (hash-table-test-function hash-table))
-        (storage (hash-table-storage hash-table))
-        (unbound-marker *hash-table-unbound-value*)
-        (tombstone *hash-table-tombstone*)
-        ;; This hash implementation is inspired by the Python dict implementation.
-        (slot (logand hash #xffffffff) (logand #xffffffff (+ (* slot 5) perturb 1)))
-        (perturb hash (ash perturb -5)))
-       (nil)
-    (let* ((offset (rem slot size))
-           (slot-key (svref storage (ash offset 1)))) ; hash-table-key-at
-      (when (and (null free-slot) (or (eq slot-key unbound-marker)
-                                      (eq slot-key tombstone)))
-        (setf free-slot offset))
-      (when (eq slot-key unbound-marker)
-        ;; Unbound value marks the end of this run.
-        (return (values nil free-slot)))
-      (when (funcall test key slot-key)
-        (return (values offset free-slot))))))
+;; Since strong & weak hash tables have different internal storage representations,
+;; this function is needed to paper over the differences in access methods.
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (defun probe-hash-table-slot (weakp storage offset unbound-marker tombstone free-slot test-fn key)
+    (if weakp
+        `(let* ((offset ,offset)
+                (slot-entry (aref ,storage offset)))
+           (multiple-value-bind (slot-key livep)
+               (if (or (eq slot-entry ,unbound-marker)
+                       (eq slot-entry ,tombstone))
+                   (values nil nil)
+                   (weak-pointer-key slot-entry))
+             (when (and (null ,free-slot)
+                        (not livep))
+               (setf ,free-slot offset))
+             (when (eq slot-entry ,unbound-marker)
+               ;; Unbound value marks the end of this run.
+               (return (values nil ,free-slot)))
+             (when (,test-fn ,key slot-key)
+               (return (values offset ,free-slot)))))
+        `(let* ((offset ,offset)
+                (slot-key (aref ,storage (the fixnum (ash offset 1))))) ; hash-table-key-at
+           (declare (type fixnum offset))
+           (when (and (null ,free-slot)
+                      (or (eq slot-key ,unbound-marker)
+                          (eq slot-key ,tombstone)))
+             (setf ,free-slot offset))
+           (when (eq slot-key ,unbound-marker)
+             ;; Unbound value marks the end of this run.
+             (return (values nil ,free-slot)))
+           (when (,test-fn ,key slot-key)
+             (return (values offset ,free-slot)))))))
 
-(defun find-hash-table-slot (key hash-table)
-  "Locate the slot matching KEY. Returns NIL if KEY is not in HASH-TABLE.
+(defmacro define-optimized-hash-table-functions-internal
+    (name test-fn hash-fn weakp)
+  (let* ((weak-name (if weakp "WEAK-" ""))
+         (gethash (intern (format nil "~AGETHASH-~A" weak-name name) (symbol-package name)))
+         (puthash (intern (format nil "~APUTHASH-~A" weak-name name) (symbol-package name)))
+         (cashash (intern (format nil "~ACASHASH-~A" weak-name name) (symbol-package name)))
+         (remhash (intern (format nil "~AREMHASH-~A" weak-name name) (symbol-package name)))
+         (find-hash-table-slot (intern (format nil "%~AFIND-HASH-TABLE-SLOT-~A" weak-name name) (symbol-package name)))
+         (find-hash-table-slot-1 (intern (format nil "%~AFIND-HASH-TABLE-SLOT-1-~A" weak-name name) (symbol-package name)))
+         (hash-table-rehash (intern (format nil "%~AHASH-TABLE-REHASH-~A" weak-name name) (symbol-package name))))
+    `(progn
+       ;; gethash
+       (defun ,gethash (key hash-table default)
+         (declare (optimize speed (safety 0))
+                  (type hash-table hash-table))
+         (let ((slot (,find-hash-table-slot key hash-table)))
+           (if slot
+               (locally
+                   (declare (type fixnum slot))
+                 ,(if weakp
+                      `(multiple-value-bind (value livep)
+                           (weak-pointer-value (weak-hash-table-entry-at hash-table slot))
+                         (if livep
+                             (values value t)
+                             (values default nil)))
+                      `(values (hash-table-value-at hash-table slot) t)))
+               (values default nil))))
+       ;; puthash
+       (defun ,puthash (value key hash-table)
+         (multiple-value-bind (slot free-slot)
+             (,find-hash-table-slot key hash-table)
+           ;; Finding the slot can cause a rehash, which can reset the invariant state.
+           ;; So update the invariant state *after* finding it, to avoid the update getting lost.
+           ;; This can occur if this is the first key being put in an a hash table that
+           ;; was created in an older GC epoch.
+           (hash-table-update-gc-invariant hash-table key)
+           (cond
+             (slot
+              ;; Replacing an existing entry
+              ,(if weakp
+                   `(set-full-weak-hash-table-entry hash-table slot key value)
+                   `(setf (hash-table-value-at hash-table slot) value)))
+             ;; Adding a new entry.
+             ((or (and (eq ,(if weakp
+                                `(weak-hash-table-entry-at hash-table free-slot)
+                                `(hash-table-key-at hash-table free-slot))
+                           *hash-table-unbound-value*)
+                       (= (1+ (hash-table-used hash-table)) (hash-table-size hash-table)))
+                  (>= (/ (float (hash-table-%count hash-table)) (float (hash-table-size hash-table)))
+                      (hash-table-rehash-threshold hash-table)))
+              ;; There must always be at least one unbound slot in the hash table.
+              (,hash-table-rehash hash-table t)
+              ;; Since we haven't inserted yet, rehash would have lost the invariantness of
+              ;; the key we're inserting. Do it again to make sure.
+              (hash-table-update-gc-invariant hash-table key)
+              (multiple-value-bind (slot free-slot)
+                  (,find-hash-table-slot key hash-table)
+                (declare (ignore slot))
+                (when (and (eq ,(if weakp
+                                    `(weak-hash-table-entry-at hash-table free-slot)
+                                    `(hash-table-key-at hash-table free-slot))
+                               *hash-table-unbound-value*)
+                           (= (1+ (hash-table-used hash-table)) (hash-table-size hash-table)))
+                  ;; Can't happen. Resizing the hash-table adds new slots.
+                  (error "Impossible!"))
+                (unless (eq ,(if weakp
+                                 `(weak-hash-table-entry-at hash-table free-slot)
+                                 `(hash-table-key-at hash-table free-slot))
+                            *hash-table-tombstone*)
+                  (incf (hash-table-used hash-table)))
+                (incf (hash-table-%count hash-table))
+                ,(if weakp
+                     `(set-full-weak-hash-table-entry hash-table free-slot key value)
+                     `(setf (hash-table-key-at hash-table free-slot) key
+                            (hash-table-value-at hash-table free-slot) value))))
+             ;; No rehash/resize needed. Insert directly.
+             (t (unless (eq ,(if weakp
+                                 `(weak-hash-table-entry-at hash-table free-slot)
+                                 `(hash-table-key-at hash-table free-slot))
+                            *hash-table-tombstone*)
+                  (incf (hash-table-used hash-table)))
+                (incf (hash-table-%count hash-table))
+                ,(if weakp
+                     `(set-full-weak-hash-table-entry hash-table free-slot key value)
+                     `(setf (hash-table-key-at hash-table free-slot) key
+                            (hash-table-value-at hash-table free-slot) value))))))
+       (defun ,cashash (old-value new-value key hash-table default)
+         (multiple-value-bind (slot free-slot)
+             (,find-hash-table-slot key hash-table)
+           (hash-table-update-gc-invariant hash-table key)
+           (cond
+             (slot
+              ;; Replacing an existing entry
+              ,(if weakp
+                   `(multiple-value-bind (current livep)
+                        (weak-pointer-value (weak-hash-table-entry-at hash-table slot))
+                      (when (not livep)
+                        (setf current default))
+                      (when (eq current old-value)
+                        (set-full-weak-hash-table-entry hash-table slot key new-value))
+                      current)
+                   `(let ((current (hash-table-value-at hash-table slot)))
+                      (when (eq current old-value)
+                        (setf (hash-table-value-at hash-table slot) new-value))
+                      current)))
+             ;; Adding a new entry.
+             ((or (and (eq (,(if weakp
+                                 `weak-hash-table-entry-at
+                                 `hash-table-key-at)
+                            hash-table free-slot)
+                           *hash-table-unbound-value*)
+                       (= (1+ (hash-table-used hash-table)) (hash-table-size hash-table)))
+                  (>= (/ (float (hash-table-%count hash-table)) (float (hash-table-size hash-table)))
+                      (hash-table-rehash-threshold hash-table)))
+              (when (not (eq old-value default))
+                (return-from ,cashash default))
+              ;; There must always be at least one unbound slot in the hash table.
+              (,hash-table-rehash hash-table t)
+              ;; Since we haven't inserted yet, rehash would have lost the invariantness of
+              ;; the key we're inserting. Do it again to make sure.
+              (hash-table-update-gc-invariant hash-table key)
+              (multiple-value-bind (slot free-slot)
+                  (,find-hash-table-slot key hash-table)
+                (declare (ignore slot))
+                (when (and (eq (,(if weakp
+                                     `weak-hash-table-entry-at
+                                     `hash-table-key-at)
+                                hash-table free-slot)
+                               *hash-table-unbound-value*)
+                           (= (1+ (hash-table-used hash-table)) (hash-table-size hash-table)))
+                  ;; Can't happen. Resizing the hash-table adds new slots.
+                  (error "Impossible!"))
+                (unless (eq (,(if weakp
+                                  `weak-hash-table-entry-at
+                                  `hash-table-key-at)
+                             hash-table free-slot)
+                            *hash-table-tombstone*)
+                  (incf (hash-table-used hash-table)))
+                (incf (hash-table-%count hash-table))
+                ,(if weakp
+                     `(set-full-weak-hash-table-entry hash-table free-slot key new-value)
+                     `(setf (hash-table-key-at hash-table free-slot) key
+                            (hash-table-value-at hash-table free-slot) new-value))
+                default))
+             ;; No rehash/resize needed. Insert directly.
+             (t
+              (when (not (eq old-value default))
+                (return-from ,cashash default))
+              (unless (eq (,(if weakp
+                                'weak-hash-table-entry-at
+                                'hash-table-key-at)
+                           hash-table free-slot)
+                          *hash-table-tombstone*)
+                (incf (hash-table-used hash-table)))
+              (incf (hash-table-%count hash-table))
+              ,(if weakp
+                   `(set-full-weak-hash-table-entry hash-table free-slot key new-value)
+                   `(setf (hash-table-key-at hash-table free-slot) key
+                          (hash-table-value-at hash-table free-slot) new-value))
+              default))))
+       (defun ,remhash (key hash-table)
+         (let ((slot (,find-hash-table-slot key hash-table)))
+           (when slot
+             ;; Entry exists.
+             ,(if weakp
+                  '(setf (weak-hash-table-entry-at hash-table slot) *hash-table-tombstone*)
+                  '(setf (hash-table-key-at hash-table slot) *hash-table-tombstone*
+                         (hash-table-value-at hash-table slot) *hash-table-tombstone*))
+             (decf (hash-table-%count hash-table))
+             t)))
+       ;; internal lookup function, performs the actual hash-lookup without
+       ;; accounting for the current gc-epoch.
+       (defun ,find-hash-table-slot-1 (key hash-table)
+         (declare (optimize speed (safety 0) (debug 1))
+                  (type hash-table hash-table))
+         (do* ((free-slot nil)
+               (hash (logand #xffffffff (,hash-fn key)))
+               (storage (hash-table-storage hash-table))
+               (size (,(if weakp 'weak-hash-table-size 'strong-hash-table-size)
+                      storage))
+               (mask (the fixnum (1- size))) ; size is always a power-of-2
+               (unbound-marker *hash-table-unbound-value*)
+               (tombstone *hash-table-tombstone*)
+               ;; This hash implementation is inspired by the Python dict implementation.
+               (slot (logand hash #xffffffff) (logand #xffffffff (the fixnum (+ (the fixnum (+ (the fixnum (* slot 5)) perturb)) 1))))
+               (perturb hash (the fixnum (ash perturb -5))))
+              (nil)
+           (declare (type fixnum hash size slot perturb)
+                    (type simple-vector storage))
+           ,(probe-hash-table-slot weakp 'storage '(logand slot mask) 'unbound-marker 'tombstone 'free-slot test-fn 'key)))
+       (defun ,find-hash-table-slot (key hash-table)
+         "Locate the slot matching KEY. Returns NIL if KEY is not in HASH-TABLE.
 The second return value is the first available/empty slot in the hash-table for KEY.
 Requires at least one completely unbound slot to terminate."
-  (loop
-     (let ((epoch *gc-epoch*))
-       (multiple-value-bind (offset free-slot)
-           (find-hash-table-slot-1 key hash-table)
-         (when (or (hash-table-gc-invariant hash-table)
-                   (and (eql epoch *gc-epoch*)
-                        (eql (hash-table-storage-epoch hash-table) *gc-epoch*)))
-           (return (values offset free-slot)))
-         (hash-table-rehash hash-table nil)))))
-
-(defun hash-table-rehash (hash-table resize-p)
-  "Resize and rehash HASH-TABLE so that there are no tombstones the usage
+         (declare (optimize speed (safety 0))
+                  (type hash-table hash-table))
+         (if (hash-table-gc-invariant hash-table)
+             (,find-hash-table-slot-1 key hash-table)
+             (loop
+               (let ((epoch *gc-epoch*))
+                 (multiple-value-bind (offset free-slot)
+                     (,find-hash-table-slot-1 key hash-table)
+                   (when (and (eql epoch *gc-epoch*)
+                              (eql (hash-table-storage-epoch hash-table) *gc-epoch*))
+                     (return (values offset free-slot)))
+                   (,hash-table-rehash hash-table nil))))))
+       (defun ,hash-table-rehash (hash-table resize-p)
+         "Resize and rehash HASH-TABLE so that there are no tombstones the usage
 is below the rehash-threshold."
-  (let ((new-size (align-up-to-power-of-two
-                   (if resize-p
-                       (if (floatp (hash-table-rehash-size hash-table))
-                           (ceiling (* (strong-hash-table-size hash-table) (hash-table-rehash-size hash-table)))
-                           (+ (strong-hash-table-size hash-table) (hash-table-rehash-size hash-table)))
-                       (strong-hash-table-size hash-table))))
-        (old-size (strong-hash-table-size hash-table))
-        (old-storage (hash-table-storage hash-table)))
-    (setf (hash-table-storage hash-table) (make-array (* new-size 2)
-                                                      :initial-element *hash-table-unbound-value*)
-          (hash-table-%count hash-table) 0
-          (hash-table-used hash-table) 0
-          ;; Make sure to preserve :MANDATORY.
-          (hash-table-gc-invariant hash-table) (or (hash-table-gc-invariant hash-table) t)
-          (hash-table-storage-epoch hash-table) *gc-epoch*)
-    (dotimes (i old-size hash-table)
-      (let ((key (svref old-storage (* i 2)))
-            (value (svref old-storage (1+ (* i 2)))))
-        (unless (or (eq key *hash-table-unbound-value*)
-                    (eq value *hash-table-tombstone*))
-          (when (and (hash-table-gc-invariant hash-table)
-                     (not (object-hash-gc-invariant-under-test key (hash-table-test hash-table))))
-            ;; Hash table is no longer invariant.
-            (setf (hash-table-gc-invariant hash-table) nil))
-          (multiple-value-bind (slot free-slot)
-              (find-hash-table-slot-1 key hash-table)
-            (when slot
-              (error "Duplicate key ~S in hash-table?" key))
-            (incf (hash-table-used hash-table))
-            (incf (hash-table-%count hash-table))
-            (setf (hash-table-key-at hash-table free-slot) key
-                  (hash-table-value-at hash-table free-slot) value)))))))
+         (let* ((old-storage (hash-table-storage hash-table))
+                (old-size (,(if weakp
+                                'weak-hash-table-size
+                                'strong-hash-table-size)
+                           old-storage))
+                (new-size (align-up-to-power-of-two
+                           (if resize-p
+                               (if (floatp (hash-table-rehash-size hash-table))
+                                   (ceiling (* old-size (hash-table-rehash-size hash-table)))
+                                   (+ old-size (hash-table-rehash-size hash-table)))
+                               old-size))))
+           (setf (hash-table-storage hash-table) (make-array ,(if weakp
+                                                                  'new-size
+                                                                  '(* new-size 2))
+                                                             :initial-element *hash-table-unbound-value*)
+                 (hash-table-%count hash-table) 0
+                 (hash-table-used hash-table) 0
+                 ;; Make sure to preserve :MANDATORY.
+                 (hash-table-gc-invariant hash-table) (or (hash-table-gc-invariant hash-table) t)
+                 (hash-table-storage-epoch hash-table) *gc-epoch*)
+           (dotimes (i old-size hash-table)
+             ,(if weakp
+                  `(let ((entry (aref old-storage i)))
+                     (unless (or (eq entry *hash-table-unbound-value*)
+                                 (eq entry *hash-table-tombstone*))
+                       (multiple-value-bind (key livep)
+                           (weak-pointer-key entry)
+                         (when livep
+                           (when (and (hash-table-gc-invariant hash-table)
+                                      (not (object-hash-gc-invariant-under-test key (hash-table-test hash-table))))
+                             ;; Hash table is no longer invariant.
+                             (setf (hash-table-gc-invariant hash-table) nil))
+                           (multiple-value-bind (slot free-slot)
+                               (,find-hash-table-slot-1 key hash-table)
+                             (when slot
+                               (error "Duplicate key ~S in hash-table?" key))
+                             (incf (hash-table-used hash-table))
+                             (incf (hash-table-%count hash-table))
+                             (setf (weak-hash-table-entry-at hash-table free-slot) entry))))))
+                  `(let ((key (aref old-storage (* i 2)))
+                         (value (aref old-storage (1+ (* i 2)))))
+                     (unless (or (eq key *hash-table-unbound-value*)
+                                 (eq key *hash-table-tombstone*))
+                       (when (and (hash-table-gc-invariant hash-table)
+                                  (not (object-hash-gc-invariant-under-test key (hash-table-test hash-table))))
+                         ;; Hash table is no longer invariant.
+                         (setf (hash-table-gc-invariant hash-table) nil))
+                       (multiple-value-bind (slot free-slot)
+                           (,find-hash-table-slot-1 key hash-table)
+                         (when slot
+                           (error "Duplicate key ~S in hash-table?" key))
+                         (incf (hash-table-used hash-table))
+                         (incf (hash-table-%count hash-table))
+                         (setf (hash-table-key-at hash-table free-slot) key
+                               (hash-table-value-at hash-table free-slot) value)))))))))))
+
+(defmacro define-optimized-hash-table-functions (name test-fn hash-fn)
+  `(progn
+     (define-optimized-hash-table-functions-internal ,name ,test-fn ,hash-fn nil)
+     (define-optimized-hash-table-functions-internal ,name ,test-fn ,hash-fn t)
+     ',name))
+
+(define-optimized-hash-table-functions standard-eq eq eq-hash)
+(define-optimized-hash-table-functions standard-eql eql eql-hash)
+(define-optimized-hash-table-functions standard-equal equal sxhash)
+(define-optimized-hash-table-functions standard-equalp equalp equalp-hash)
 
 (defstruct (hash-table-iterator
              (:constructor %make-hash-table-iterator))
@@ -383,7 +584,7 @@ is below the rehash-threshold."
     (if (hash-table-iterator-weakp iterator)
         (do () ((>= (hash-table-iterator-index iterator) size))
           (let* ((index (hash-table-iterator-index iterator))
-                 (entry (svref ht index)))
+                 (entry (aref ht index)))
             ;; Increment the key until a non-unbound/-tombstone key is found.
             (incf (hash-table-iterator-index iterator))
             (unless (or (eq entry *hash-table-unbound-value*)
@@ -394,8 +595,8 @@ is below the rehash-threshold."
                   (return (values t key value)))))))
         (do () ((>= (hash-table-iterator-index iterator) size))
           (let* ((index (hash-table-iterator-index iterator))
-                 (key (svref ht index))
-                 (value (svref ht (1+ index))))
+                 (key (aref ht index))
+                 (value (aref ht (1+ index))))
             ;; Increment the key until a non-unbound/-tombstone key is found.
             (incf (hash-table-iterator-index iterator) 2)
             (unless (or (eq key *hash-table-unbound-value*)
@@ -415,6 +616,7 @@ is below the rehash-threshold."
         (unless more (return nil))
         (funcall function key value)))))
 
+(declaim (inline eq-hash))
 (defun eq-hash (object)
   (lisp-object-address object))
 
@@ -487,201 +689,3 @@ is below the rehash-threshold."
                                               (char-int (char-upcase (char object i)))))))))
         (symbol (eql-hash object))
         (t 0))))
-
-;;; Internal weak hash table support.
-;;; Don't call these functions directly.
-;;;
-;;; Algorithmically identical to strong hash tables, but the underlying
-;;; storage representation is very different.
-;;;
-;;; These functions are all called with the lock held & key invariance checked.
-;;;
-;;; TODO: Reduce the duplication between the strong & weak codepaths, in
-;;; a way that doesn't make performance even worse...
-
-(defun weak-hash-table-entry-at (hash-table slot)
-  (svref (hash-table-storage hash-table) slot))
-
-;; Value should be either the unbound value, tombstone, or a weak pointer.
-(defun (setf weak-hash-table-entry-at) (value hash-table slot)
-  (setf (svref (hash-table-storage hash-table) slot) value))
-
-(defun set-full-weak-hash-table-entry (hash-table slot key value)
-  (setf (weak-hash-table-entry-at hash-table slot)
-        (make-weak-pointer key :value value :weakness (hash-table-weakness hash-table))))
-
-(defun gethash-weak (key hash-table &optional default)
-  (let ((slot (find-weak-hash-table-slot key hash-table)))
-    (if slot
-        (multiple-value-bind (value livep)
-            (weak-pointer-value (weak-hash-table-entry-at hash-table slot))
-          (if livep
-              (values value t)
-              (values default nil)))
-        (values default nil))))
-
-(defun (setf gethash-weak) (value key hash-table &optional default)
-  (declare (ignore default))
-  (multiple-value-bind (slot free-slot)
-      (find-weak-hash-table-slot key hash-table)
-    (hash-table-update-gc-invariant hash-table key)
-    (cond
-      (slot
-       ;; Replacing an existing entry
-       (set-full-weak-hash-table-entry hash-table slot key value))
-      ;; Adding a new entry.
-      ((or (and (eq (weak-hash-table-entry-at hash-table free-slot) *hash-table-unbound-value*)
-                (= (1+ (hash-table-used hash-table)) (hash-table-size hash-table)))
-           (>= (/ (float (hash-table-%count hash-table)) (float (hash-table-size hash-table)))
-               (hash-table-rehash-threshold hash-table)))
-       ;; There must always be at least one unbound slot in the hash table.
-       (weak-hash-table-rehash hash-table t)
-       (multiple-value-bind (slot free-slot)
-           (find-weak-hash-table-slot key hash-table)
-         (declare (ignore slot))
-         (when (and (eq (weak-hash-table-entry-at hash-table free-slot) *hash-table-unbound-value*)
-                    (= (1+ (hash-table-used hash-table)) (hash-table-size hash-table)))
-           ;; Can't happen. Resizing the hash-table adds new slots.
-           (error "Impossible!"))
-         (unless (eql (weak-hash-table-entry-at hash-table free-slot) *hash-table-tombstone*)
-           (incf (hash-table-used hash-table)))
-         (incf (hash-table-%count hash-table))
-         (set-full-weak-hash-table-entry hash-table free-slot key value)))
-      ;; No rehash/resize needed. Insert directly.
-      (t (unless (eql (weak-hash-table-entry-at hash-table free-slot) *hash-table-tombstone*)
-           (incf (hash-table-used hash-table)))
-         (incf (hash-table-%count hash-table))
-         (set-full-weak-hash-table-entry hash-table free-slot key value))))
-  value)
-
-(defun (cas gethash-weak) (old-value new-value key hash-table &optional default)
-  (multiple-value-bind (slot free-slot)
-      (find-weak-hash-table-slot key hash-table)
-    (hash-table-update-gc-invariant hash-table key)
-    (cond
-      (slot
-       ;; Replacing an existing entry
-       (multiple-value-bind (current livep)
-           (weak-pointer-value (weak-hash-table-entry-at hash-table slot))
-         (when (not livep)
-           (setf current default))
-         (when (eq current old-value)
-           (set-full-weak-hash-table-entry hash-table slot key new-value))
-         current))
-      ;; Adding a new entry.
-      ((or (and (eq (weak-hash-table-entry-at hash-table free-slot) *hash-table-unbound-value*)
-                (= (1+ (hash-table-used hash-table)) (hash-table-size hash-table)))
-           (>= (/ (float (hash-table-%count hash-table)) (float (hash-table-size hash-table)))
-               (hash-table-rehash-threshold hash-table)))
-       (when (not (eq old-value default))
-         (return-from gethash-weak default))
-       ;; There must always be at least one unbound slot in the hash table.
-       (weak-hash-table-rehash hash-table t)
-       (multiple-value-bind (slot free-slot)
-           (find-weak-hash-table-slot key hash-table)
-         (declare (ignore slot))
-         (when (and (eq (weak-hash-table-entry-at hash-table free-slot) *hash-table-unbound-value*)
-                    (= (1+ (hash-table-used hash-table)) (hash-table-size hash-table)))
-           ;; Can't happen. Resizing the hash-table adds new slots.
-           (error "Impossible!"))
-         (unless (eql (weak-hash-table-entry-at hash-table free-slot) *hash-table-tombstone*)
-           (incf (hash-table-used hash-table)))
-         (incf (hash-table-%count hash-table))
-         (set-full-weak-hash-table-entry hash-table free-slot key new-value)
-         default))
-      (t
-       ;; No rehash/resize needed. Insert directly.
-       (when (not (eq old-value default))
-         (return-from gethash-weak default))
-       (unless (eql (weak-hash-table-entry-at hash-table free-slot) *hash-table-tombstone*)
-         (incf (hash-table-used hash-table)))
-       (incf (hash-table-%count hash-table))
-       (set-full-weak-hash-table-entry hash-table free-slot key new-value)
-       default))))
-
-(defun remhash-weak (key hash-table)
-  (let ((slot (find-weak-hash-table-slot key hash-table)))
-    (when slot
-      ;; Entry exists.
-      (setf (weak-hash-table-entry-at hash-table slot) *hash-table-tombstone*)
-      (decf (hash-table-%count hash-table))
-      t)))
-
-(defun find-weak-hash-table-slot-1 (key hash-table)
-  (do* ((free-slot nil)
-        (hash (funcall (hash-table-hash-function hash-table) key))
-        (size (hash-table-size hash-table))
-        (test (hash-table-test hash-table))
-        (storage (hash-table-storage hash-table))
-        (unbound-marker *hash-table-unbound-value*)
-        (tombstone *hash-table-tombstone*)
-        ;; This hash implementation is inspired by the Python dict implementation.
-        (slot (logand hash #xffffffff) (logand #xffffffff (+ (* slot 5) perturb 1)))
-        (perturb hash (ash perturb -5)))
-       (nil)
-    (let* ((offset (rem slot size))
-           (slot-entry (svref storage offset)))
-      (multiple-value-bind (slot-key livep)
-          (if (or (eq slot-entry unbound-marker)
-                  (eq slot-entry tombstone))
-              (values nil nil)
-              (weak-pointer-key slot-entry))
-        (when (and (null free-slot)
-                   (not livep))
-          (setf free-slot offset))
-        (when (eq slot-entry unbound-marker)
-          ;; Unbound value marks the end of this run.
-          (return (values nil free-slot)))
-        (when (funcall test key slot-key)
-          (return (values offset free-slot)))))))
-
-(defun find-weak-hash-table-slot (key hash-table)
-  "Locate the slot matching KEY. Returns NIL if KEY is not in HASH-TABLE.
-The second return value is the first available/empty slot in the hash-table for KEY.
-Requires at least one completely unbound slot to terminate."
-  (loop
-     (let ((epoch *gc-epoch*))
-       (multiple-value-bind (offset free-slot)
-           (find-weak-hash-table-slot-1 key hash-table)
-         (when (or (hash-table-gc-invariant hash-table)
-                   (and (eql epoch *gc-epoch*)
-                        (eql (hash-table-storage-epoch hash-table) *gc-epoch*)))
-           (return (values offset free-slot)))
-         (weak-hash-table-rehash hash-table nil)))))
-
-(defun weak-hash-table-rehash (hash-table resize-p)
-  "Resize and rehash HASH-TABLE so that there are no tombstones the usage
-is below the rehash-threshold."
-  (let ((new-size (align-up-to-power-of-two
-                   (if resize-p
-                       (if (floatp (hash-table-rehash-size hash-table))
-                           (ceiling (* (hash-table-size hash-table) (hash-table-rehash-size hash-table)))
-                           (+ (hash-table-size hash-table) (hash-table-rehash-size hash-table)))
-                       (hash-table-size hash-table))))
-        (old-size (hash-table-size hash-table))
-        (old-storage (hash-table-storage hash-table)))
-    (setf (hash-table-storage hash-table) (make-array new-size
-                                                      :initial-element *hash-table-unbound-value*)
-          (hash-table-%count hash-table) 0
-          (hash-table-used hash-table) 0
-          ;; Make sure to preserve :MANDATORY.
-          (hash-table-gc-invariant hash-table) (or (hash-table-gc-invariant hash-table) t)
-          (hash-table-storage-epoch hash-table) *gc-epoch*)
-    (dotimes (i old-size hash-table)
-      (let ((entry (svref old-storage i)))
-        (unless (or (eq entry *hash-table-unbound-value*)
-                    (eq entry *hash-table-tombstone*))
-          (multiple-value-bind (key livep)
-              (weak-pointer-key entry)
-            (when livep
-              (when (and (hash-table-gc-invariant hash-table)
-                         (not (object-hash-gc-invariant-under-test key (hash-table-test hash-table))))
-                ;; Hash table is no longer invariant.
-                (setf (hash-table-gc-invariant hash-table) nil))
-              (multiple-value-bind (slot free-slot)
-                  (find-weak-hash-table-slot-1 key hash-table)
-                (when slot
-                  (error "Duplicate key ~S in hash-table?" key))
-                (incf (hash-table-used hash-table))
-                (incf (hash-table-%count hash-table))
-                (setf (weak-hash-table-entry-at hash-table free-slot) entry)))))))))

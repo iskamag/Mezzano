@@ -171,20 +171,25 @@
       ((#x04 #x05 #x06 #x07) ;; Translation fault (page not mapped).
        (%page-fault-handler interrupt-frame fault-addr :not-present))
       ((#x0C #x0D #x0E #x0F) ;; Permission fault.
-       (let ((pte (get-pte-for-address fault-addr nil)))
+       (let* ((pte (get-pte-for-address fault-addr nil))
+              (current (and pte (page-table-entry pte))))
          (cond ((and (logtest esr #x40)
                      pte
-                     (logtest (page-table-entry pte) +arm64-tte-writable+)
-                     (eql (ldb +arm64-tte-ap+ (page-table-entry pte))
+                     (logtest current +arm64-tte-writable+)
+                     (eql (ldb +arm64-tte-ap+ current)
                           +arm64-tte-ap-pro-una+))
                 ;; Dirty bit emulation.
                 ;; Set the dirty bit and make the page writable again.
                 #+(or)
                 (debug-print-line "Dirty emulation for address " fault-addr)
-                (setf (page-table-entry pte) (logior (page-table-entry pte)
-                                                     +arm64-tte-dirty+))
-                (setf (ldb +arm64-tte-ap+ (page-table-entry pte))
-                      +arm64-tte-ap-prw-una+)
+                (let ((new (dpb +arm64-tte-ap-prw-una+
+                                +arm64-tte-ap+
+                                (logior current +arm64-tte-dirty+))))
+                  ;; We don't bother trying to retry the result of this.
+                  ;; No matter if it passes or fails we return from the
+                  ;; fault and retry the access. We'll either succeed,
+                  ;; end up back here, or trigger another fault.
+                  (ext:cas (page-table-entry pte) current new))
                 (flush-tlb-single fault-addr))
                ((logtest esr #x40)
                 (%page-fault-handler interrupt-frame fault-addr :write-to-ro))

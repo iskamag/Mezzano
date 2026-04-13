@@ -67,7 +67,10 @@
   (mezzano.lap.arm64:ret))
 
 (defun %arm64-sync-icache (base length)
-  (let ((end (+ base length)))
+  ;; Make sure we align base/end to the cache-line boundary so we get everything.
+  (let ((start (logand base (1- +cache-line-size+)))
+        (end (logand (+ base length (1- +cache-line-size+))
+                     (lognot (1- +cache-line-size+)))))
     ;; Clear (write dirty data, but don't invalidate) data cache back to
     ;; the point of unification (where I & D caches meet)
     (loop for addr from base below end by +cache-line-size+

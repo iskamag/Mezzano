@@ -1,0 +1,222 @@
+name: CI
+
+on:
+  # Triggers the workflow on push or pull request events but only for the "master" branch
+  push:
+    branches: ["github-ci-build-test", master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build (${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ matrix.timeout }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86-64
+            timeout: 30
+            qemu_bin: qemu-system-x86_64
+            qemu_machine: >-
+              -enable-kvm
+              -hda mezzano.image
+              -vga std
+              -net user
+              -net nic,model=virtio
+              -device isa-debug-exit,iobase=0xf4,iosize=0x04
+            qemu_exit_pass: 3
+            qemu_exit_fail: 1
+          # Fails due to some weird miscompilation, maybe due to older sbcl
+          #- arch: arm64
+          #  timeout: 45
+          #  qemu_bin: qemu-system-aarch64
+          #  qemu_machine: >-
+          #    -machine virt
+          #    -cpu max
+          #    -kernel Mezzano/tools/kboot/kboot-generic-arm64.bin
+          #    -device virtio-gpu-device
+          #    -device virtio-keyboard-device
+          #    -device virtio-mouse-device
+          #    -drive if=none,file=mezzano.image,id=blk,format=raw
+          #    -device virtio-blk-device,drive=blk
+          #    -netdev user,id=vmnic,hostname=qemu
+          #    -device virtio-net-device,netdev=vmnic
+          #    -semihosting-config enable=on,target=native
+          #  qemu_exit_pass: 0
+          #  qemu_exit_fail: 1
+
+    # Steps represent a sequence of tasks that will be executed as part of the job
+    steps:
+      - name: Checkout Mezzano
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+          path: Mezzano           # -> $GITHUB_WORKSPACE/Mezzano
+
+      # Resolve MBuild's current HEAD SHA (used as the cache key)
+      - name: Get MBuild HEAD SHA
+        id: mbuild-sha
+        run: |
+          echo "sha=$(git ls-remote https://github.com/froggey/MBuild refs/heads/master | cut -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore MBuild cache
+        id: mbuild-cache
+        uses: actions/cache@v5
+        with:
+          path: MBuild
+          key: mbuild-${{ steps.mbuild-sha.outputs.sha }}
+          # No restore-keys — a partial MBuild (wrong submodule state) is worse than none
+
+      - name: Checkout MBuild
+        if: steps.mbuild-cache.outputs.cache-hit != 'true'
+        uses: actions/checkout@v6
+        with:
+          repository: froggey/MBuild
+          path: MBuild            # -> $GITHUB_WORKSPACE/MBuild
+          submodules: recursive
+
+      # Cached mbuild might have some llf files cached.
+      # TODO: Figure out how to do out-of-tree builds.
+      - name: Clean MBuild
+        working-directory: MBuild
+        run: |
+          rm -rf home/.cache/common-lisp/ home/.slime/ home/asdf/build/
+
+      - name: make asdf.lisp
+        working-directory: MBuild/home/asdf
+        run: |
+          make
+
+      - name: Install apt packages
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            curl \
+            sbcl \
+            qemu-system \
+            git
+
+      - name: Install Quicklisp and dependencies
+        run: |
+          if [ ! -f ~/quicklisp/setup.lisp ]; then
+          curl -fsSL https://beta.quicklisp.org/quicklisp.lisp -o /tmp/quicklisp.lisp
+          sbcl --non-interactive \
+          --load /tmp/quicklisp.lisp \
+          --eval '(quicklisp-quickstart:install :path (merge-pathnames "quicklisp/" (user-homedir-pathname)))' \
+          --eval '(ql-util:without-prompting (ql:add-to-init-file))'
+          fi
+          sbcl --non-interactive \
+          --eval "(ql:quickload '(alexandria iterate nibbles cl-ppcre cl-fad closer-mop trivial-gray-streams) :silent t)" \
+          --eval '(quit)'
+
+      - name: Generate config.lisp
+        working-directory: Mezzano
+        run: |
+          echo "(in-package :mezzano.internals)" > config.lisp
+          echo "(defparameter *file-server-host-ip* \"10.0.2.2\")" >> config.lisp
+          echo "(defparameter *home-directory-path* \"REMOTE:${GITHUB_WORKSPACE}/MBuild/home/\")" >> config.lisp
+          echo "(defparameter *mezzano-source-path* \"REMOTE:${GITHUB_WORKSPACE}/Mezzano/\")" >> config.lisp
+          # we're in a hurry!
+          echo "(setf *compile-parallel* t)" >> config.lisp
+          cat config.lisp
+
+      - name: Build cold image
+        working-directory: Mezzano
+        run: |
+          set -o pipefail
+          sed -i 's/:architecture :x86-64/:architecture :${{ matrix.arch }}/g' \
+            $GITHUB_WORKSPACE/MBuild/build-cold-image.lisp
+          sbcl --non-interactive \
+            --load $GITHUB_WORKSPACE/MBuild/build-cold-image.lisp \
+            --eval '(quit)' \
+          2>&1 | tee "${{ github.workspace }}/build-cold-image.log"
+
+      - name: Start file server
+        working-directory: Mezzano/file-server
+        run: |
+          sbcl --non-interactive \
+          --load $GITHUB_WORKSPACE/MBuild/run-file-server.lisp \
+          &> "${{ github.workspace }}/file-server.log" 2>&1 &
+          echo $! > "${{ github.workspace }}/file-server.pid"
+          # Wait for the server to become ready.
+          timeout 30 bash -c 'until lsof -i :2599 -sTCP:LISTEN >/dev/null 2>&1; do sleep 1; done'
+          echo "File server ready (PID $(cat ${{ github.workspace }}/file-server.pid))"
+
+      # Sadly the native arm64 runners don't have nested virt enabled, so we only
+      # get this on x86-64. This is also why we run the arm64 build on an x86-64 runner,
+      # because they're usually slightly faster under TCG.
+      - name: Enable KVM access
+        if: matrix.arch == 'x86-64'
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Run tests in QEMU
+        timeout-minutes: 30
+        run: |
+          ${{ matrix.qemu_bin }} \
+            -m 2G \
+            -nographic \
+            -monitor none \
+            -serial stdio \
+            -smp $(nproc) \
+            -no-reboot \
+            ${{ matrix.qemu_machine }} \
+          2>&1 | tee "${{ github.workspace }}/serial.log"
+          QEMU_EXIT=${PIPESTATUS[0]}
+          case "${QEMU_EXIT}" in
+            ${{ matrix.qemu_exit_pass }})
+              ;;
+            ${{ matrix.qemu_exit_fail }})
+              exit 1
+              ;;
+            *)
+              echo "Unexpected QEMU exit code ${QEMU_EXIT}"
+              exit 1
+              ;;
+          esac
+
+      - name: Upload file server log
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: file-server-log-${{ github.run_id }}-${{ matrix.arch }}
+          path: ${{ github.workspace }}/file-server.log
+          retention-days: 14
+
+      - name: Upload serial log
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: serial-log-${{ github.run_id }}-${{ matrix.arch }}
+          path: ${{ github.workspace }}/serial.log
+          retention-days: 14
+
+      - name: Upload cold image build log
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: build-cold-image-log-${{ github.run_id }}-${{ matrix.arch }}
+          path: ${{ github.workspace }}/build-cold-image.log
+          retention-days: 14
+
+      - name: Upload image on failure
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: mezzano-image-${{ github.run_id }}-${{ matrix.arch }}
+          path: |
+            ${{ github.workspace }}/mezzano.image
+            ${{ github.workspace }}/mezzano.map
+            ${{ github.workspace }}/mezzano.symbol-table
+          retention-days: 3
