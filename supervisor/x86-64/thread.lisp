@@ -198,7 +198,7 @@
 
 (defun stack-space-required-for-force-call-on-thread (thread)
   (declare (ignore thread))
-  (+ 32 ; Partial wrapper (R15, padding, RBP, return address)
+  (+ 40 ; Partial wrapper (32 bytes) and up to 8 bytes of alignment
      (* +thread-mv-slots-size+ 8) ; Saved MV area.
      512 ; FPU state
      (* 20 8))) ; GPRs
@@ -230,7 +230,7 @@
                                                    #'%%partial-save-return-thunk
                                                    sys.int::+function-entry-point+))
       ;; Wrap the return thunk in the same partial frame as a wired call.
-      (let ((fp (+ sp (* 16 8))))
+      (let ((fp (+ sp (* 15 8))))
         (setf (sys.int::memref-unsigned-byte-64 (decf sp 8)) fp)
         (setf (sys.int::memref-unsigned-byte-64 (decf sp 8)) 0) ; padding
         (setf (sys.int::memref-t (decf sp 8)) 0) ; R15 restored by the interrupt thunk
