@@ -86,6 +86,30 @@
                              (funcall (lambda () (return-from done (list :exit 42))))
                           (x86-r15-stress-calls)))
                       '(:exit 42)))))
+    (probe :runtime-catch-throw
+           (lambda ()
+             (let ((tag (list :r15-catch)))
+               (assert
+                (equal (multiple-value-list
+                        (mezzano.internals::%catch
+                         tag
+                         (lambda ()
+                           (unwind-protect
+                                (mezzano.internals::%throw tag (list :caught 42 3 4 5 6 7))
+                             (x86-r15-stress-calls)))))
+                       '(:caught 42 3 4 5 6 7))))))
+    (probe :warning-restarts
+           (lambda ()
+             (let ((inner 0) (outer 0))
+               (handler-bind ((warning (lambda (condition)
+                                         (incf outer)
+                                         (muffle-warning condition))))
+                 (handler-bind ((warning (lambda (condition)
+                                           (declare (ignore condition))
+                                           (incf inner)
+                                           (x86-r15-stress-calls))))
+                   (warn "R15 warning restart regression ~D" 42)))
+               (assert (= inner outer 1)))))
     (probe :voluntary-switch
            (lambda ()
              (dotimes (i 10)
