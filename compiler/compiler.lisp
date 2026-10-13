@@ -7,6 +7,10 @@
 (defparameter *perform-tce* nil
   "When true, attempt to eliminate tail calls.")
 
+(defparameter *use-x86-r15* t
+  "When true, allocate x86-64 Lisp values to callee-save R15.
+Binding this to NIL affects newly compiled code, not the calling convention.")
+
 (defparameter *trace-asm* nil)
 
 (defvar *jump-table-size-min* 4)
@@ -24,6 +28,7 @@ Currently disabled by default as it has a severe performance impact.")
 (defun compiler-state-bindings ()
   (let ((symbols '(*should-inline-functions*
                    *perform-tce*
+                   *use-x86-r15*
                    *trace-asm*
                    *jump-table-size-min*
                    *jump-table-size-max*

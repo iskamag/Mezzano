@@ -32,6 +32,11 @@ exit targets also save it, since an exit skips intervening callees' epilogues.
 Calls that may non-locally exit into the current function clobber `R15` for
 register allocation, as on arm64.
 
+Bind `mezzano.compiler::*use-x86-r15*` to NIL while compiling to exclude R15
+from value allocation. This supports comparing recompiled call graphs in one
+live image. The callee-save calling convention, including preservation by NLX
+targets, remains in effect; existing compiled functions are unchanged.
+
 The direction flag (`RFLAGS.DF`) must be set to zero (forward) on function
 entry and return. Other flags are caller-save.
 

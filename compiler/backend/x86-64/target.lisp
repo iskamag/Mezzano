@@ -21,7 +21,9 @@
   :rcx)
 
 (defmethod ra:valid-physical-registers-for-kind ((kind (eql :value)) (architecture c:x86-64-target))
-  '(:r8 :r9 :r10 :r11 :r12 :r13 :rbx :r15))
+  (if c::*use-x86-r15*
+      '(:r8 :r9 :r10 :r11 :r12 :r13 :rbx :r15)
+      '(:r8 :r9 :r10 :r11 :r12 :r13 :rbx)))
 
 (defmethod ra:valid-physical-registers-for-kind ((kind (eql :integer)) (architecture c:x86-64-target))
   '(:rax :rcx :rdx :rsi :rdi))

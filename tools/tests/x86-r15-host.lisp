@@ -60,6 +60,16 @@
   (assert (member :r15
                   (mezzano.compiler.backend.register-allocator:instruction-clobbers call target))))
 
+(let ((target (make-instance 'mezzano.compiler:x86-64-target))
+      (mezzano.compiler::*use-x86-r15* nil)
+      ;; The host cross environment has no LOAD-TIME-VALUE loader installed.
+      (mezzano.compiler::*load-time-value-hook* nil))
+  (assert (not (member :r15
+                       (mezzano.compiler.backend.register-allocator:valid-physical-registers-for-kind :value target))))
+  (assert (equal (assoc 'mezzano.compiler::*use-x86-r15*
+                       (mezzano.compiler::compiler-state-bindings))
+                 '(mezzano.compiler::*use-x86-r15* nil))))
+
 (let ((*r15-test-lap* nil))
   (dolist (mezzano.compiler::*perform-tce* '(nil t))
     (dolist (form
@@ -86,3 +96,30 @@
       (mezzano.compiler::compile-lambda form)))
   (assert (plusp (count-if #'r15-check-generated-function *r15-test-lap*)))
   (format t "R15 HOST PASS: ~D generated functions checked.~%" (length *r15-test-lap*)))
+
+;; Turning allocation off leaves the ABI intact but changes real code generation.
+(dolist (mezzano.compiler::*use-x86-r15* '(nil t))
+  (let ((*r15-test-lap* nil)
+        (mezzano.compiler::*perform-tce* nil))
+    (mezzano.compiler::compile-lambda
+     '(lambda (x)
+        (unknown-function x)
+        (unknown-function x)
+        (car x)))
+    (let ((body-uses
+            (loop for lap in *r15-test-lap* sum
+              (count-if
+               (lambda (inst)
+                 (and (consp inst)
+                      (member :r15 (cdr inst))
+                      (not (keywordp (car inst)))
+                      (not (and (eq (car inst) 'mezzano.lap.x86:mov64)
+                                (or (and (consp (second inst))
+                                         (eq (car (second inst)) :stack))
+                                    (and (consp (third inst))
+                                         (eq (car (third inst)) :stack)))))))
+               lap))))
+      (assert (if mezzano.compiler::*use-x86-r15*
+                  (plusp body-uses)
+                  (zerop body-uses))))))
+(format t "R15 ALLOCATION FLAG PASS: generated bodies differ in both modes.~%")
