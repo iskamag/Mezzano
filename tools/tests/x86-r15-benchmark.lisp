@@ -137,7 +137,8 @@
                       (dotimes (r repeats sum)
                         (dotimes (i 64)
                           (setf sum (logand #xffff (+ sum (* 17 i) 31))))))))
-      ;; Unchanged code control: one call to the shared raw integer loop.
+      ;; These wrappers provide compilation statistics, while timed CONTROL
+      ;; trials call the same RAW-CONTROL function object in both modes.
       (,control . (lambda (repeats input)
                     (declare (optimize (speed 3) (safety 0) (debug 0)))
                     (raw-control repeats input))))))
@@ -204,14 +205,10 @@
                                        (logand #xffff (score (svref input i) (+ 26 i))))))
                  ((arithmetic control) (+ (* 17 (/ (* 64 63) 2)) (* 64 31))))))))
 
-(defun check-control-code ()
-  (let* ((off (fdefinition (graph-name nil 'control)))
-         (on (fdefinition (graph-name t 'control)))
-         (size (mezzano.internals::function-code-size off)))
-    (assert (= size (mezzano.internals::function-code-size on)))
-    (loop for i from 16 below size do
-      (assert (= (mezzano.internals::function-code-byte off i)
-                 (mezzano.internals::function-code-byte on i))))))
+(defun benchmark-function (mode name)
+  ;; Separately compiled wrappers have different PC-relative relocation
+  ;; bytes. Use one identical function object for the strict timing control.
+  (fdefinition (if (eq name 'control) 'raw-control (graph-name mode name))))
 
 (defun time-trial (function repeats input)
   ;; Snapshot counters without allocating a result structure before timing.
@@ -253,8 +250,8 @@
   ;; amounts of work in an off/on pair. Calibration trials are not samples.
   (let ((repeats 1))
     (loop
-      (let* ((off (time-trial (fdefinition (graph-name nil name)) repeats input))
-             (on (time-trial (fdefinition (graph-name t name)) repeats input))
+      (let* ((off (time-trial (benchmark-function nil name) repeats input))
+             (on (time-trial (benchmark-function t name) repeats input))
              (seconds (max (getf off :seconds) (getf on :seconds))))
         (assert (= (getf off :checksum) (getf on :checksum)))
         (when (>= seconds (/ target 3))
@@ -283,13 +280,13 @@ TSC ticks measure elapsed reference time, not core execution cycles."
     (dotimes (i 64) (setf (svref records i) (cons (+ i 1) (+ (* i 3) 7))))
     (compile-graph nil :calibration)
     (compile-graph t :calibration)
-    (check-control-code)
+    (assert (eq (benchmark-function nil 'control) (benchmark-function t 'control)))
     (dolist (entry (list (list 'calls records) (list 'tree tree)
                         (list 'records records) (list 'arithmetic nil) (list 'control nil)))
       (destructuring-bind (name input) entry
         (let* ((repeats (calibrate name input target-seconds))
-               (off (funcall (fdefinition (graph-name nil name)) repeats input))
-               (on (funcall (fdefinition (graph-name t name)) repeats input)))
+               (off (funcall (benchmark-function nil name) repeats input))
+               (on (funcall (benchmark-function t name) repeats input)))
           (assert (= off on (reference-checksum name repeats input)))
           (push (list name input repeats off) workloads)
           (emit-record (list :calibration :workload name :repeats repeats :checksum off)))))
@@ -298,11 +295,11 @@ TSC ticks measure elapsed reference time, not core execution cycles."
       (let* ((pair (1+ index)) (order (if (evenp index) '(nil t) '(t nil))))
         ;; Recompile the entire owned graph each pair, alternating order.
         (dolist (mode order) (compile-graph mode pair))
-        (check-control-code)
+        (assert (eq (benchmark-function nil 'control) (benchmark-function t 'control)))
         (dolist (workload workloads)
           (destructuring-bind (name input repeats expected) workload
             (dolist (mode order)
-              (let ((function (fdefinition (graph-name mode name))))
+              (let ((function (benchmark-function mode name)))
                 (mezzano.internals::gc :full t)
                 (setf *sink* (funcall function (max 1 (floor repeats 10)) input))
                 (let ((metrics (time-trial function repeats input)))
