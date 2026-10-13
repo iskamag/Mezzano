@@ -142,26 +142,32 @@
   (when (not (thread-full-save-p thread))
     ;; Discard the partial wrapper, keeping the ordinary return address on
     ;; top of the stack for %%FULL-SAVE-RETURN-THUNK. Callers must allow paging.
-    (let ((sp (thread-state-rsp thread)))
-      (setf (thread-state-r15-value thread) (sys.int::memref-t sp 0)
-            (thread-state-rbp thread) (sys.int::memref-unsigned-byte-64 sp 2)
-            (thread-state-rsp thread) (+ sp 24)))
-    (setf (thread-state-rcx-value thread) 0
-          (thread-state-rbx-value thread) nil
-          (thread-state-r8-value thread) nil
-          (thread-state-r9-value thread) nil
-          (thread-state-r10-value thread) nil
-          (thread-state-r11-value thread) nil
-          (thread-state-r12-value thread) nil
-          (thread-state-r13-value thread) nil
-          (thread-state-r14-value thread) nil
-          (thread-state-rip thread) (sys.int::%object-ref-unsigned-byte-64
-                                     #'%%full-save-return-thunk
-                                     sys.int::+function-entry-point+)
-          (thread-state-cs thread) #x08
-          (thread-state-ss thread) #x00
-          (thread-state-rflags thread) #x202
-          (thread-full-save-p thread) t)))
+    (let* ((sp (thread-state-rsp thread))
+           (r15 (sys.int::memref-t sp 0))
+           (fp (sys.int::memref-unsigned-byte-64 sp 2)))
+      ;; Publish the new shape without a GC interrupt seeing a partial
+      ;; flag paired with an already-unwrapped stack pointer.
+      (safe-without-interrupts (thread r15 fp)
+        (setf (thread-state-r15-value thread) r15
+              (thread-state-rbp thread) fp
+              (thread-state-rsp thread) (+ (thread-state-rsp thread) 24)
+              (thread-state-rcx-value thread) 0
+              (thread-state-rbx-value thread) nil
+              (thread-state-r8-value thread) nil
+              (thread-state-r9-value thread) nil
+              (thread-state-r10-value thread) nil
+              (thread-state-r11-value thread) nil
+              (thread-state-r12-value thread) nil
+              (thread-state-r13-value thread) nil
+              (thread-state-r14-value thread) nil
+              (thread-state-rip thread) (sys.int::%object-ref-unsigned-byte-64
+                                         #'%%full-save-return-thunk
+                                         sys.int::+function-entry-point+)
+              (thread-state-cs thread) #x08
+              (thread-state-ss thread) #x00
+              (thread-state-rflags thread) #x202
+              (thread-full-save-p thread) t)))))
+
 
 (sys.int::define-lap-function %%partial-save-return-thunk (())
   (:gc :frame :interrupt t)
@@ -203,8 +209,21 @@
      512 ; FPU state
      (* 20 8))) ; GPRs
 
+(defun ensure-thread-state-conversion-context ()
+  ;; Foothold/unsleep callers own the world stop. The pager runs with IRQs
+  ;; off on a wired stack and commits target pages before constructing frames.
+  ;; These are the existing exclusions protecting copies of saved registers.
+  (let ((self (current-thread)))
+    (ensure (or (eql *world-stopper* self)
+                (and (eql self sys.int::*pager-thread*)
+                     (not (sys.int::%interrupt-state))))
+            "Thread-state conversion without world-stop or pager exclusion"))
+  (when (not (sys.int::%interrupt-state))
+    (ensure-on-wired-stack)))
+
 (defun convert-thread-to-partial-save (thread)
   (when (thread-full-save-p thread)
+    (ensure-thread-state-conversion-context)
     ;; Push the current full save state on the stack and create an interrupt frame.
     (let ((sp (thread-state-rsp thread)))
       (decf sp (+ (* +thread-mv-slots-size+ 8)
@@ -234,34 +253,41 @@
         (setf (sys.int::memref-unsigned-byte-64 (decf sp 8)) fp)
         (setf (sys.int::memref-unsigned-byte-64 (decf sp 8)) 0) ; padding
         (setf (sys.int::memref-t (decf sp 8)) 0) ; R15 restored by the interrupt thunk
-        (setf (thread-state-rsp thread) sp
-              (thread-state-rbp thread) fp
-              (thread-full-save-p thread) nil)))))
+        (safe-without-interrupts (thread sp fp)
+          (setf (thread-state-rsp thread) sp
+                (thread-state-rbp thread) fp
+                (thread-full-save-p thread) nil))))))
 
 (defun force-call-on-thread (thread function &optional (argument nil argumentp))
+  (ensure-thread-state-conversion-context)
   (convert-thread-to-partial-save thread)
-  ;; The injected function follows the ordinary entry convention; unwrap
-  ;; the partial save and leave its return address at RSP.
-  (let ((sp (thread-state-rsp thread)))
-    (setf (thread-state-r15-value thread) (sys.int::memref-t sp 0)
-          (thread-state-rbp thread) (sys.int::memref-unsigned-byte-64 sp 2)
-          (thread-state-rsp thread) (+ sp 24)))
-  (setf (thread-state-rip thread) (sys.int::%object-ref-unsigned-byte-64
-                                   function
-                                   sys.int::+function-entry-point+)
-        (thread-state-rcx-value thread) (if argumentp 1 0)
-        (thread-state-rbx-value thread) function
-        (thread-state-r8-value thread) argument
-        (thread-state-r9-value thread) nil
-        (thread-state-r10-value thread) nil
-        (thread-state-r11-value thread) nil
-        (thread-state-r12-value thread) nil
-        (thread-state-r13-value thread) nil
-        (thread-state-r14-value thread) nil
-        (thread-state-cs thread) #x08
-        (thread-state-ss thread) #x00
-        (thread-state-rflags thread) #x202
-        (thread-full-save-p thread) t))
+  ;; Read the pageable stack and function header before atomic publication.
+  ;; The caller's exclusion prevents copied/staged values from being moved by
+  ;; GC. Until RSP and FULL-SAVE-P change together the saved wrapper remains
+  ;; the authoritative root set; the staged register fields are ignored.
+  (let* ((sp (thread-state-rsp thread))
+         (r15 (sys.int::memref-t sp 0))
+         (fp (sys.int::memref-unsigned-byte-64 sp 2))
+         (entry (sys.int::%object-ref-unsigned-byte-64 function sys.int::+function-entry-point+)))
+    (setf (thread-state-r15-value thread) r15
+          (thread-state-rbp thread) fp
+          (thread-state-rip thread) entry
+          (thread-state-rcx-value thread) (if argumentp 1 0))
+    (safe-without-interrupts (thread function argument)
+      ;; Leave the ordinary return address at RSP for the injected function.
+      (setf (thread-state-rsp thread) (+ (thread-state-rsp thread) 24)
+            (thread-state-rbx-value thread) function
+            (thread-state-r8-value thread) argument
+            (thread-state-r9-value thread) nil
+            (thread-state-r10-value thread) nil
+            (thread-state-r11-value thread) nil
+            (thread-state-r12-value thread) nil
+            (thread-state-r13-value thread) nil
+            (thread-state-r14-value thread) nil
+            (thread-state-cs thread) #x08
+            (thread-state-ss thread) #x00
+            (thread-state-rflags thread) #x202
+            (thread-full-save-p thread) t))))
 
 (defun stop-thread-for-single-step (interrupt-frame)
   (let ((self (current-thread)))

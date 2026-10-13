@@ -105,9 +105,11 @@
                (mezzano.internals::gc :full t)
                (mezzano.supervisor::convert-thread-to-full-save thread)
                (assert (mezzano.supervisor:thread-full-save-p thread))
-               ;; Check both wrappers: full -> partial -> full.
-               (mezzano.supervisor::convert-thread-to-partial-save thread)
-               (mezzano.supervisor::convert-thread-to-full-save thread)
+               ;; Materializing an interrupt frame requires the same exclusion
+               ;; as foothold injection: current caller owns the world stop.
+               (mezzano.supervisor::with-world-stopped
+                 (mezzano.supervisor::convert-thread-to-partial-save thread)
+                 (mezzano.supervisor::convert-thread-to-full-save thread))
                (mezzano.supervisor::resume-thread thread)
                (let ((result (first (mezzano.supervisor:thread-join thread))))
                  (assert (and (consp result) (eq (car result) :r15-regression)
