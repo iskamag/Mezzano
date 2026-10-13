@@ -114,6 +114,25 @@
                (let ((result (first (mezzano.supervisor:thread-join thread))))
                  (assert (and (consp result) (eq (car result) :r15-regression)
                               (eql (cdr result) 12345)))))))
+    (probe :foothold
+           (lambda ()
+             (let ((ran nil)
+                   (thread
+                     (mezzano.supervisor:make-thread
+                      (lambda ()
+                        (x86-r15-probe #'mezzano.supervisor::stop-current-thread))
+                      :name "R15 foothold regression")))
+               (loop until (eq (mezzano.supervisor::sample-thread-state thread) :stopped)
+                     do (mezzano.supervisor:thread-yield))
+               (assert (not (mezzano.supervisor:thread-full-save-p thread)))
+               (mezzano.supervisor::establish-thread-foothold
+                thread (lambda () (setf ran t)))
+               (assert (mezzano.supervisor:thread-full-save-p thread))
+               (mezzano.supervisor::resume-thread thread)
+               (let ((result (first (mezzano.supervisor:thread-join thread))))
+                 (assert ran)
+                 (assert (and (consp result) (eq (car result) :r15-regression)
+                              (eql (cdr result) 12345)))))))
     (probe :gc
            (lambda ()
              (mezzano.internals::gc)
