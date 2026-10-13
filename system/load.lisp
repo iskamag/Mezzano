@@ -90,6 +90,13 @@
             "LLF compiled for wrong architecture ~S. Wanted ~S."
             arch (current-architecture))))
 
+(defun llf-header-compatible-p (stream)
+  "Return true if STREAM starts with a valid LLF header for this image.
+Consumes the header. Invalid or truncated headers return false."
+  (handler-case
+      (progn (check-llf-header stream) t)
+    (error () nil)))
+
 (defun load-integer (stream)
   (let ((value 0) (shift 0))
     (loop

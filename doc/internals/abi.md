@@ -20,6 +20,10 @@ to store Lisp values. The GC will scan these registers.
 
 `R14` contains the constant NIL (equivalent to arm64 `x26`).
 
+LLF version 37 introduces this x86-64 callee-save convention. Earlier compiled
+code is incompatible: an old non-local exit target can bypass a callee's
+epilogue without restoring the caller's R15. Recompile all LLFs.
+
 `R15` is callee-save and stores Lisp values. The GC scans it in full saves
 and interrupt frames, and scans its saved stack slot for voluntarily suspended
 threads. Compiled functions that use it save the incoming value in a live stack

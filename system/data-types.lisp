@@ -314,7 +314,9 @@ Internal to sg-vec, should not be used by other code.")
 reserved on the disk, but no specific block has been allocated.")
 (defconstant +block-map-id-not-allocated+ 0)
 
-(defparameter *llf-version* 36)
+;; Version 37 requires the x86-64 R15 callee-save ABI, including NLX targets.
+;; Old targets bypass callee epilogues without restoring the caller's R15.
+(defparameter *llf-version* 37)
 
 (defconstant +llf-arch-x86-64+ 1)
 (defconstant +llf-arch-arm64+ 2)
