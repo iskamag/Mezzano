@@ -1164,9 +1164,13 @@ It will put the thread to sleep, while it waits for the page."
     ;; Ensure that enough of the stack is paged in to form a full
     ;; interrupt frame.
     (let* ((current-sp (thread-state-rsp thread))
-           (target-sp (- current-sp (stack-space-required-for-force-call-on-thread thread))))
+           (target-sp (- current-sp (stack-space-required-for-force-call-on-thread thread)))
+           ;; Unwrapping an x86 partial save reads R15 and saved RBP above
+           ;; current-sp. Include the whole wrapper if it crosses a page.
+           (top-sp #+x86-64 (if (thread-full-save-p thread) current-sp (+ current-sp 32))
+                   #-x86-64 current-sp))
       (loop
-         for address from (align-down target-sp #x1000) below (align-up current-sp #x1000) by #x1000
+         for address from (align-down target-sp #x1000) below (align-up top-sp #x1000) by #x1000
          do (when (not (wait-for-page-unlocked address t))
               (return-from pager-invoke-function-on-thread nil))))
     (if arg-p
