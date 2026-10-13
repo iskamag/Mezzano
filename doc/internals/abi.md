@@ -18,9 +18,15 @@ values, so must be executed with `:extra-registers` metadata to indicate livenes
 `RBX`, `R8`, `R9`, `R10`, `R11`, `R12`, and `R13` are all caller-save and are used
 to store Lisp values. The GC will scan these registers.
 
-`R14` contains the constant NIL (equivalent to arm64 x26
+`R14` contains the constant NIL (equivalent to arm64 `x26`).
 
-`R15` is not used or scanned by the GC due to historical reasons.
+`R15` is callee-save and stores Lisp values. The GC scans it in full saves
+and interrupt frames, and scans its saved value for voluntarily suspended
+threads. Compiled functions that use it save the incoming value in a live stack
+slot and restore it before returning or tail-calling. Functions with non-local
+exit targets also save it, since an exit skips intervening callees' epilogues.
+Calls that may non-locally exit into the current function clobber `R15` for
+register allocation, as on arm64.
 
 The direction flag (`RFLAGS.DF`) must be set to zero (forward) on function
 entry and return. Other flags are caller-save.

@@ -63,14 +63,32 @@
   (:gc :no-frame :layout #*00)
   (sys.lap-x86:test64 (:rsp) #x200)
   (sys.lap-x86:jnz INTERRUPTS-ENABLED)
-  ;; Interrupts are already disabled, tail-call to the function.
-  (sys.lap-x86:add64 :rsp 8) ; drop pushed flags.
-  (sys.lap-x86:jmp (:object :rbx 0))
+  ;; Interrupts are already disabled. Preserve R15 here too: rescheduling can
+  ;; bypass the callee's epilogue even when interrupts were already off.
+  (sys.lap-x86:mov64 (:rsp) :rbp)
+  (sys.lap-x86:mov64 :rbp :rsp)
+  (:gc :frame)
+  (sys.lap-x86:sub64 :rsp 16)
+  (sys.lap-x86:mov64 (:stack 0) :r15)
+  (:gc :frame :layout #*1)
+  (sys.lap-x86:call (:object :rbx 0))
+  (:gc :frame :layout #*1 :multiple-values 0)
+  (sys.lap-x86:mov64 :r15 (:stack 0))
+  (sys.lap-x86:leave)
+  (:gc :no-frame :layout #*0 :multiple-values 0)
+  (sys.lap-x86:ret)
   INTERRUPTS-ENABLED
   ;; Save the old stack pointer.
   (sys.lap-x86:mov64 (:rsp) :rbp) ; overwrite the saved interrupt state.
   (sys.lap-x86:mov64 :rbp :rsp)
   (:gc :frame)
+  ;; Save the caller's R15 on its normal stack before switching stacks.
+  ;; Voluntary rescheduling bypasses the wired callee's epilogue, so the
+  ;; scheduler must recover this value rather than the wired callee's R15.
+  ;; R8 continues to point at the original return address; saved R15 is R8-16.
+  (sys.lap-x86:sub64 :rsp 16)
+  (sys.lap-x86:mov64 (:rbp -8) :r15)
+  (:gc :frame :layout #*1)
   ;; Disable interrupts after setting up the frame, not before.
   ;; Modifying the normal stack may cause page-faults which can't
   ;; occur with interrupts disabled.
@@ -80,13 +98,16 @@
   (sys.lap-x86:mov64 :rsp (:object-location nil #.+x86-64-cpu-wired-stack-pointer+))
   ;; Call function, argument were setup above.
   (sys.lap-x86:call (:object :rbx 0))
-  (:gc :frame :multiple-values 0)
+  (:gc :frame :layout #*1 :multiple-values 0)
   ;; Switch back to the old stack.
   ;; Do not restore :RBP here, that would touch the old stack with
   ;; interrupts disabled.
-  (sys.lap-x86:mov64 :rsp :rbp)
+  (sys.lap-x86:lea64 :rsp (:rbp -16))
   ;; Reenable interrupts, must not be done when on the wired stack.
   (sys.lap-x86:sti)
+  ;; Now safe to restore the callee-save registers.
+  (sys.lap-x86:mov64 :r15 (:rsp 8))
+  (sys.lap-x86:add64 :rsp 16)
   ;; Now safe to restore :RBP.
   (sys.lap-x86:pop :rbp)
   (:gc :no-frame :layout #*0 :multiple-values 0)

@@ -13,11 +13,16 @@
   (sys.lap-x86:ret))
 
 (sys.int::define-lap-function %%return-to-same-thread ()
-  (sys.lap-x86:mov64 :rsp :r8)
+  ;; Keep the saved R15 in the live stack layout until it is reloaded.
+  (sys.lap-x86:lea64 :rsp (:r8 -16))
   (sys.lap-x86:mov64 :rbp :r9)
   (sys.lap-x86:xor32 :ecx :ecx)
   (sys.lap-x86:mov64 :r8 :r14)
   (sys.lap-x86:sti)
+  (:gc :no-frame :layout #*100)
+  (sys.lap-x86:pop :r15)
+  (:gc :no-frame :layout #*00)
+  (sys.lap-x86:add64 :rsp 8) ; drop saved frame pointer
   (:gc :no-frame :layout #*0)
   (sys.lap-x86:ret))
 
@@ -76,6 +81,8 @@
   (sys.lap-x86:mov64 :r9 (:symbol-global-cell *global-thread-lock*))
   (sys.lap-x86:mov64 :r10 (:constant :unlocked))
   (sys.lap-x86:mov64 (:object :r9 #.sys.int::+symbol-value-cell-value+) :r10)
+  ;; Partial saves retain the caller's R15 in the thread save area.
+  (sys.lap-x86:mov64 :r15 (:object :r8 #.+thread-state-r15+))
   ;; Restore stack pointer.
   (sys.lap-x86:mov64 :rsp (:object :r8 #.+thread-state-rsp+))
   ;; Restore frame pointer.

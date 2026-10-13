@@ -909,6 +909,8 @@ This is required to make the GC interrupt safe."
                        (return-address (memref-unsigned-byte-64 stack-pointer
                                                                 #-arm64 0
                                                                 #+arm64 3)))
+                  #+x86-64
+                  (scavengef (mezzano.supervisor:thread-state-r15-value object) cycle-kind)
                   #+arm64
                   (scavengef (memref-t stack-pointer 0) cycle-kind) ; x13
                   #+arm64
@@ -1083,8 +1085,11 @@ This is required to make the GC interrupt safe."
   (let ((stack-pointer (%object-ref-signed-byte-64 object +delimited-continuation-stack-pointer+)))
     (when (not (zerop stack-pointer))
       ;; Scan the stack. God willing.
-      (let ((frame-pointer (memref-unsigned-byte-64 stack-pointer 2))
-            (return-address (memref-unsigned-byte-64 stack-pointer 3)))
+      ;; x86-64 captures R15 and alignment padding below the saved SSP pair.
+      #+x86-64
+      (scavengef (memref-t stack-pointer 1) cycle-kind)
+      (let ((frame-pointer (memref-unsigned-byte-64 stack-pointer #+x86-64 4 #-x86-64 2))
+            (return-address (memref-unsigned-byte-64 stack-pointer #+x86-64 5 #-x86-64 3)))
         (scavenge-stack stack-pointer frame-pointer return-address cycle-kind)))))
 
 (defun scan-weak-pointer (object cycle-kind)

@@ -540,8 +540,8 @@ Returns NIL if the function captures no variables."
 (defun platform-callee-save-regs ()
   #+arm64
   (list (cons :x13 nil) (cons :x14 nil))
-  #-arm64
-  nil)
+  #+x86-64
+  (list (cons :r15 nil)))
 
 (defun update-callee-save-regs (regs fp)
   (let ((new-fp (memref-unsigned-byte-64 fp 0))
