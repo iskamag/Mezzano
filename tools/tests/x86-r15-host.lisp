@@ -76,6 +76,10 @@
                (list a b c d e f fp g gp))
              (lambda (a b c d e f &key (x :default xp) (y :default yp))
                (list a b c d e f x xp y yp))
+             (lambda (a b c d e f &rest options
+                      &key (x :default xp) (y :default yp) &allow-other-keys)
+               (list a b c d e f x xp y yp (copy-list options)))
+             (lambda (function arguments) (apply function arguments))
              (lambda (fn) (multiple-value-bind (a b c d e f g) (funcall fn)
                             (list a b c d e f g)))
              (lambda (x) (block done (funcall (lambda () (return-from done x)))))))

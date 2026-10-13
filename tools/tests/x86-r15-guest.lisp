@@ -37,7 +37,7 @@
 
 (declaim (notinline x86-r15-leaf x86-r15-tail x86-r15-tail-many
                     x86-r15-optionals x86-r15-rest x86-r15-keywords
-                    x86-r15-supplied-optionals))
+                    x86-r15-supplied-optionals x86-r15-rest-keywords))
 (defun x86-r15-leaf (a b c d e f g h)
   (list a b c d e f g h))
 (defun x86-r15-tail (a b c d)
@@ -53,6 +53,9 @@
   (list a b c d e f fp g gp))
 (defun x86-r15-keywords (a b c d e f &key (x :default xp) (y :default yp))
   (list a b c d e f x xp y yp))
+(defun x86-r15-rest-keywords (a b c d e f &rest options
+                            &key (x :default xp) (y :default yp) &allow-other-keys)
+  (list a b c d e f x xp y yp (copy-list options)))
 (declaim (notinline x86-r15-seven-values))
 (defun x86-r15-seven-values ()
   (values (cons :a 1) (cons :b 2) 3 4 5 6 7))
@@ -75,6 +78,16 @@
                    (list a b c d e f :default nil :default nil)))
     (assert (equal (x86-r15-keywords a b c d e f :y h :x g)
                    (list a b c d e f g t h t)))
+    (assert (equal (apply #'x86-r15-supplied-optionals (list a b c d e f g))
+                   (list a b c d e f t g t)))
+    (assert (equal (apply #'x86-r15-keywords (list a b c d e f :y h :x g))
+                   (list a b c d e f g t h t)))
+    (assert (equal (apply #'x86-r15-keywords
+                         (list a b c d e f :allow-other-keys t :unknown 42 :x g))
+                   (list a b c d e f g t :default nil)))
+    (assert (equal (apply #'x86-r15-rest-keywords
+                         (list a b c d e f :unknown 42 :y h :x g))
+                   (list a b c d e f g t h t (list :unknown 42 :y h :x g))))
     (assert (= (+ (cdr a) (cdr b) (cdr c) (cdr d)
                   (cdr e) (cdr f) (cdr g) (cdr h)) 36))))
 
@@ -123,6 +136,15 @@
                                            (x86-r15-stress-calls))))
                    (warn "R15 warning restart regression ~D" 42)))
                (assert (= inner outer 1)))))
+    (probe :declining-warning
+           (lambda ()
+             (let ((count 0))
+               (handler-bind ((t (lambda (condition)
+                                   (assert (typep condition 'warning))
+                                   (incf count)
+                                   (x86-r15-stress-calls))))
+                 (warn "R15 declining warning regression"))
+               (assert (= count 1)))))
     (probe :voluntary-switch
            (lambda ()
              (dotimes (i 10)
