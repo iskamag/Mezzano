@@ -21,7 +21,7 @@ to store Lisp values. The GC will scan these registers.
 `R14` contains the constant NIL (equivalent to arm64 `x26`).
 
 `R15` is callee-save and stores Lisp values. The GC scans it in full saves
-and interrupt frames, and scans its saved value for voluntarily suspended
+and interrupt frames, and scans its saved stack slot for voluntarily suspended
 threads. Compiled functions that use it save the incoming value in a live stack
 slot and restore it before returning or tail-calling. Functions with non-local
 exit targets also save it, since an exit skips intervening callees' epilogues.
@@ -578,3 +578,13 @@ A normal interrupt frame will have metadata of `(:gc :frame :interrupt t)`, howe
 x86-64 supports an additional mode of `(:gc :no-frame :interrupt t)`, which indicates
 that sp is pointing directly at the `iret` frame part of the state and is ready
 to return.
+
+### Voluntary x86-64 thread saves.
+
+Before switching to the wired stack, `%call-on-wired-stack-without-interrupts`
+saves the caller's R15 on its original stack. The saved RSP points at a four-word
+partial frame: R15, alignment padding, saved RBP, and return address. The saved
+RBP denotes the caller's frame. The GC scans R15 before unwinding the caller.
+Resume thunks enable interrupts before reading this pageable stack, restore R15,
+discard the padding and saved RBP, then return. Full/partial conversions and
+foothold injection use the same wrapper; stopped-stack accesses permit paging.

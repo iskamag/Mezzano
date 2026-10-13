@@ -14,15 +14,15 @@
 
 (sys.int::define-lap-function %%return-to-same-thread ()
   ;; Keep the saved R15 in the live stack layout until it is reloaded.
-  (sys.lap-x86:lea64 :rsp (:r8 -16))
+  (sys.lap-x86:mov64 :rsp :r8)
   (sys.lap-x86:mov64 :rbp :r9)
   (sys.lap-x86:xor32 :ecx :ecx)
   (sys.lap-x86:mov64 :r8 :r14)
   (sys.lap-x86:sti)
-  (:gc :no-frame :layout #*100)
+  (:gc :no-frame :layout #*1000)
   (sys.lap-x86:pop :r15)
-  (:gc :no-frame :layout #*00)
-  (sys.lap-x86:add64 :rsp 8) ; drop saved frame pointer
+  (:gc :no-frame :layout #*000)
+  (sys.lap-x86:add64 :rsp 16) ; drop padding & saved frame pointer
   (:gc :no-frame :layout #*0)
   (sys.lap-x86:ret))
 
@@ -81,14 +81,16 @@
   (sys.lap-x86:mov64 :r9 (:symbol-global-cell *global-thread-lock*))
   (sys.lap-x86:mov64 :r10 (:constant :unlocked))
   (sys.lap-x86:mov64 (:object :r9 #.sys.int::+symbol-value-cell-value+) :r10)
-  ;; Partial saves retain the caller's R15 in the thread save area.
-  (sys.lap-x86:mov64 :r15 (:object :r8 #.+thread-state-r15+))
   ;; Restore stack pointer.
   (sys.lap-x86:mov64 :rsp (:object :r8 #.+thread-state-rsp+))
   ;; Restore frame pointer.
   (sys.lap-x86:mov64 :rbp (:object :r8 #.+thread-state-rbp+))
   ;; Reenable interrupts. Must be done before touching the thread stack.
   (sys.lap-x86:sti)
+  (:gc :no-frame :layout #*1000)
+  (sys.lap-x86:pop :r15)
+  (:gc :no-frame :layout #*000)
+  (sys.lap-x86:add64 :rsp 16) ; drop padding & saved frame pointer
   (:gc :no-frame :layout #*0)
   ;; No value return.
   (sys.lap-x86:xor32 :ecx :ecx)
@@ -138,6 +140,12 @@
 
 (defun convert-thread-to-full-save (thread)
   (when (not (thread-full-save-p thread))
+    ;; Discard the partial wrapper, keeping the ordinary return address on
+    ;; top of the stack for %%FULL-SAVE-RETURN-THUNK. Callers must allow paging.
+    (let ((sp (thread-state-rsp thread)))
+      (setf (thread-state-r15-value thread) (sys.int::memref-t sp 0)
+            (thread-state-rbp thread) (sys.int::memref-unsigned-byte-64 sp 2)
+            (thread-state-rsp thread) (+ sp 24)))
     (setf (thread-state-rcx-value thread) 0
           (thread-state-rbx-value thread) nil
           (thread-state-r8-value thread) nil
@@ -190,7 +198,7 @@
 
 (defun stack-space-required-for-force-call-on-thread (thread)
   (declare (ignore thread))
-  (+ 16 ; Return address and more alignment
+  (+ 32 ; Partial wrapper (R15, padding, RBP, return address)
      (* +thread-mv-slots-size+ 8) ; Saved MV area.
      512 ; FPU state
      (* 20 8))) ; GPRs
@@ -221,12 +229,23 @@
       (setf (sys.int::memref-unsigned-byte-64 sp) (sys.int::%object-ref-unsigned-byte-64
                                                    #'%%partial-save-return-thunk
                                                    sys.int::+function-entry-point+))
-      (setf (thread-state-rsp thread) sp
-            (thread-state-rbp thread) (+ sp (* 15 8))
-            (thread-full-save-p thread) nil))))
+      ;; Wrap the return thunk in the same partial frame as a wired call.
+      (let ((fp (+ sp (* 16 8))))
+        (setf (sys.int::memref-unsigned-byte-64 (decf sp 8)) fp)
+        (setf (sys.int::memref-unsigned-byte-64 (decf sp 8)) 0) ; padding
+        (setf (sys.int::memref-t (decf sp 8)) 0) ; R15 restored by the interrupt thunk
+        (setf (thread-state-rsp thread) sp
+              (thread-state-rbp thread) fp
+              (thread-full-save-p thread) nil)))))
 
 (defun force-call-on-thread (thread function &optional (argument nil argumentp))
   (convert-thread-to-partial-save thread)
+  ;; The injected function follows the ordinary entry convention; unwrap
+  ;; the partial save and leave its return address at RSP.
+  (let ((sp (thread-state-rsp thread)))
+    (setf (thread-state-r15-value thread) (sys.int::memref-t sp 0)
+          (thread-state-rbp thread) (sys.int::memref-unsigned-byte-64 sp 2)
+          (thread-state-rsp thread) (+ sp 24)))
   (setf (thread-state-rip thread) (sys.int::%object-ref-unsigned-byte-64
                                    function
                                    sys.int::+function-entry-point+)

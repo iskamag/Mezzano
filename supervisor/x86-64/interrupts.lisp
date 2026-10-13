@@ -69,11 +69,12 @@
   (sys.lap-x86:mov64 :rbp :rsp)
   (:gc :frame)
   (sys.lap-x86:sub64 :rsp 16)
-  (sys.lap-x86:mov64 (:stack 0) :r15)
-  (:gc :frame :layout #*1)
+  (sys.lap-x86:mov64 (:stack 1) :r15)
+  (:gc :frame :layout #*01)
+  (sys.lap-x86:mov64 :r8 :rsp) ; saved partial frame: R15, padding, RBP, return address
   (sys.lap-x86:call (:object :rbx 0))
-  (:gc :frame :layout #*1 :multiple-values 0)
-  (sys.lap-x86:mov64 :r15 (:stack 0))
+  (:gc :frame :layout #*01 :multiple-values 0)
+  (sys.lap-x86:mov64 :r15 (:stack 1))
   (sys.lap-x86:leave)
   (:gc :no-frame :layout #*0 :multiple-values 0)
   (sys.lap-x86:ret)
@@ -85,10 +86,11 @@
   ;; Save the caller's R15 on its normal stack before switching stacks.
   ;; Voluntary rescheduling bypasses the wired callee's epilogue, so the
   ;; scheduler must recover this value rather than the wired callee's R15.
-  ;; R8 continues to point at the original return address; saved R15 is R8-16.
+  ;; Pass the partial frame pointer in R8; R9 remains the caller's RBP.
   (sys.lap-x86:sub64 :rsp 16)
-  (sys.lap-x86:mov64 (:rbp -8) :r15)
-  (:gc :frame :layout #*1)
+  (sys.lap-x86:mov64 (:stack 1) :r15)
+  (:gc :frame :layout #*01)
+  (sys.lap-x86:mov64 :r8 :rsp)
   ;; Disable interrupts after setting up the frame, not before.
   ;; Modifying the normal stack may cause page-faults which can't
   ;; occur with interrupts disabled.
@@ -98,7 +100,7 @@
   (sys.lap-x86:mov64 :rsp (:object-location nil #.+x86-64-cpu-wired-stack-pointer+))
   ;; Call function, argument were setup above.
   (sys.lap-x86:call (:object :rbx 0))
-  (:gc :frame :layout #*1 :multiple-values 0)
+  (:gc :frame :layout #*01 :multiple-values 0)
   ;; Switch back to the old stack.
   ;; Do not restore :RBP here, that would touch the old stack with
   ;; interrupts disabled.
@@ -106,7 +108,7 @@
   ;; Reenable interrupts, must not be done when on the wired stack.
   (sys.lap-x86:sti)
   ;; Now safe to restore the callee-save registers.
-  (sys.lap-x86:mov64 :r15 (:rsp 8))
+  (sys.lap-x86:mov64 :r15 (:rsp))
   (sys.lap-x86:add64 :rsp 16)
   ;; Now safe to restore :RBP.
   (sys.lap-x86:pop :rbp)

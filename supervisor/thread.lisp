@@ -402,13 +402,6 @@ Interrupts must be off and the global thread lock must be held."
   (save-fpu-state current-thread)
   ;; Save stack pointer.
   (setf (thread-state-rsp-value current-thread) sp)
-  ;; The wired call may have overwritten R15 without returning through its
-  ;; epilogue. Recover the value saved by %CALL-ON-WIRED-STACK-WITHOUT-INTERRUPTS.
-  #+x86-64
-  ;; SP is passed with raw pointer bits in a value register. Read the numeric
-  ;; field accessor so MEMREF-T receives a normally boxed address.
-  (setf (thread-state-r15-value current-thread)
-        (sys.int::memref-t (thread-state-rsp current-thread) -2))
   ;; Only partial state was saved.
   (setf (thread-full-save-p current-thread) nil)
   ;; Jump to common function.

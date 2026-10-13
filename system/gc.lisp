@@ -907,15 +907,16 @@ This is required to make the GC interrupt safe."
              (t (let* ((stack-pointer (mezzano.supervisor:thread-stack-pointer object))
                        (frame-pointer (mezzano.supervisor:thread-frame-pointer object))
                        (return-address (memref-unsigned-byte-64 stack-pointer
-                                                                #-arm64 0
-                                                                #+arm64 3)))
+                                                                3)))
                   #+x86-64
-                  (scavengef (mezzano.supervisor:thread-state-r15-value object) cycle-kind)
+                  (scavengef (memref-t stack-pointer 0) cycle-kind) ; R15
                   #+arm64
                   (scavengef (memref-t stack-pointer 0) cycle-kind) ; x13
                   #+arm64
                   (scavengef (memref-t stack-pointer 1) cycle-kind) ; x14
-                  (scavenge-stack stack-pointer frame-pointer return-address cycle-kind))))))))
+                  (scavenge-stack #+x86-64 (+ stack-pointer 32)
+                                  #-x86-64 stack-pointer
+                                  frame-pointer return-address cycle-kind))))))))
 
 (defun gc-info-for-function-offset (function offset)
   (when (function-reference-p function)

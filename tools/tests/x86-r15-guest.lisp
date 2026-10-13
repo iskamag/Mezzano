@@ -35,7 +35,8 @@
   (:gc :no-frame :layout #*0)
   (mezzano.lap.x86:ret))
 
-(declaim (notinline x86-r15-leaf x86-r15-tail x86-r15-tail-many))
+(declaim (notinline x86-r15-leaf x86-r15-tail x86-r15-tail-many
+                    x86-r15-optionals x86-r15-rest))
 (defun x86-r15-leaf (a b c d e f g h)
   (list a b c d e f g h))
 (defun x86-r15-tail (a b c d)
@@ -91,6 +92,26 @@
                (mezzano.supervisor:thread-yield)
                (sleep 0.01)
                (x86-r15-stress-calls))))
+    (probe :partial-conversion
+           (lambda ()
+             (let ((thread
+                     (mezzano.supervisor:make-thread
+                      (lambda ()
+                        (x86-r15-probe #'mezzano.supervisor::stop-current-thread))
+                      :name "R15 stopped-thread regression")))
+               (loop until (eq (mezzano.supervisor::sample-thread-state thread) :stopped)
+                     do (mezzano.supervisor:thread-yield))
+               (assert (not (mezzano.supervisor:thread-full-save-p thread)))
+               (mezzano.internals::gc :full t)
+               (mezzano.supervisor::convert-thread-to-full-save thread)
+               (assert (mezzano.supervisor:thread-full-save-p thread))
+               ;; Check both wrappers: full -> partial -> full.
+               (mezzano.supervisor::convert-thread-to-partial-save thread)
+               (mezzano.supervisor::convert-thread-to-full-save thread)
+               (mezzano.supervisor::resume-thread thread)
+               (let ((result (first (mezzano.supervisor:thread-join thread))))
+                 (assert (and (consp result) (eq (car result) :r15-regression)
+                              (eql (cdr result) 12345)))))))
     (probe :gc
            (lambda ()
              (mezzano.internals::gc)
