@@ -36,7 +36,8 @@
   (mezzano.lap.x86:ret))
 
 (declaim (notinline x86-r15-leaf x86-r15-tail x86-r15-tail-many
-                    x86-r15-optionals x86-r15-rest))
+                    x86-r15-optionals x86-r15-rest x86-r15-keywords
+                    x86-r15-supplied-optionals))
 (defun x86-r15-leaf (a b c d e f g h)
   (list a b c d e f g h))
 (defun x86-r15-tail (a b c d)
@@ -48,6 +49,10 @@
   (list a b c d e f g))
 (defun x86-r15-rest (a b c d e &rest rest)
   (list a b c d e rest))
+(defun x86-r15-supplied-optionals (a b c d e &optional (f :default fp) (g :default gp))
+  (list a b c d e f fp g gp))
+(defun x86-r15-keywords (a b c d e f &key (x :default xp) (y :default yp))
+  (list a b c d e f x xp y yp))
 (declaim (notinline x86-r15-seven-values))
 (defun x86-r15-seven-values ()
   (values (cons :a 1) (cons :b 2) 3 4 5 6 7))
@@ -62,6 +67,14 @@
     (assert (equal (x86-r15-optionals a b c d e) (list a b c d e nil nil)))
     (assert (equal (x86-r15-optionals a b c d e f g) (list a b c d e f g)))
     (assert (equal (x86-r15-rest a b c d e f g h) (list a b c d e (list f g h))))
+    (assert (equal (x86-r15-supplied-optionals a b c d e)
+                   (list a b c d e :default nil :default nil)))
+    (assert (equal (x86-r15-supplied-optionals a b c d e f g)
+                   (list a b c d e f t g t)))
+    (assert (equal (x86-r15-keywords a b c d e f)
+                   (list a b c d e f :default nil :default nil)))
+    (assert (equal (x86-r15-keywords a b c d e f :y h :x g)
+                   (list a b c d e f g t h t)))
     (assert (= (+ (cdr a) (cdr b) (cdr c) (cdr d)
                   (cdr e) (cdr f) (cdr g) (cdr h)) 36))))
 
