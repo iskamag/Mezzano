@@ -16,3 +16,15 @@ Interrupt handler restrictions:
 * No access to special variables. Variables must be either lexical, constant, or global.
 
 Restrictions for interrupt handlers are hard and fast. Your code is broken if it does not follow these restrictions and will cause panics.
+
+`MEZZANO.SUPERVISOR:CALL-WITH-WORLD-STOPPED-OR-PANIC` runs a destructive worker
+under the existing world stop with footholds inhibited. A normal return from
+the worker authorizes release: finish all fallible completion and validation
+before returning. Any nonlocal exit before release and wakeup complete panics;
+a failure after release begins is a machine fail-stop, not a retained old stop.
+This entry preserves the existing queued-stopper handoff. It does not stop
+continuing supervisor/idle actors or admit their heap access, and does not
+establish residency or allocation freedom. Call it from an admitted ordinary
+thread with interrupts enabled, outside pseudo-atomic execution. Ordinary error
+construction/debugger entry and explicitly forcing footholds remain inadmissible
+inside a supervisor worker. Pending footholds may run after successful release.
