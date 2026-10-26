@@ -1,0 +1,11 @@
+;;;; Load in a running Mezzano image.
+(flet ((fails-p (thunk)
+         (handler-case (progn (funcall thunk) nil)
+           (error () t))))
+  (assert (equal (subseq '(1 2 3) 1 3) '(2 3)))
+  (assert (null (subseq '(1 2 3) 3)))
+  (assert (fails-p (lambda () (subseq '(1 2 3) 9))))
+  (assert (fails-p (lambda () (subseq '(1 2 3) 2 1))))
+  (assert (fails-p (lambda () (subseq '(1 2 3) 0 4))))
+  (assert (fails-p (lambda () (subseq '(1 2 3) -1))))
+  (format t "List SUBSEQ bounds regressions: 6 checks passed.~%"))
