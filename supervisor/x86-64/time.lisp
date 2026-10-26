@@ -22,34 +22,28 @@
     (setf (sys.int::io-port/8 #x40) (ldb (byte 8 0) divisor)
           (sys.int::io-port/8 #x40) (ldb (byte 8 8) divisor))))
 
+(defun wait-for-next-pit-tick (current-time)
+  (loop for time = (get-internal-run-time)
+        until (not (eql time current-time))
+        finally (return time)))
+
+(defun calibrate-smoothed (sample)
+  "Take six samples, averaging each new sample with the previous estimate."
+  (let ((estimate (funcall sample)))
+    (dotimes (i 5 estimate)
+      (setf estimate (/ (+ estimate (funcall sample)) 2)))))
+
 (defun calibrate-tsc-1 ()
-  "Return the number of cycles per second, approximately."
-  (let ((initial-time (get-internal-run-time))
-        (start-time nil)
-        (end-time nil)
-        (start-cycle nil)
-        (end-cycle nil))
-    ;; Wait for the start of this tick.
-    (loop
-       (setf start-time (get-internal-run-time))
-       (when (not (eq start-time initial-time))
-         (return)))
-    (setf start-cycle (sys.int::tsc))
-    (loop
-       (setf end-time (get-internal-run-time))
-       (when (not (eq end-time start-time))
-         (return)))
-    (setf end-cycle (sys.int::tsc))
-    (let* ((cycles (- end-cycle start-cycle))
-           (time (/ (float (- end-time start-time)) internal-time-units-per-second))
-           (cycles-per-second (/ cycles time)))
-      cycles-per-second)))
+  "Return the number of TSC cycles per second, using the PIT reference."
+  (let* ((start-time (wait-for-next-pit-tick (get-internal-run-time)))
+         (start-cycle (sys.int::tsc))
+         (end-time (wait-for-next-pit-tick start-time))
+         (cycles (- (sys.int::tsc) start-cycle))
+         (seconds (/ (float (- end-time start-time)) internal-time-units-per-second)))
+    (/ (float cycles) seconds)))
 
 (defun calibrate-tsc ()
-  (let ((n (calibrate-tsc-1)))
-    (dotimes (i 5)
-      (setf n (/ (+ n (calibrate-tsc-1)) 2)))
-    (setf *cpu-speed* (floor n))))
+  (setf *cpu-speed* (floor (calibrate-smoothed #'calibrate-tsc-1))))
 
 (defun high-precision-time-units-to-internal-time-units (tsc-time)
   (if (boundp '*cpu-speed*)

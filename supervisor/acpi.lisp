@@ -380,10 +380,22 @@
              (:area :wired))
   address)
 
+(defstruct (acpi-madt-processor-x2apic
+             (:area :wired))
+  x2apic-id
+  flags
+  acpi-processor-uid)
+
+(defun madt-entry-minimum-length (type)
+  (case type
+    (0 8) (1 12) (2 10) (3 8) (4 6) (5 12) (9 16)))
+
 (defun read-acpi-madt-table (address)
   (let ((table (make-acpi-madt-table :address address))
         (n-controller-entries 0))
     (read-acpi-table-header table)
+    (when (< (acpi-table-header-length table) 44)
+      (panic "ACPI MADT is shorter than its fixed header"))
     (setf (acpi-madt-table-local-interrupt-controller-address table)
           (physical-memref-unsigned-byte-32 (+ address 36)))
     (setf (acpi-madt-table-flags table)
@@ -393,10 +405,18 @@
       (loop
          (when (>= offset total-length)
            (return))
-         (when (<= (physical-memref-unsigned-byte-8 (+ address offset)) 5)
-           ;; Ignore entries with an unknown type.
-           (incf n-controller-entries))
-         (incf offset (physical-memref-unsigned-byte-8 (+ address offset 1)))))
+         (when (< (- total-length offset) 2)
+           (panic "ACPI MADT entry has no length"))
+         (let* ((type (physical-memref-unsigned-byte-8 (+ address offset)))
+                (len (physical-memref-unsigned-byte-8 (+ address offset 1)))
+                (minimum (madt-entry-minimum-length type)))
+           (when (or (< len 2)
+                     (> len (- total-length offset))
+                     (and minimum (< len minimum)))
+             (panic "Malformed ACPI MADT entry"))
+           (when minimum
+             (incf n-controller-entries))
+           (incf offset len))))
     (setf (acpi-madt-table-controllers table) (sys.int::make-simple-vector n-controller-entries :wired))
     (let ((offset 44)
           (total-length (acpi-table-header-length table))
@@ -440,8 +460,15 @@
              (5 ;; Local APIC address override.
               (setf (svref (acpi-madt-table-controllers table) current)
                     (make-acpi-madt-lapic-address-override
-                     :address (physical-memref-unsigned-byte-64 (+ address offset 4))))))
-           (incf current)
+                     :address (physical-memref-unsigned-byte-64 (+ address offset 4)))))
+             (9 ;; Processor local x2APIC.
+              (setf (svref (acpi-madt-table-controllers table) current)
+                    (make-acpi-madt-processor-x2apic
+                     :x2apic-id (physical-memref-unsigned-byte-32 (+ address offset 4))
+                     :flags (physical-memref-unsigned-byte-32 (+ address offset 8))
+                     :acpi-processor-uid (physical-memref-unsigned-byte-32 (+ address offset 12))))))
+           (when (madt-entry-minimum-length type)
+             (incf current))
            (incf offset len))))
     table))
 
