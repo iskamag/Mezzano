@@ -192,12 +192,11 @@
 (defun remove-if (test sequence &key from-end (start 0) end count key)
   (unless key (setf key 'identity))
   (when from-end
-    (setf sequence (reverse sequence))
-    (rotatef start end)
-    (when (null start) (setf start 0))
-    (if (= end 0)
-        (setf end nil)
-        (setf end (- (length sequence) end))))
+    (let ((length (length sequence)))
+      (setf sequence (reverse sequence)
+            end (or end length))
+      (psetf start (- length end)
+             end (- length start))))
   (when count
     (check-type count (or null integer)))
   (etypecase sequence
@@ -276,46 +275,36 @@
 (defun remove-duplicates (sequence &key from-end test test-not key (start 0) end)
   (with-test-test-not (test test-not)
     (unless key (setf key 'identity))
-    (when (or (not (eql start 0))
-              end)
-      (setf sequence (subseq sequence start end)))
-    (etypecase sequence
-      (list
-       (if from-end
-           (do* ((result (cons nil nil))
-                 (tail result)
-                 (i sequence (cdr i)))
-                ((null i)
-                 (cdr result))
-             (declare (dynamic-extent result))
-             (unless (member (funcall key (car i)) (cdr result) :test test :key key)
-               (setf (cdr tail) (cons (car i) nil)
-                     tail (cdr tail))))
-           (do* ((result (cons nil nil))
-                 (tail result)
-                 (i sequence (cdr i)))
-                ((null i)
-                 (cdr result))
-             (declare (dynamic-extent result))
-             (unless (member (funcall key (car i)) (cdr i) :test test :key key)
-               (setf (cdr tail) (cons (car i) nil)
-                     tail (cdr tail))))))
-      (vector
-       (when from-end
-         (setf sequence (reverse sequence)))
-       (let ((result (make-array (length sequence)
-                                 :element-type (array-element-type sequence)
-                                 :fill-pointer 0)))
-         (dotimes (i (length sequence))
-           (unless (find (funcall key (aref sequence i))
-                         result
-                         :key key
-                         :test test)
-             (vector-push (aref sequence i) result)))
-         (when from-end
-           (setf result (nreverse result)))
-         ;; Simplify result.
-         (subseq result 0))))))
+    (let* ((end (or end (length sequence)))
+           (middle (etypecase sequence
+                     (list (subseq sequence start end))
+                     (vector (loop for i from start below end collect (aref sequence i)))))
+           (kept nil))
+      ;; Compare only elements inside the bounds. Earlier elements are the
+      ;; first argument to TEST, regardless of the traversal direction.
+      (do ((rest middle (cdr rest)))
+          ((null rest))
+        (let ((item (car rest)))
+          (unless (if from-end
+                      (loop for previous in kept
+                            thereis (funcall test (funcall key previous) (funcall key item)))
+                      (loop for later in (cdr rest)
+                            thereis (funcall test (funcall key item) (funcall key later))))
+            (push item kept))))
+      (setf kept (nreverse kept))
+      (etypecase sequence
+        (list (nconc (subseq sequence 0 start)
+                     kept
+                     (subseq sequence end)))
+        (vector
+         (let ((result (make-array (length sequence)
+                                   :element-type (array-element-type sequence)
+                                   :fill-pointer 0)))
+           (loop for i below start do (vector-push (aref sequence i) result))
+           (dolist (item kept) (vector-push item result))
+           (loop for i from end below (length sequence)
+                 do (vector-push (aref sequence i) result))
+           (subseq result 0)))))))
 
 (defun delete-duplicates (sequence &key from-end test test-not (start 0) end key)
   (remove-duplicates sequence
@@ -1094,19 +1083,18 @@
 (defun mismatch (sequence-1 sequence-2 &key from-end test test-not key (start1 0) (start2 0) end1 end2)
   (with-test-test-not (test test-not)
     (setf key (or key #'identity))
-    (when from-end
-      (setf sequence-1 (reverse sequence-1)
-            sequence-2 (reverse sequence-2)))
     (setf end1 (or end1 (length sequence-1)))
     (setf end2 (or end2 (length sequence-2)))
     (dotimes (position (min (- end1 start1)
                             (- end2 start2))
               (when (not (eql (- end1 start1) (- end2 start2)))
-                (+ start1 position)))
-      (when (not (funcall test
-                          (funcall key (elt sequence-1 (+ start1 position)))
-                          (funcall key (elt sequence-2 (+ start2 position)))))
-        (return (+ start1 position))))))
+                (if from-end (- end1 position) (+ start1 position))))
+      (let ((index1 (if from-end (- end1 position 1) (+ start1 position)))
+            (index2 (if from-end (- end2 position 1) (+ start2 position))))
+        (when (not (funcall test
+                            (funcall key (elt sequence-1 index1))
+                            (funcall key (elt sequence-2 index2))))
+          (return (if from-end (1+ index1) index1)))))))
 
 
 ;;;; MERGE, from SBCL.
