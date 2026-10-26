@@ -85,14 +85,18 @@
   (mezzano.lap.arm64:orr :x28 :xzr :x0)
   (mezzano.lap.arm64:ret))
 
+(sys.int::define-lap-function %%finish-switch-via-cpu-stack ((new-thread))
+  (:gc :no-frame :layout #*)
+  ;; SP_EL0 can still be the old ephemeral thread's stack. SP_EL1 is the
+  ;; private stack of the current CPU; x27 holds its fixed top pointer.
+  (mezzano.lap.arm64:msr :spsel 1)
+  (mezzano.lap.arm64:add :sp :x27 0)
+  (mezzano.lap.arm64:movz :x5 #.(ash 1 sys.int::+n-fixnum-bits+))
+  (mezzano.lap.arm64:named-call %%finish-switch-on-cpu-stack)
+  (mezzano.lap.arm64:brk 42))
+
 (sys.int::define-lap-function %%restore-full-save-thread ((thread))
-  ;; Drop the global thread lock.
-  ;; This must be done here, not in %%switch-to-thread-common to prevent
-  ;; another CPU from switching on to the old thread's stack while it is
-  ;; still in use.
-  (mezzano.lap.arm64:ldr :x1 (:symbol-global-cell *global-thread-lock*))
-  (mezzano.lap.arm64:ldr :x2 (:constant :unlocked))
-  (mezzano.lap.arm64:str :x2 (:object :x1 #.sys.int::+symbol-value-cell-value+))
+  ;; The MCS handoff occurred on this CPU's private stack.
   ;; Switch back to SP_EL0, restoring the original value of SP_EL1.
   (mezzano.lap.arm64:add :sp :x27 0)
   (mezzano.lap.arm64:msr :spsel 0)
@@ -130,13 +134,7 @@
   (mezzano.lap.arm64:eret))
 
 (sys.int::define-lap-function %%restore-partial-save-thread ((thread))
-  ;; Drop the global thread lock.
-  ;; This must be done here, not in %%switch-to-thread-common to prevent
-  ;; another CPU from switching on to the old thread's stack while it is
-  ;; still in use.
-  (mezzano.lap.arm64:ldr :x1 (:symbol-global-cell *global-thread-lock*))
-  (mezzano.lap.arm64:ldr :x2 (:constant :unlocked))
-  (mezzano.lap.arm64:str :x2 (:object :x1 #.sys.int::+symbol-value-cell-value+))
+  ;; The MCS handoff occurred on this CPU's private stack.
   ;; Switch back to SP_EL0, restoring the original value of SP_EL1.
   (mezzano.lap.arm64:add :sp :x27 0)
   (mezzano.lap.arm64:msr :spsel 0)

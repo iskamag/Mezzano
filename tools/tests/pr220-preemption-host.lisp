@@ -4,7 +4,7 @@
 (defpackage :mezzano.supervisor (:use :cl))
 (in-package :mezzano.supervisor)
 
-(defstruct cpu (inhibit-scheduling 0) (preemption-pending nil))
+(defstruct cpu (inhibit-scheduling 0) (preemption-pending nil) (quiesce-deferred nil))
 (defvar *cpu* (make-cpu))
 (defvar *timer-resets* nil)
 (defvar *preemptions* 0)

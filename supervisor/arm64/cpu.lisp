@@ -241,6 +241,9 @@
 
 (sys.int::defglobal *non-quiescent-cpus-remaining*)
 
+(defun send-deferred-quiesce-ipi ()
+  (send-ipi-to-cpu (local-cpu) +quiesce-sgi-id+))
+
 (defun quiesce-cpus-for-world-stop ()
   "Bring all CPUs to a consistent state to stop the world.
 Protected by the world stop lock."
@@ -253,6 +256,11 @@ Protected by the world stop lock."
 
 ;; Save the current thread's state and switch to the CPU's idle thread.
 (defun quiesce-ipi-handler (interrupt-frame)
+  (let ((cpu (local-cpu)))
+    (when (plusp (cpu-inhibit-scheduling cpu))
+      ;; Preserve the interrupted thread's CPU until its local operation ends.
+      (setf (cpu-quiesce-deferred cpu) t)
+      (return-from quiesce-ipi-handler nil)))
   (let* ((current (current-thread))
          (idle (local-cpu-idle-thread))
          (was-active (not (eql current idle))))
@@ -264,12 +272,11 @@ Protected by the world stop lock."
       (preemption-timer-reset nil)
       (save-fpu-state current)
       (save-interrupted-state current interrupt-frame)
-      (setf (thread-state idle) :active))
-    ;; Once its state is saved, this CPU is quiescent for the world stop.
-    (sys.int::%atomic-fixnum-add-symbol '*non-quiescent-cpus-remaining* -1)
-    (when was-active
-      ;; Complete the switch on the idle thread.
-      (%%switch-to-thread-common idle idle))))
+      (setf (thread-state idle) :active
+            (cpu-quiesce-ack-pending (local-cpu)) t))
+    (if was-active
+        (%%switch-to-thread-common idle idle)
+        (sys.int::%atomic-fixnum-add-symbol '*non-quiescent-cpus-remaining* -1))))
 
 ;; TODO: This needs to be fixed up to prevent multiple CPUs hitting it at
 ;; once. It can't currently happen because it is only used from IRQ handlers

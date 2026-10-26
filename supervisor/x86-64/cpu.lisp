@@ -265,6 +265,9 @@ The bootloader is loaded to #x7C00, so #x7000 should be safe.")
 
 (sys.int::defglobal *non-quiescent-cpus-remaining*)
 
+(defun send-deferred-quiesce-ipi ()
+  (send-self-ipi +quiesce-ipi-vector+))
+
 (defun quiesce-cpus-for-world-stop ()
   "Bring all CPUs to a consistent state to stop the world.
 Protected by the world stop lock."
@@ -278,24 +281,33 @@ Protected by the world stop lock."
 (defun quiesce-ipi-handler (interrupt-frame info)
   (declare (ignore info))
   (lapic-eoi)
+  (let ((cpu (local-cpu)))
+    (when (plusp (cpu-inhibit-scheduling cpu))
+      ;; The interrupted thread may be completing a CPU-local TLB operation.
+      ;; Retry after its outermost scheduling inhibitor has been released.
+      (setf (cpu-quiesce-deferred cpu) t)
+      (return-from quiesce-ipi-handler nil)))
+  ;; Normal quiesce: switch to idle thread.
   (let* ((current (current-thread))
          (idle (local-cpu-idle-thread))
          (was-active (not (eql current idle))))
     (when was-active
       (acquire-global-thread-lock)
-      ;; First preserve the interrupted thread and make it runnable.
+      ;; Return this thread to the run queue.
       (setf (thread-state current) :runnable)
       (push-run-queue current)
       (preemption-timer-reset nil)
+      ;; Save thread state.
       (save-fpu-state current)
       (save-interrupted-state current interrupt-frame)
+      ;; Partially switch to the idle thread.
       (setf (thread-state idle) :active)
+      (setf (cpu-quiesce-ack-pending (local-cpu)) t)
       (setf (sys.int::msr +msr-ia32-gs-base+) (sys.int::lisp-object-address idle)))
-    ;; Once its state is saved, this CPU is quiescent for the world stop.
-    (sys.int::%atomic-fixnum-add-symbol '*non-quiescent-cpus-remaining* -1)
-    (when was-active
-      ;; Complete the switch on the idle thread.
-      (%%switch-to-thread-common idle idle))))
+    (if was-active
+        ;; The trampoline acknowledges after leaving the old stack.
+        (%%switch-to-thread-common idle idle)
+        (sys.int::%atomic-fixnum-add-symbol '*non-quiescent-cpus-remaining* -1))))
 
 ;; TODO: This needs to be fixed up to prevent multiple CPUs hitting it at
 ;; once. It can't currently happen because it is only used from IRQ handlers
