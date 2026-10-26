@@ -1,3 +1,5 @@
+(in-package :mezzano.internals)
+
 ;;;; Load in a running Mezzano image.
 (let* ((timer (mezzano.supervisor:make-timer :name 'remaining-time-regression))
        (now (get-internal-run-time))
@@ -14,3 +16,5 @@
          (assert (zerop (mezzano.supervisor:timer-disarm timer)))
          (format t "Timer remaining regressions: 6 checks passed.~%"))
     (mezzano.supervisor:timer-disarm timer)))
+
+(mezzano.supervisor:debug-print-line "TIMER-REMAINING-GUEST-PASSED")
