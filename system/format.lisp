@@ -260,6 +260,55 @@
             (write-char #\+ stream))
           (write n :stream stream :escape nil :radix nil :base base :readably nil)))))
 
+(defun format-monetary (stream object params at-sign colon)
+  "Print a monetary value with the requested precision, sign and padding."
+  (let ((digits (or (first params) 2))
+        (minimum-integer-digits (or (second params) 1))
+        (width (or (third params) 0))
+        (padchar (or (fourth params) #\Space))
+        (*print-escape* nil)
+        (*print-readably* nil))
+    (check-type digits (integer 0))
+    (check-type minimum-integer-digits (integer 0))
+    (check-type width (integer 0))
+    (check-type padchar character)
+    (unless (realp object)
+      (return-from format-monetary
+        (format-integer stream object 10 (list width) nil nil)))
+    ;; Infinity and NaN have implementation-specific printed representations.
+    (when (and (floatp object)
+               (or (mezzano.internals::float-nan-p object)
+                   (mezzano.internals::float-infinity-p object)))
+      (return-from format-monetary (mezzano.internals::write-float object stream)))
+    (let* ((negative (if (floatp object)
+                         (minusp (float-sign object))
+                         (minusp object)))
+           (sign (cond (negative #\-) (at-sign #\+)))
+           (scale (expt 10 digits))
+           ;; Rational arithmetic avoids overflow and loss of precision when
+           ;; scaling a float before rounding.
+           (scaled (multiple-value-bind (whole remainder)
+                       (floor (* (abs (rational object)) scale))
+                     (if (>= (* 2 remainder) 1) (1+ whole) whole)))
+           (integer-part (truncate scaled scale))
+           (fraction-part (rem scaled scale))
+           (integer-string (if (and (zerop integer-part) (zerop minimum-integer-digits))
+                               ""
+                               (write-to-string integer-part :base 10 :radix nil)))
+           (fraction-string (write-to-string fraction-part :base 10 :radix nil))
+           (zeroes (max 0 (- minimum-integer-digits (length integer-string))))
+           (padding (max 0 (- width (+ (if sign 1 0) zeroes
+                                       (length integer-string) 1 digits)))))
+      (when (and colon sign) (write-char sign stream))
+      (dotimes (i padding) (write-char padchar stream))
+      (when (and (not colon) sign) (write-char sign stream))
+      (dotimes (i zeroes) (write-char #\0 stream))
+      (write-string integer-string stream)
+      (write-char #\. stream)
+      (when (plusp digits)
+        (dotimes (i (- digits (length fraction-string))) (write-char #\0 stream))
+        (write-string fraction-string stream)))))
+
 (defvar *cardinal-names-1*
   '("zero" "one" "two" "three" "four" "five" "six" "seven" "eight" "nine"
     "ten" "eleven" "twelve" "thirteen" "fourteen" "fifteen" "sixteen" "seventeen" "eighteen" "nineteen"))
@@ -410,10 +459,7 @@
 ;;; TODO: F, E, G, $
 
 (define-format-interpreter #\$ (at-sign colon &optional (d 2) (n 1) (w 0) (padchar #\Space))
-  (let ((arg (consume-argument)))
-    (when (realp arg)
-      (setf arg (float 0.0f0)))
-    (format t "~D" arg)))
+  (format-monetary *standard-output* (consume-argument) (list d n w padchar) at-sign colon))
 
 ;;;; 22.3.4 FORMAT Printer Operations.
 

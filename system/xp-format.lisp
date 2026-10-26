@@ -485,19 +485,7 @@
        (format-general-float XP ,(get-arg) the-params ',atsign ',colon))))
 
 (defun format-monetary (stream object params atsign colon)
-  (declare (ignore atsign colon))
-  (let ((d (or (first params) 2))
-        (e (or (second params) 1))
-        (w (or (third params) 0))
-        (padchar (or (fourth params) #\Space)))
-    ;; TODO.
-    (declare (ignore d e padchar))
-    (let ((*print-escape* nil)
-          (*print-readably* nil))
-      (if (realp object)
-          (mezzano.internals::write-float (float object) stream)
-          ;; Format as if by ~wD
-          (mezzano.format::format-integer stream object 10 (list w) nil nil)))))
+  (mezzano.format::format-monetary stream object params atsign colon))
 
 (def-format-handler #\$ (start end)
   (declare (ignore end))
