@@ -1,0 +1,89 @@
+Cons TLAB experiment, 2026-10-26
+Branch: feature/cons-tlabs; baseline allocator: 68b7e85c
+
+One live x86-64 KVM guest, one vCPU pinned to host CPU 4.
+Host: AMD Ryzen 5 3600. Timings are elapsed TSC ticks, not core cycles.
+Native compile-file and wired LLF loading through the serial REPL:
+  runtime/runtime-x86-64.lisp -> runtime/allocate.lisp -> system/gc.lisp
+  -> shared baseline under separate names -> benchmark callers.
+
+Each pair measures 500000 (cons nil nil) calls in each mode, with 16 calls
+per loop iteration. Shared/TLAB order alternates. Compilation, explicit GC,
+young-area expansion and page touching, warmup, and validation are excluded.
+Normal CONS counters and TLAB refills are included. Every sample checked
+8000000 per-thread allocation bytes, a valid returned cons, and zero timed GC.
+
+pair      shared        TLAB     shared/TLAB
+ 0    10216152     7118352  1.435184
+ 1    10216908     7860888  1.299714
+ 2    10225908     6846552  1.493585
+ 3     9792540     6580368  1.488144
+ 4     9467676     6612948  1.431687
+ 5     9440208     6607512  1.428708
+ 6     9464796     6623532  1.428965
+ 7     9376524     6672528  1.405243
+ 8     9433080     6633540  1.422028
+ 9     9402840     7280100  1.291581
+10     9481176     6592680  1.438136
+
+CONS-LIVE-MEDIAN shared=9467676 tlab=6633540 paired-speedup=1.428965
+Measured median paired speedup: 1.43x. The suggested 2x was not reached.
+
+Verification:
+- make clean after changing the thread layout, then make cold-image: passed.
+- Bounded make kvm checks (180s and final 120s, headless with GPU retained):
+  reached library
+  compilation/loading without panic or warm-init error; expected timeout.
+- Four-vCPU guest regression through serial REPL: passed the actual thread
+  GC bitmap assertion, exact buffer boundary/refill, allocation accounting,
+  parked-thread invalidation, live lists across minor/major GC, and 100
+  allocating footholds. Pinned/wired conses also survived full collection.
+- Same regressions passed in the one-vCPU guest after native recompilation.
+- Restart metadata was also checked against a retained older CONS function
+  after replacing its definition. The final saved-PC-based helper passed the
+  complete four-vCPU regression again after wired loading of its native LLF.
+- Loaded CONS and DO-CONS machine code were inspected: ordinary loads,
+  arithmetic and stores, with no atomic RMW. CONS has the fast path inline;
+  its only named dependency is SLOW-CONS. The baseline retains LOCK XADD.
+- ARM64 cross-compilation of thread/switch code, runtime, allocator, GC and
+  guest tests passed.
+  No ARM64 execution or full desktop startup is claimed.
+- git diff --check: passed.
+
+Raw final session logs remain in /tmp/mezzano-cons-tlab-raw-live/serial.log
+and /tmp/mezzano-cons-tlab-raw-smp/serial.log. This is a narrow allocator
+microbenchmark, not application throughput or a multicore scaling result.
+
+PREFETCHNTA follow-up, 2026-10-26
+
+Added PREFETCHNTA at the next bump address in both x86-64 CONS and DO-CONS.
+The preceding 1.43x measurements did not include prefetching.
+
+Live native recompilation compared prefetch off/on in the same pinned one-vCPU
+guest, alternating order for 11 pairs of 500000 allocations. Allocator assembly
+was loaded before recompiling runtime/allocate.lisp and benchmark callers.
+The same exact-byte, returned-cons, and zero-timed-GC checks remained enabled.
+
+pair    off ticks    on ticks    off/on
+ 0     6598260     6161040  1.070965
+ 1     6661296     6263676  1.06348
+ 2     6617088     6268284  1.055645
+ 3     6555960     6250320  1.048899
+ 4     6596712     6150024  1.072631
+ 5     6663096     6365448  1.046759
+ 6     6617736     6183648  1.070199
+ 7     6647076     6291252  1.056558
+ 8     6621516     6225840  1.063553
+ 9     6639696     6195096  1.071766
+10     6820344     6148332  1.109299
+
+PREFETCH-MEDIAN off=6621516 on=6225840 paired-speedup=1.063553
+CONS-LIVE-MEDIAN shared=9473652 tlab=6156324 paired-speedup=1.536246
+Prefetching measured 6.4% faster than no prefetch; the updated allocator
+measured 1.54x faster than the original shared allocator in this run.
+The full cons/GC/foothold guest regression and make cold-image passed.
+Loaded CONS and DO-CONS disassembly confirmed PREFETCHNTA, with no atomic RMW.
+Raw comparison: /tmp/mezzano-cons-prefetch-compare.log
+Raw serial session: /tmp/mezzano-cons-prefetch-live/serial.log
+The prefetched cold image also passed a bounded 90s make kvm check, reaching
+library compilation without panic or warm-initialization error.
