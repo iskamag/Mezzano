@@ -1,0 +1,36 @@
+;;;; Run with sbcl --script tools/tests/format-monetary-host.lisp.
+;;;; Load the actual helper into an isolated host package.
+(defpackage :mezzano.internals (:use :cl))
+(defpackage :monetary-test (:use :cl))
+(in-package :monetary-test)
+
+(defun mezzano.internals::float-nan-p (object) (declare (ignore object)) nil)
+(defun mezzano.internals::float-infinity-p (object) (declare (ignore object)) nil)
+(defun mezzano.internals::write-float (object stream) (write object :stream stream))
+
+(let* ((path (merge-pathnames "../../system/format.lisp" *load-truename*))
+       (source (with-open-file (in path)
+                 (let ((text (make-string (file-length in))))
+                   (read-sequence text in)
+                   text))))
+  (dolist (name '("format-integer" "format-monetary"))
+    (let ((offset (search (concatenate 'string "(defun " name " ") source)))
+      (assert offset)
+      (eval (read-from-string source nil nil :start offset)))))
+
+(let ((checks 0))
+  (dolist (object '(0 1/8 -1/8 42 1.25 -0.0 3.14159))
+    (dolist (digits '(0 1 2 4))
+      (dolist (minimum '(0 1 3))
+        (dolist (width '(0 8))
+          (dolist (colon '(nil t))
+            (dolist (at-sign '(nil t))
+              (let* ((control (concatenate 'string "~" (write-to-string digits) ","
+                                           (write-to-string minimum) "," (write-to-string width)
+                                           ",'*" (if colon ":" "") (if at-sign "@" "") "$"))
+                     (expected (format nil control object))
+                     (actual (with-output-to-string (stream)
+                               (format-monetary stream object (list digits minimum width #\*) at-sign colon))))
+                (assert (string= actual expected) () "~S ~S: ~S instead of ~S" control object actual expected)
+                (incf checks))))))))
+  (format t "Monetary host differential: ~D checks passed.~%" checks))
