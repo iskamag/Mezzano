@@ -346,22 +346,22 @@
             `(let ,(mapcar #'list vars params)
                (funcall (symbol-function ',fn) xp ,(get-arg) ,colon ,atsign ,@ vars)))))))
 
-;; TODO: Process mincol,colinc,minpad,padchar.
 (defun impl-A/S (start end escape-value readably-is-nil)
   (declare (ignore end))
   (multiple-value-bind (colon atsign params)
       (parse-params start '(0 1 0 #\Space))
-    (declare (ignore atsign))
-    `(let ((*print-escape* ,escape-value)
-           ,@(when readably-is-nil
-               `((*print-readably* nil))))
-       ,@params
-       ,(if colon
-            `(let ((arg ,(get-arg)))
-               (if arg
-                   (write+ arg XP)
-                   (write-string++ "()" XP 0 2)))
-            `(write+ ,(get-arg) XP)))))
+    `(let* ((mincol ,(first params))
+            (colinc ,(second params))
+            (minpad ,(third params))
+            (padchar ,(fourth params))
+            (arg ,(get-arg))
+            (*print-escape* ,escape-value)
+            ,@(when readably-is-nil `((*print-readably* nil))))
+       (if (and (eql mincol 0) (eql minpad 0) (eql colinc 1) (eql padchar #\Space))
+           ,(if colon
+                `(if arg (write+ arg XP) (write-string++ "()" XP 0 2))
+                `(write+ arg XP))
+           (mezzano.format::format-padded-object XP arg mincol colinc minpad padchar ',atsign ',colon)))))
 
 (def-format-handler #\A (start end)
   (impl-A/S start end nil t))
@@ -821,6 +821,14 @@
         (if (null white) (return (nreverse result)))))))
 
  ) ;end of eval when for all (formatter "...") stuff.
+
+(defun print-format-padded-object (object stream)
+  ;; The non-pretty printer does not handle circular lists. Route those
+  ;; through XP's pretty printer when circularity checking is requested.
+  (let ((*print-pretty* (or *print-pretty* *print-circle*)))
+    (maybe-initiate-xp-printing (lambda (xp value) (write+ value xp)) stream object)))
+
+(setf mezzano.format::*format-padded-object-printer* #'print-format-padded-object)
 
 
 ;Any format string that is converted to a function is always printed

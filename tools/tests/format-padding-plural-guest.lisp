@@ -1,0 +1,36 @@
+(in-package :mezzano.internals)
+
+;;;; Check the warm formatter and the independently accessible early interpreter.
+(let ((cases '(("~5A" ("xy") "xy   ")
+               ("~5@A" ("xy") "   xy")
+               ("~5,3,1,'*A" ("xy") "xy****")
+               ("~5,3,1,'*@S" ("xy") "*\"xy\"")
+               ("~5:@A" (nil) "   ()")
+               ("~vA/~D" (5 "xy" 9) "xy   /9")
+               ("~v[~D~;~D~]" (1 9) "9")
+               ("~D tr~:@P / ~D win~:P" (7 1) "7 tries / 1 win")
+               ("~P ~P ~@P" (:foo 1.0 1) "s s y")
+               ("~D ~:P~D" (2 5) "2 s5")
+               ("~{~D~:P~}" ((1 2)) "12s")
+               ("~@{~D~:P~}" (1 2) "12s")
+               ("~:[~:P~;~:P~]" (nil) "s")
+               ("~@?~:P" ("~D" 1) "1")
+               ("~?~P" ("~D~:P" (2) 1) "2s"))))
+  (dolist (case cases)
+    (destructuring-bind (control arguments expected) case
+      (let ((early (with-output-to-string (*standard-output*)
+                     (mezzano.format::interpret-format-control
+                      (mezzano.format::parse-format-control control) arguments)))
+            (warm (apply #'format nil control arguments)))
+        (unless (and (string= early expected) (string= warm expected))
+          (error "~S ~S: early ~S, warm ~S, expected ~S"
+                 control arguments early warm expected)))))
+  (let ((object (list :a)) (*print-circle* t))
+    (setf (cdr object) object)
+    (let ((expected "       #1=(:A . #1#)"))
+      (assert (string= (format nil "~20@S" object) expected))
+      (assert (string= (with-output-to-string (*standard-output*)
+                         (mezzano.format::interpret-format-control
+                          (mezzano.format::parse-format-control "~20@S") (list object)))
+                       expected))))
+  (mezzano.supervisor:debug-print-line "FORMAT-PADDING-PLURAL-GUEST-PASSED"))
