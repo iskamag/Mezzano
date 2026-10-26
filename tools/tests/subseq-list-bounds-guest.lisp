@@ -1,3 +1,5 @@
+(in-package :mezzano.internals)
+
 ;;;; Load in a running Mezzano image.
 (flet ((fails-p (thunk)
          (handler-case (progn (funcall thunk) nil)
@@ -9,3 +11,5 @@
   (assert (fails-p (lambda () (subseq '(1 2 3) 0 4))))
   (assert (fails-p (lambda () (subseq '(1 2 3) -1))))
   (format t "List SUBSEQ bounds regressions: 6 checks passed.~%"))
+
+(mezzano.supervisor:debug-print-line "SUBSEQ-BOUNDS-GUEST-PASSED")
