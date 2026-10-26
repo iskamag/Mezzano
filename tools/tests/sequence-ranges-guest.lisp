@@ -1,3 +1,5 @@
+(in-package :mezzano.internals)
+
 ;;;; Load in a Mezzano image to check sequence range behavior.
 (let ((checks 0))
   (flet ((check (actual expected)
@@ -20,3 +22,5 @@
     (check (mismatch '(2 3) '(1 2 3) :from-end t) 0)
     (check (mismatch '(0 1 2 3 9) '(8 1 2 3 7) :start1 1 :end1 4 :start2 1 :end2 4 :from-end t) nil))
   (format t "Sequence range regressions: ~D checks passed.~%" checks))
+
+(mezzano.supervisor:debug-print-line "SEQUENCE-RANGES-GUEST-PASSED")
