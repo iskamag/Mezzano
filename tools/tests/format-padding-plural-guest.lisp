@@ -1,5 +1,11 @@
 (in-package :mezzano.internals)
 
+(defclass format-printer-settings-probe () ())
+
+(defmethod print-object ((object format-printer-settings-probe) stream)
+  (declare (ignore object))
+  (write-string (if *print-pretty* "pretty" "plain") stream))
+
 ;;;; Check the warm formatter and the independently accessible early interpreter.
 (let ((cases '(("~5A" ("xy") "xy   ")
                ("~5@A" ("xy") "   xy")
@@ -25,7 +31,22 @@
         (unless (and (string= early expected) (string= warm expected))
           (error "~S ~S: early ~S, warm ~S, expected ~S"
                  control arguments early warm expected)))))
-  (let ((object (list :a)) (*print-circle* t))
+  (let ((*print-circle* t) (*print-pretty* nil))
+    (let ((object (make-instance 'format-printer-settings-probe)))
+      (assert (string= (format nil "~10A" object) "plain     "))
+      (assert (string= (with-output-to-string (*standard-output*)
+                         (mezzano.format::interpret-format-control
+                          (mezzano.format::parse-format-control "~10A") (list object)))
+                       "plain     ")))
+    (assert (string= (format nil "~20@S" '(1 2 3)) "             (1 2 3)"))
+    (assert (string= (format nil "~20@S" '(1 . 2)) "             (1 . 2)"))
+    (let ((tail (list :a)))
+      (assert (string= (format nil "~20@S" (list tail tail)) "       (#1=(:A) #1#)")))
+    (let ((*print-length* 2))
+      (assert (string= (format nil "~20@S" '(1 2 3)) "           (1 2 ...)")))
+    (let ((*print-level* 1))
+      (assert (string= (format nil "~20@S" '(1 (2))) "               (1 #)"))))
+  (let ((object (list :a)) (*print-circle* t) (*print-pretty* nil))
     (setf (cdr object) object)
     (let ((expected "       #1=(:A . #1#)"))
       (assert (string= (format nil "~20@S" object) expected))

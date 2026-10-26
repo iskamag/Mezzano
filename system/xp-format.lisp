@@ -822,10 +822,18 @@
 
  ) ;end of eval when for all (formatter "...") stuff.
 
+(defun print-format-circle-list (stream list)
+  ;; Use XP's cycle-aware list traversal without inserting pretty newlines.
+  (pprint-logical-block (stream list :prefix "(" :suffix ")")
+    (pprint-exit-if-list-exhausted)
+    (loop (write+ (pprint-pop) stream)
+          (pprint-exit-if-list-exhausted)
+          (write-char++ #\Space stream))))
+
 (defun print-format-padded-object (object stream)
-  ;; The non-pretty printer does not handle circular lists. Route those
-  ;; through XP's pretty printer when circularity checking is requested.
-  (let ((*print-pretty* (or *print-pretty* *print-circle*)))
+  ;; The regular non-pretty list printer does not detect circular tails.
+  ;; Keep the caller's *PRINT-PRETTY* binding while XP tracks those tails.
+  (let ((*format-circle-printing* t))
     (maybe-initiate-xp-printing (lambda (xp value) (write+ value xp)) stream object)))
 
 (setf mezzano.format::*format-padded-object-printer* #'print-format-padded-object)

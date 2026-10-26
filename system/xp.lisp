@@ -958,6 +958,8 @@
       (attempt-to-output xp T T))
     result))
 
+(defvar *format-circle-printing* nil)
+
 (defun write+ (object xp)
   (unless (and *circularity-hash-table*
                (eq (circularity-process xp object nil) :subsequent))
@@ -968,6 +970,9 @@
           #+(or)
           type)
       (cond (printer (funcall printer xp object))
+            ((and *format-circle-printing* *circularity-hash-table*
+                  (not *print-pretty*) (consp object))
+             (print-format-circle-list xp object))
             ((maybe-print-fast xp object))
             #+(or)
             ((and *print-pretty*
