@@ -135,6 +135,8 @@
 
 (defun sys.int::bootloader-entry-point (boot-information-page)
   (let ((first-run-p nil))
+    ;; The allocator can use its mutex before scheduler queues are reset.
+    (setf *mutex-pi-ready* nil)
     (initialize-boot-cpu)
     (initialize-debug-log)
     (initialize-fdt boot-information-page)

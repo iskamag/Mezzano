@@ -10,6 +10,7 @@
 (sys.int::defglobal *low-priority-run-queue*)
 (sys.int::defglobal *all-threads*)
 (sys.int::defglobal *n-running-cpus*)
+(sys.int::defglobal *mutex-pi-ready* nil)
 
 (sys.int::defglobal *world-stopper*)
 (sys.int::defglobal *pseudo-atomic-thread-count*)
@@ -186,7 +187,13 @@ can be reprotected.")
   (state-rflags 0 :type (signed-byte 64))
   (state-rsp 0 :type (signed-byte 64))
   ;; Used to save packed fpsr (low half)/fpcr (high half) state on arm64.
-  (state-ss  0 :type (signed-byte 64)))
+  (state-ss  0 :type (signed-byte 64))
+  ;; Keep PI fields after the fixed machine state: ARM LAP encodes several
+  ;; existing thread-slot offsets directly in load/store instructions.
+  ;; :supervisor is an execution domain, never a donated priority.
+  (base-priority :normal :type (member :low :normal :high :supervisor :idle))
+  (owned-mutexes nil)
+  (waiting-mutex nil))
 
 (define-doubly-linked-list-helpers run-queue
     thread-queue-next thread-queue-prev
@@ -314,6 +321,26 @@ can be reprotected.")
   (when (eql thread *world-stopper*)
     (return-from push-run-queue))
   (push-run-queue-1 thread (run-queue-for-priority (thread-priority thread))))
+
+(defun thread-priority-rank (priority)
+  (ecase priority
+    (:idle 0) (:low 1) (:normal 2) (:high 3) (:supervisor 4)))
+
+(defun thread-priority-higher-p (first second)
+  (> (thread-priority-rank first) (thread-priority-rank second)))
+
+(defun set-thread-effective-priority (thread priority)
+  "Move a runnable thread between queues while holding the scheduler lock."
+  (ensure-global-thread-lock-held)
+  (let ((old (thread-priority thread)))
+    (unless (eql old priority)
+      (let ((queued (and (eql (thread-state thread) :runnable)
+                         (run-queue-linked-p thread))))
+        (when queued
+          (run-queue-remove thread (run-queue-for-priority old)))
+        (setf (thread-priority thread) priority)
+        (when queued
+          (push-run-queue thread))))))
 
 (defun pop-run-queue-1 (rq)
   (run-queue-pop-front rq))
@@ -578,6 +605,7 @@ Interrupts must be off and the global thread lock must be held."
     (setf (thread-stack thread) stack
           (thread-self thread) thread
           (thread-priority thread) priority
+          (thread-base-priority thread) priority
           (thread-join-event thread) (make-event :name thread))
     ;; Protect the guard area, making it fully inaccessible.
     (protect-memory-range (stack-base stack) +thread-stack-soft-guard-size+ 0)
@@ -743,7 +771,8 @@ not and WAIT-P is false."
          (stack (%allocate-stack stack-size t)))
     (setf (thread-stack thread) stack
           (thread-self thread) thread
-          (thread-priority thread) priority)
+          (thread-priority thread) priority
+          (thread-base-priority thread) priority)
     (reset-ephemeral-thread thread entry-point initial-state priority)
     thread))
 
@@ -803,6 +832,9 @@ not and WAIT-P is false."
     ;; Remove from whatever wait queue too
   (setf (thread-state thread) state
         (thread-priority thread) (or priority :supervisor)
+        (thread-base-priority thread) (or priority :supervisor)
+        (thread-owned-mutexes thread) nil
+        (thread-waiting-mutex thread) nil
         (thread-special-stack-pointer thread) nil
         (thread-wait-item thread) nil
         (thread-pending-footholds thread) '()
@@ -851,7 +883,8 @@ not and WAIT-P is false."
   ;; Don't let the pager run until the paging disk has been found.
   (reset-ephemeral-thread sys.int::*pager-thread* #'pager-thread :sleeping :supervisor)
   (setf (thread-wait-item sys.int::*pager-thread*) "Waiting for paging disk")
-  (reset-ephemeral-thread sys.int::*disk-io-thread* #'disk-thread :runnable :supervisor))
+  (reset-ephemeral-thread sys.int::*disk-io-thread* #'disk-thread :runnable :supervisor)
+  (setf *mutex-pi-ready* t))
 
 (defun wake-thread (thread)
   "Wake a sleeping thread."
@@ -991,6 +1024,9 @@ footholds will be reenabled, otherwise footholds will stay inhibited."
                                (ensure (wait-queue-p wi)
                                        "Thread " thread " sleeping on non-wait-queue " wi)
                                (remove-from-wait-queue thread wi)
+                               (when (and (mutex-p wi)
+                                          (eql (thread-waiting-mutex thread) wi))
+                                 (mutex-waiter-removed wi thread))
                                (unlock-wait-queue wi)
                                (wake-thread-1 thread)
                                t)

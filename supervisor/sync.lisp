@@ -102,29 +102,122 @@
   (state :unlocked)
   (stack-next nil)
   ;; Number of times ACQUIRE-MUTEX failed to immediately acquire the lock.
-  (contested-count 0 :type fixnum))
+  (contested-count 0 :type fixnum)
+  ;; Intrusive link in the owner's list; all donation links are guarded by
+  ;; the global thread lock. No consing is needed while interrupts are off.
+  (owned-next nil)
+  (pi-linked-p nil))
+
+;; Lock order for mutex PI: mutex wait queue, then global thread lock.
+;; The global lock protects owner links, waiter queues, and effective priorities;
+;; wait-queue mutations elsewhere (UNSLEEP-THREAD) take the same order.
+(defun mutex-link-owner (mutex owner)
+  (ensure-global-thread-lock-held)
+  (setf (mutex-owned-next mutex) (thread-owned-mutexes owner)
+        (thread-owned-mutexes owner) mutex
+        (mutex-owner mutex) owner
+        (mutex-pi-linked-p mutex) t))
+
+(defun mutex-unlink-owner (mutex owner)
+  (ensure-global-thread-lock-held)
+  (let ((previous nil))
+    (loop for current = (thread-owned-mutexes owner)
+            then (mutex-owned-next current)
+          while current
+          do (when (eql current mutex)
+               (if previous
+                   (setf (mutex-owned-next previous) (mutex-owned-next current))
+                   (setf (thread-owned-mutexes owner) (mutex-owned-next current)))
+               (setf (mutex-owned-next current) nil
+                     (mutex-pi-linked-p current) nil)
+               (return-from mutex-unlink-owner))
+             (setf previous current))
+    (panic "Mutex missing from owner's PI list " mutex)))
+
+(defun mutex-effective-priority (owner)
+  ;; :supervisor grants world-stop execution eligibility, not just a shorter
+  ;; scheduler queue. Never donate that eligibility to an ordinary owner.
+  (let ((best (thread-base-priority owner)))
+    (loop for mutex = (thread-owned-mutexes owner)
+            then (mutex-owned-next mutex)
+          while mutex
+          do (do-wait-queue (waiter mutex)
+               (let ((priority (thread-priority waiter)))
+                 (when (and (eql priority :supervisor)
+                            (not (eql best :supervisor)))
+                   (setf priority :high))
+                 (when (thread-priority-higher-p priority best)
+                   (setf best priority)))))
+    best))
+
+(defun mutex-propagate-priority (thread)
+  "Recompute THREAD and owners above it in the acyclic mutex wait graph."
+  (ensure-global-thread-lock-held)
+  (loop repeat 1024
+        while thread
+        do (let ((priority (mutex-effective-priority thread)))
+             (when (eql priority (thread-priority thread))
+               (return-from mutex-propagate-priority))
+             (set-thread-effective-priority thread priority)
+             (let ((waiting (thread-waiting-mutex thread)))
+               (setf thread (when waiting (mutex-owner waiting)))))
+        finally (when thread
+                  (panic "Mutex PI chain exceeds bound (cycle?)"))))
+
+(defun mutex-wait-cycle-p (self owner)
+  ;; A new edge from SELF to OWNER may not close a cycle. Existing wait
+  ;; edges are stable under the global thread lock.
+  (loop repeat 1024
+        while owner
+        do (when (eql owner self)
+             (return-from mutex-wait-cycle-p t))
+           (let ((waiting (thread-waiting-mutex owner)))
+             (setf owner (when waiting (mutex-owner waiting))))
+        finally (when owner
+                  (panic "Mutex wait chain exceeds bound (cycle?)")))
+  nil)
+
+(defun mutex-waiter-removed (mutex thread)
+  "Withdraw a cancelled mutex wait while both locks are held."
+  (ensure-global-thread-lock-held)
+  (setf (thread-waiting-mutex thread) nil)
+  (when (mutex-owner mutex)
+    (mutex-propagate-priority (mutex-owner mutex))))
 
 (defun acquire-mutex (mutex &optional (wait-p t))
   (check-type mutex mutex)
   (let ((self (current-thread)))
-    ;; Fast path - try to lock.
-    (when (eql (sys.int::cas (mutex-state mutex) :unlocked :locked) :unlocked)
-      ;; We got it.
-      (setf (mutex-owner mutex) self)
+    ;; The uncontended CAS remains valid before INITIALIZE-THREADS, when the
+    ;; allocator already uses mutexes but the scheduler lock is unavailable.
+    ;; Hold the scheduler lock before changing the state. The slow path also
+    ;; holds it while inspecting the state and owner, so it cannot observe a
+    ;; successful CAS before the new owner has been linked.
+    (when (if *mutex-pi-ready*
+              (safe-without-interrupts (mutex self)
+                (acquire-global-thread-lock)
+                (let ((acquired (eql (sys.int::cas (mutex-state mutex)
+                                                 :unlocked :locked)
+                                     :unlocked)))
+                  (when acquired
+                    (mutex-link-owner mutex self))
+                  (release-global-thread-lock)
+                  acquired))
+              (when (eql (sys.int::cas (mutex-state mutex) :unlocked :locked)
+                         :unlocked)
+                (setf (mutex-owner mutex) self)
+                t))
       (return-from acquire-mutex t))
-    ;; Idiot check.
-    (unless (not (mutex-held-p mutex))
+    (when (mutex-held-p mutex)
       (if *lock-violations-are-fatal*
           (panic "Recursive locking detected on " mutex " " (mutex-name mutex))
           (error 'sys.int::mutex-error
                  :mutex mutex
                  :format-control "Recursive locking detected on ~S ~S"
                  :format-arguments (list mutex (mutex-name mutex)))))
-    ;; Increment MUTEX-CONTESTED-COUNT
     (sys.int::atomic-incf (mutex-contested-count mutex))
     (when wait-p
       (ensure-interrupts-enabled)
-      (unless (not *pseudo-atomic*)
+      (when *pseudo-atomic*
         (panic "Trying to acquire mutex " mutex " while pseudo-atomic."))
       (thread-pool-blocking-hijack acquire-mutex mutex wait-p)
       (%call-on-wired-stack-without-interrupts
@@ -132,29 +225,32 @@
       t)))
 
 (defun acquire-mutex-slow-path (sp fp mutex self)
-  ;; Slow path.
-  ;; Now try to sleep on the lock.
+  ;; Blocking already requires an initialized scheduler.
   (lock-wait-queue mutex)
-  ;; Put the lock into the contested state.
-  ;; Try to acquire again, release may have been running.
-  (when (eql (sys.int::atomic-swapf (mutex-state mutex) :contested) :unlocked)
-    ;; We got it.
-    (setf (mutex-owner mutex) self)
+  (acquire-global-thread-lock)
+  (when (eql (mutex-state mutex) :unlocked)
+    (mutex-link-owner mutex self)
+    (setf (mutex-state mutex) :locked)
+    (release-global-thread-lock)
     (unlock-wait-queue mutex)
     (return-from acquire-mutex-slow-path))
-  ;; Add to wait queue. Release will directly transfer ownership
-  ;; to this thread.
+  ;; An allocator mutex acquired before INITIALIZE-THREADS may still be held.
+  ;; Admit it to PI bookkeeping before adding the first waiter.
+  (unless (mutex-pi-linked-p mutex)
+    (mutex-link-owner mutex (mutex-owner mutex)))
+  (when (mutex-wait-cycle-p self (mutex-owner mutex))
+    (release-global-thread-lock)
+    (unlock-wait-queue mutex)
+    (panic "Mutex wait cycle involving " mutex))
+  (setf (mutex-state mutex) :contested)
   (push-wait-queue self mutex)
-  ;; Now sleep.
-  ;; Must take the thread lock before dropping the mutex lock or release
-  ;; may be able to remove the thread from the sleep queue before it goes
-  ;; to sleep.
-  (acquire-global-thread-lock)
-  (unlock-wait-queue mutex)
-  (setf (thread-wait-item self) mutex
+  (setf (thread-waiting-mutex self) mutex
+        (thread-wait-item self) mutex
         (thread-state self) :sleeping
         (thread-unsleep-helper self) #'acquire-mutex
         (thread-unsleep-helper-argument self) mutex)
+  (mutex-propagate-priority (mutex-owner mutex))
+  (unlock-wait-queue mutex)
   (%reschedule-via-wired-stack sp fp))
 
 (defun mutex-held-p (mutex)
@@ -178,44 +274,47 @@
                       :format-control "Trying to release mutex ~S ~S held by other thread ~S"
                       :format-arguments (list mutex (mutex-name mutex) current-owner)))))))
 
+(defun mutex-release-locked (mutex)
+  "Release under the mutex wait-queue lock and global thread lock."
+  (ensure-global-thread-lock-held)
+  (let ((old-owner (mutex-owner mutex))
+        (next-owner (pop-wait-queue mutex)))
+    (when (mutex-pi-linked-p mutex)
+      (mutex-unlink-owner mutex old-owner))
+    (setf (mutex-owner mutex) nil)
+    (when next-owner
+      (setf (thread-waiting-mutex next-owner) nil)
+      (mutex-link-owner mutex next-owner))
+    (setf (mutex-state mutex)
+          (cond ((null next-owner) :unlocked)
+                ((wait-queue-empty-p mutex) :locked)
+                (t :contested)))
+    (mutex-propagate-priority old-owner)
+    (when next-owner
+      (mutex-propagate-priority next-owner)
+      (wake-thread-1 next-owner))))
+
 (defun release-mutex (mutex)
   (check-type mutex mutex)
   (check-mutex-release-consistence mutex)
-  (setf (mutex-owner mutex) nil)
-  (when (not (eql (sys.int::cas (mutex-state mutex) :locked :unlocked) :locked))
-    ;; Mutex must be in the contested state.
-    (release-mutex-slow-path mutex))
+  (if *mutex-pi-ready*
+      (safe-without-interrupts (mutex)
+        (lock-wait-queue mutex)
+        (acquire-global-thread-lock)
+        (mutex-release-locked mutex)
+        (release-global-thread-lock)
+        (unlock-wait-queue mutex))
+      ;; No other threads exist before the scheduler starts.
+      (progn
+        (setf (mutex-owner mutex) nil)
+        (unless (eql (sys.int::cas (mutex-state mutex) :locked :unlocked) :locked)
+          (panic "Contended mutex before scheduler initialization " mutex))))
   (values))
 
-(defun release-mutex-slow-path (mutex)
-  ;; Contested lock. Need to wake a thread and pass the lock to it.
-  (safe-without-interrupts (mutex)
-    (with-wait-queue-lock (mutex)
-      ;; Look for a thread to wake.
-      (let ((thread (pop-wait-queue mutex)))
-        (cond (thread
-               ;; Found one, wake it & transfer the lock.
-               (setf (mutex-owner mutex) thread)
-               (wake-thread thread))
-              (t
-               ;; No threads sleeping, just drop the lock.
-               ;; Any threads trying to lock will be spinning on the wait queue lock.
-               (setf (mutex-state mutex) :unlocked)))))))
-
 (defun release-mutex-for-condition-variable (mutex)
-  (setf (mutex-owner mutex) nil)
-  (when (not (eql (sys.int::cas (mutex-state mutex) :locked :unlocked) :locked))
-    ;; Mutex must be in the contested state.
-    ;; Look for a thread to wake.
-    (let ((thread (pop-wait-queue mutex)))
-      (cond (thread
-             ;; Found one, wake it & transfer the lock.
-             (setf (mutex-owner mutex) thread)
-             (wake-thread-1 thread))
-            (t
-             ;; No threads sleeping, just drop the lock.
-             ;; Any threads trying to lock will be spinning on the wait queue lock.
-             (setf (mutex-state mutex) :unlocked))))))
+  ;; CONDITION-WAIT-INNER already holds the condition-variable and mutex
+  ;; wait-queue locks, followed by the global thread lock.
+  (mutex-release-locked mutex))
 
 (defun call-with-mutex (thunk mutex wait-p)
   (unwind-protect
