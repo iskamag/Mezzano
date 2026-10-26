@@ -1,3 +1,5 @@
+(in-package :mezzano.internals)
+
 ;;;; Load in a running Mezzano image.
 (let ((cases '(("~$" 3.14159 "3.14")
                ("~$" 42 "42.00")
@@ -17,3 +19,5 @@
                   (format stream "~$" 1.5))))
     (assert (string= result "prefix 1.50")))
   (format t "Monetary format regressions: ~D checks passed.~%" (1+ (length cases))))
+
+(mezzano.supervisor:debug-print-line "MONETARY-FORMAT-GUEST-PASSED")
