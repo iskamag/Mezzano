@@ -59,7 +59,13 @@ can be reprotected.")
   (cons-allocation-count 0)
   (cons-fast-path-hits 0)
   (general-allocation-count 0)
-  (general-fast-path-hits 0))
+  (general-fast-path-hits 0)
+  ;; True while this CPU can be woken to look for runnable threads.
+  (idle-p nil)
+  ;; The current thread must stay on this CPU while positive.
+  (inhibit-scheduling 0 :type fixnum)
+  ;; A one-shot preemption event arrived while scheduling was inhibited.
+  (preemption-pending nil))
 
 (defstruct (thread
              (:area :wired)
@@ -261,8 +267,7 @@ can be reprotected.")
   (run-queue-pop-front rq))
 
 (defun pop-run-queue ()
-  ;; FIXME, HACK! Virtio drivers seem to be broken when the run outside the first PE on A64
-  ;; This constrains supervisor threads to just that PE.
+  ;; ARM supervisor threads run on the boot CPU.
   (or (and #+arm64 (eql (local-cpu) *bsp-cpu*)
            (pop-run-queue-1 *supervisor-priority-run-queue*))
       (pop-run-queue-1 *high-priority-run-queue*)
@@ -383,15 +388,40 @@ Interrupts must be off and the global thread lock must be held."
 
 (defun maybe-preempt-via-interrupt (interrupt-frame)
   (let ((current (current-thread)))
-    (acquire-global-thread-lock)
-    (cond ((or (and *world-stopper*
-                    (eql current *world-stopper*))
-               (eql (thread-priority current) :supervisor)
-               (eql current (local-cpu-idle-thread)))
-           (release-global-thread-lock))
+    (cond ((plusp (cpu-inhibit-scheduling (local-cpu)))
+           nil)
           (t
-           (setf (thread-state current) :runnable)
-           (%reschedule-via-interrupt interrupt-frame)))))
+           (acquire-global-thread-lock)
+           (cond ((or (and *world-stopper*
+                           (eql current *world-stopper*))
+                      (eql (thread-priority current) :supervisor)
+                      (eql current (local-cpu-idle-thread)))
+                  (release-global-thread-lock))
+                 (t
+                  (setf (thread-state current) :runnable)
+                  (%reschedule-via-interrupt interrupt-frame)))))))
+
+(defun inhibit-local-cpu-scheduling ()
+  ;; The CPU must not change between selecting it and incrementing the count.
+  (safe-without-interrupts ()
+    (incf (cpu-inhibit-scheduling (local-cpu)))))
+
+(defun allow-local-cpu-scheduling ()
+  (safe-without-interrupts ()
+    (let ((cpu (local-cpu)))
+      (ensure (plusp (cpu-inhibit-scheduling cpu)))
+      (decf (cpu-inhibit-scheduling cpu))
+      (when (and (zerop (cpu-inhibit-scheduling cpu))
+                 (cpu-preemption-pending cpu))
+        (setf (cpu-preemption-pending cpu) nil)
+        ;; Retry promptly without granting a fresh timeslice.
+        (preemption-timer-reset 1)))))
+
+(defmacro with-local-cpu-scheduling-inhibited (&body body)
+  `(progn
+     (inhibit-local-cpu-scheduling)
+     (unwind-protect (progn ,@body)
+       (allow-local-cpu-scheduling))))
 
 (defun %%switch-to-thread-via-wired-stack (current-thread sp fp next-thread)
   ;; Save frame pointer.
@@ -611,11 +641,14 @@ not and WAIT-P is false."
        ;; the system idles. Not needed to be correct, but reduces activity
        ;; when idle.
        (ensure (not (preemption-timer-remaining)))
+       ;; Mark this CPU as idle for directed wakeup.
+       (setf (cpu-idle-p (local-cpu)) t)
        ;; Look for a thread to switch to.
        (acquire-global-thread-lock)
        (setf (thread-state self) :runnable)
        (let ((next (update-run-queue)))
          (cond ((not (eql next self))
+                (setf (cpu-idle-p (local-cpu)) nil)
                 (increment-n-running-cpus)
                 ;; Switch to thread.
                 (%run-on-wired-stack-without-interrupts (sp fp next self)
