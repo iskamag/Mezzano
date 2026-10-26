@@ -27,6 +27,12 @@
         (t (or (find-constructor (first tree) name)
                (find-constructor (rest tree) name)))))
 
+(defun form-present-p (tree wanted)
+  (cond ((equal tree wanted) t)
+        ((atom tree) nil)
+        (t (or (form-present-p (first tree) wanted)
+               (form-present-p (rest tree) wanted)))))
+
 (defun constructor-unknown-keywords (constructor slots)
   (let ((arguments (rest constructor)))
     (assert (evenp (length arguments)))
@@ -56,5 +62,9 @@
   (assert (equal (constructor-unknown-keywords
                   '(make-x86-64-cpu :apic-in-x2apic-mode t)
                   base-slots)
-                 '(:apic-in-x2apic-mode))))
-(format t "PASS: x86-64 and ARM secondary CPU constructor keywords match slots.~%")
+                 '(:apic-in-x2apic-mode)))
+  (assert (form-present-p
+           (read-source-form "../../supervisor/arm64/cpu.lisp"
+                             "(defun initialize-boot-cpu ")
+           '(setf *tlb-shootdown-in-progress* nil))))
+(format t "PASS: CPU constructors match slots and ARM boot initializes TLB state.~%")

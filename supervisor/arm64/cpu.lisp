@@ -22,6 +22,9 @@
   page-fault-hook)
 
 (defun initialize-boot-cpu ()
+  ;; DEFGlobal does not initialize a previously unbound symbol in the cold image.
+  ;; Early virtio DMA mapping can begin a shootdown during the FDT scan.
+  (setf *tlb-shootdown-in-progress* nil)
   (setf (arm64-cpu-self *bsp-cpu*) *bsp-cpu*)
   (setf (arm64-cpu-state *bsp-cpu*) :online)
   (setf (arm64-cpu-idle-thread *bsp-cpu*)
@@ -300,22 +303,20 @@ Protected by the world stop lock."
   (sys.int::%atomic-fixnum-add-symbol
    '*debug-magic-button-ready-variable* -1))
 
+(sys.int::defglobal *tlb-shootdown-in-progress* nil)
+
 (defun begin-tlb-shootdown ()
-  nil)
-
-(defun tlb-shootdown-single (address)
-  (declare (ignore address))
-  nil)
-
-(defun tlb-shootdown-range (base length)
-  (declare (ignore base length))
-  nil)
-
-(defun tlb-shootdown-all ()
-  nil)
+  (ensure (rw-lock-write-held-p *vm-lock*) "VM lock not held when doing TLB shootdown!")
+  (ensure (not *tlb-shootdown-in-progress*) "TLB shootdown already in progress!")
+  ;; ARM TLBI IS broadcasts in hardware, but keep the issuing thread on
+  ;; the same CPU until its local invalidation and barriers are complete.
+  (inhibit-local-cpu-scheduling)
+  (setf *tlb-shootdown-in-progress* t))
 
 (defun finish-tlb-shootdown ()
-  nil)
+  (ensure *tlb-shootdown-in-progress*)
+  (setf *tlb-shootdown-in-progress* nil)
+  (allow-local-cpu-scheduling))
 
 (defun check-tlb-shootdown-not-in-progress ()
   nil)

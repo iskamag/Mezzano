@@ -358,6 +358,9 @@ If the CPU is idle, this will cause it to check for new threads."
 TLB shootdown must be protected by the VM lock."
   (ensure (rw-lock-write-held-p *vm-lock*) "VM lock not held when doing TLB shootdown!")
   (ensure (not *tlb-shootdown-in-progress*) "TLB shootdown already in progress!")
+  ;; No scheduler lock is held here: each peer must be able to enter its IPI.
+  ;; Keep the initiator on the CPU whose local TLB we invalidate.
+  (inhibit-local-cpu-scheduling)
   (setf *tlb-shootdown-in-progress* t)
   (setf *busy-tlb-shootdown-cpus* (1- *n-up-cpus*))
   (broadcast-ipi +ipi-type-fixed+ +tlb-shootdown-ipi-vector+)
@@ -367,17 +370,6 @@ TLB shootdown must be protected by the VM lock."
        (return))
      (sys.int::cpu-relax)))
 
-(defun tlb-shootdown-single (address)
-  (declare (ignore address))
-  (ensure *tlb-shootdown-in-progress*))
-
-(defun tlb-shootdown-range (base length)
-  (declare (ignore base length))
-  (ensure *tlb-shootdown-in-progress*))
-
-(defun tlb-shootdown-all ()
-  (ensure *tlb-shootdown-in-progress*))
-
 (defun finish-tlb-shootdown ()
   (ensure *tlb-shootdown-in-progress*)
   (setf *busy-tlb-shootdown-cpus* (1- *n-up-cpus*))
@@ -386,7 +378,8 @@ TLB shootdown must be protected by the VM lock."
   (loop
      (when (eql *busy-tlb-shootdown-cpus* 0)
        (return))
-     (sys.int::cpu-relax)))
+     (sys.int::cpu-relax))
+  (allow-local-cpu-scheduling))
 
 (defun tlb-shootdown-ipi-handler (interrupt-frame info)
   (declare (ignore info))
