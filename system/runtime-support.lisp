@@ -444,16 +444,16 @@
     (setf (mezzano.runtime::instance-access-by-name new-class 'mezzano.clos::prototype)
           mezzano.clos::*secret-unbound-value*)
     (setf (mezzano.runtime::instance-access-by-name new-class 'mezzano.clos::slot-storage-layout)
-          (make-layout :class new-class
-                       :hash (mezzano.runtime::instance-access-by-name
-                              new-class 'mezzano.clos::hash)
-                       :obsolete nil
-                       :heap-size (structure-definition-size sdef)
-                       :heap-layout (layout-heap-layout (structure-definition-layout sdef))
-                       :area (structure-definition-area sdef)
-                       :instance-slots (convert-structure-definition-instance-slots sdef)
-                       ;; TODO
-                       :compatible (make-array 0 :area :wired)))
+          (finish-compatible-layouts
+           (make-layout :class new-class
+                        :hash (mezzano.runtime::instance-access-by-name
+                               new-class 'mezzano.clos::hash)
+                        :obsolete nil
+                        :heap-size (structure-definition-size sdef)
+                        :heap-layout (layout-heap-layout (structure-definition-layout sdef))
+                        :area (structure-definition-area sdef)
+                        :instance-slots (convert-structure-definition-instance-slots sdef)
+                        :compatible (make-structure-compatible-layouts parent-class))))
     (setf (mezzano.runtime::instance-access-by-name new-class 'mezzano.clos::source-location)
           source-location)
     (pushnew new-class

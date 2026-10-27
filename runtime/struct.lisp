@@ -207,13 +207,43 @@
       (return t))))
 
 (defun sys.int::structure-layout-compatible-p (object layout)
-  "Test if an object is compatible with the given layout."
+  "Test if OBJECT's current storage is compatible with LAYOUT."
   (declare (optimize (speed 3) (safety 0) (debug 0)))
   (when (sys.int::instance-p object)
-    (loop with object-layout of-type sys.int::layout = (sys.int::%instance-layout object)
-          with compatible of-type simple-vector = (sys.int::layout-compatible object-layout)
-          for l across compatible
-            thereis (eq l layout))))
+    (let ((object-layout (sys.int::%instance-layout object)))
+      ;; A copied layout with a replacement instance still describes the old
+      ;; storage.  Neither it nor an obsolete layout is safe for direct slot
+      ;; access.  An obsolete ancestor also invalidates the rest of the path.
+      (when (and (not (sys.int::layout-new-instance object-layout))
+                 (not (sys.int::layout-obsolete layout)))
+        (loop with compatible of-type simple-vector = (sys.int::layout-compatible object-layout)
+              for l across compatible
+              do (when (sys.int::layout-obsolete l)
+                   (return nil))
+                 (when (eq l layout)
+                   (return t)))))))
+
+(defun sys.int::make-structure-compatible-layouts (parent)
+  "Make a wired vector with room for a layout and its parent layouts."
+  (let ((parents
+          (loop for current = parent then next
+                while current
+                for class-p = (structure-class-p current)
+                for layout = (if class-p
+                                 (instance-access-by-name current 'mezzano.clos::slot-storage-layout)
+                                 (sys.int::structure-definition-layout current))
+                for next = (if class-p
+                               (instance-access-by-name current 'mezzano.clos::parent)
+                               (sys.int::structure-definition-parent current))
+                when layout collect layout)))
+    (make-array (1+ (length parents))
+                :initial-contents (cons nil parents)
+                :area :wired)))
+
+(defun sys.int::finish-compatible-layouts (layout)
+  "Install LAYOUT in the first element of its unpublished compatible vector."
+  (setf (svref (sys.int::layout-compatible layout) 0) layout)
+  layout)
 
 (defun sys.int::%allocate-struct (structure-class)
   (when (symbolp structure-class)
@@ -316,8 +346,8 @@
                                                                           collect (sys.int::structure-slot-definition-name slot)
                                                                           collect (sys.int::structure-slot-definition-location slot))
                                                      :area :wired)
-                         ;; TODO
-                         :compatible (make-array 0 :area :wired))))
+                         :compatible (sys.int::make-structure-compatible-layouts parent))))
+    (sys.int::finish-compatible-layouts layout-object)
     (setf (sys.int::structure-definition-layout def) layout-object)
     def))
 

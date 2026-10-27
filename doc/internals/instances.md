@@ -30,6 +30,18 @@ It's a `sealed` structure-object allocated in the `wired` area with the followin
 * `HEAP-LAYOUT` - Used by the GC to know which words of the object contain Lisp values and which contain unboxed data. Either `NIL` meaning no values, `T` meaning all words contain values to be scanned, or a `SIMPLE-BIT-VECTOR` the size of the object with a `1` bit indicating that word contains a Lisp value.
 * `AREA` - Allocation area in which the object should be allocated.
 * `INSTANCE-SLOTS` - A `SIMPLE-VECTOR` containing two adjacent entries per slot in the instance. The first entry is the name of the slot, the second entry is the `location` of the slot in the instance.
+* `COMPATIBLE` - A wired `SIMPLE-VECTOR` used for direct structure slot access.
+  A structure layout records itself followed by its ancestor layouts, in
+  order; a normal standard-object layout records only itself. A copied layout
+  for a superseded instance shares the original vector.
+
+Compatibility vectors describe storage, not just class membership. A direct
+access must reject a superseded instance or any obsolete layout along the path
+to the target layout. Structure `TYPEP` checks compiled with this implementation
+fall back to the class parent chain when the vector cannot prove compatibility,
+so those checks and existing instances remain meaningful after a layout changes.
+Redefining a structure also replaces its layout when its inherited layout path
+changes, even if its physical slot layout did not change.
 
 Layouts are allocated in the `wired` area since they are used by the GC. Allowing them to be movable would complicate the GC.
 

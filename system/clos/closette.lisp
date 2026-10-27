@@ -1055,16 +1055,16 @@ Other arguments are included directly."
                                         (safe-class-slots class)))
          (instance-slot-vector
           (make-array (* (length instance-slots) 2)))
-         (layout (sys.int::make-layout
-                  :class class
-                  :hash (safe-class-hash class)
-                  :obsolete nil
-                  :heap-size (compute-class-heap-size class instance-slots)
-                  :heap-layout t
-                  :area (std-slot-value class 'allocation-area)
-                  :instance-slots instance-slot-vector
-                  ;; TODO (should just be self)
-                  :compatible (make-array 0 :area :wired))))
+         (layout (sys.int::finish-compatible-layouts
+                  (sys.int::make-layout
+                   :class class
+                   :hash (safe-class-hash class)
+                   :obsolete nil
+                   :heap-size (compute-class-heap-size class instance-slots)
+                   :heap-layout t
+                   :area (std-slot-value class 'allocation-area)
+                   :instance-slots instance-slot-vector
+                   :compatible (make-array 1 :area :wired)))))
     (loop
        for i from 0 by 2
        for slot in instance-slots

@@ -961,7 +961,11 @@
                            (mezzano.clos:class-layout struct-type))))
                    (structure-layout-compatible-p
                     ,object-sym
-                    ',(mezzano.clos:class-layout struct-type)))))))))
+                    ',(mezzano.clos:class-layout struct-type))
+                   ;; Layouts cached by compiled code or descendants may be
+                   ;; obsolete after redefinition.  TYPEP asks about class
+                   ;; membership, not whether direct slot access is safe.
+                   (structure-type-p ,object-sym ',struct-type))))))))
   (when (eql type-specifier 'sequence)
     ;; Open-code parts the sequence type check.
     ;; This is a performance hack that replaces the old DEFTYPE SEQUENCE,
