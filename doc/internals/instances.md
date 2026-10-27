@@ -37,11 +37,11 @@ It's a `sealed` structure-object allocated in the `wired` area with the followin
 
 Compatibility vectors describe storage, not just class membership. A direct
 access must reject a superseded instance or any obsolete layout along the path
-to the target layout. Structure `TYPEP` checks compiled with this implementation
-fall back to the class parent chain when the vector cannot prove compatibility,
-so those checks and existing instances remain meaningful after a layout changes.
-Redefining a structure also replaces its layout when its inherited layout path
-changes, even if its physical slot layout did not change.
+to the target layout. Structure `TYPEP` checks fall back to the class parent
+chain for those stale paths; a complete, current vector without the target is
+a fast negative result. Redefining a structure also replaces its layout when
+its inherited layout path changes, even if its physical slot layout did not
+change.
 
 Layouts are allocated in the `wired` area since they are used by the GC. Allowing them to be movable would complicate the GC.
 

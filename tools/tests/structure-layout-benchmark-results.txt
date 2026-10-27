@@ -1,0 +1,41 @@
+Structure layout compatibility benchmark, 2026-10-28
+
+Host: AMD Ryzen 7 6800H.  One x86-64 KVM guest vCPU, QEMU pinned to host
+CPU 4.  Each of 11 alternating pairs performs 640,000 operations.  Times are
+elapsed TSC ticks, not core cycles.  Compilation, warmup, and an explicit
+full GC precede timing.  Every sample checks its result, zero allocation,
+and zero GC cycles.  The reported ratio is the median of the paired ratios.
+
+Case                 upstream ticks    current ticks    current/upstream
+Exact structure          13,143,168       13,172,352          1.006635
+Child structure          23,500,640       22,376,736          0.948632
+Grandchild structure     27,441,600       25,581,120          0.935504
+Unrelated structure      23,455,392       23,467,232          1.000538
+Fixnum miss              15,478,432       15,327,136          0.993558
+Mixed inputs             19,612,448       18,827,200          0.975215
+
+Parent accessor: empty-vector fallback 3,093,299,712 ticks; populated-vector
+fast path 24,630,592 ticks; median paired current/empty ratio 0.007891.
+
+For TYPEP, the old and current compiler expansions use the same objects and
+complete vectors, so the comparison isolates the compatibility check rather
+than the old incorrect TYPEP result on an empty vector.  Both helpers are
+compiled wired, and the benchmark asserts that the generated baseline calls
+the upstream helper.  For the accessor case, one test child is temporarily
+given the old empty vector, and the same compiled accessor is used on both
+children.  The older case thus emulates the old slow fallback rather than
+loading an old image.  These are focused microbenchmarks, not application
+throughput or ARM64 measurements.
+
+Reproduction, from Mezzano/:
+
+  sbcl --non-interactive --load tools/tests/structure-layout-benchmark-image.lisp
+  taskset -c 4 timeout 180 qemu-system-x86_64 -enable-kvm -machine q35 -m 3G -smp 1 \
+    -drive file=/tmp/mezzano-layout-benchmark/native.image,format=raw -snapshot \
+    -serial stdio -monitor none -display none -vga std -net none -no-reboot \
+    > /tmp/mezzano-layout-benchmark/serial.log 2>&1
+
+The image prints STRUCTURE-LAYOUT-ALL-PASSED after the correctness regression
+and benchmark; QEMU must then be stopped, or left to the timeout.  The native
+disassembly of STRUCTURE-LAYOUT-TYPEP showed the single loop bound and direct
+vector element load, without an additional per-element bounds check.

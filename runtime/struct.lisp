@@ -206,22 +206,39 @@
     (when (eq object-class structure-class)
       (return t))))
 
+(defmacro structure-layout-match-p (object layout stale-form)
+  ;; Share the fast path, but let TYPEP resolve class membership on a stale
+  ;; path while slot access declines to use stale storage.  A complete,
+  ;; current vector that does not contain LAYOUT is a definite miss.
+  (let ((object-var (gensym "OBJECT"))
+        (layout-var (gensym "LAYOUT")))
+    `(let ((,object-var ,object)
+           (,layout-var ,layout))
+       (when (sys.int::instance-p ,object-var)
+         (let ((object-layout (sys.int::%instance-layout ,object-var)))
+           (if (sys.int::layout-new-instance object-layout)
+               ,stale-form
+               ;; The fixed vector length bounds the raw element reads.
+               (loop with compatible of-type simple-vector = (sys.int::layout-compatible object-layout)
+                     for i of-type fixnum below (length compatible)
+                     do (let ((l (sys.int::%object-ref-t compatible i)))
+                          (when (sys.int::layout-obsolete l)
+                            (return ,stale-form))
+                          (when (eq l ,layout-var)
+                            (return t)))
+                     finally (when (sys.int::layout-obsolete ,layout-var)
+                               (return ,stale-form)))))))))
+
 (defun sys.int::structure-layout-compatible-p (object layout)
   "Test if OBJECT's current storage is compatible with LAYOUT."
   (declare (optimize (speed 3) (safety 0) (debug 0)))
-  (when (sys.int::instance-p object)
-    (let ((object-layout (sys.int::%instance-layout object)))
-      ;; A copied layout with a replacement instance still describes the old
-      ;; storage.  Neither it nor an obsolete layout is safe for direct slot
-      ;; access.  An obsolete ancestor also invalidates the rest of the path.
-      (when (and (not (sys.int::layout-new-instance object-layout))
-                 (not (sys.int::layout-obsolete layout)))
-        (loop with compatible of-type simple-vector = (sys.int::layout-compatible object-layout)
-              for l across compatible
-              do (when (sys.int::layout-obsolete l)
-                   (return nil))
-                 (when (eq l layout)
-                   (return t)))))))
+  (structure-layout-match-p object layout nil))
+
+(defun sys.int::structure-layout-typep (object layout)
+  "Test structure class membership, falling back only for a stale path."
+  (declare (optimize (speed 3) (safety 0) (debug 0)))
+  (structure-layout-match-p object layout
+                            (sys.int::structure-type-p object (sys.int::layout-class layout))))
 
 (defun sys.int::make-structure-compatible-layouts (parent)
   "Make a wired vector with room for a layout and its parent layouts."

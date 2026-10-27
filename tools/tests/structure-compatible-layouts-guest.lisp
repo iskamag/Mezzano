@@ -5,6 +5,12 @@
   (:export :run))
 (in-package :mezzano.structure-layout-test)
 
+;; These definitions and the TYPEP call are cross-compiled into cold images.
+(defstruct static-parent value)
+(defstruct (static-child (:include static-parent)) child-value)
+(defun cold-compiled-static-parent-p (object)
+  (typep object 'static-parent))
+
 (defun class-layout (name)
   (mezzano.clos:class-layout (find-class name)))
 
@@ -53,6 +59,14 @@
     (check-layouts 'cold-child '(cold-child mezzano.supervisor::acpi-table-header structure-object))
     (assert (funcall (compiled-typep 'mezzano.supervisor::acpi-table-header)
                      (make-cold-child)))
+    ;; A cold-compiled TYPEP also resolves the class of an obsolete target
+    ;; layout after a runtime redefinition.
+    (let ((object (make-static-child :value 5))
+          (old-layout (class-layout 'static-parent)))
+      (assert (cold-compiled-static-parent-p object))
+      (eval '(defstruct static-parent value (added 9)))
+      (assert (mezzano.internals::layout-obsolete old-layout))
+      (assert (cold-compiled-static-parent-p object)))
     ;; Structure definitions have unpublished layouts before class conversion.
     (let* ((base (mezzano.internals::make-struct-definition
                   'definition-base nil nil nil 0 nil nil nil nil))
