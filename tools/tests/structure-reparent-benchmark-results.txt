@@ -1,49 +1,53 @@
-Structure reparenting regression and benchmark, 2026-10-28
+Structure layout and reparenting benchmark, 2026-10-28
 
-Host: AMD Ryzen 7 6800H, x86-64 KVM guest with one vCPU, QEMU pinned to
-host CPU 4. Results are TSC ticks, not core cycles. Each value is the median
-of 11 paired samples, alternating the order; the ratio is the median of the
-paired ratios, not the ratio of the two median tick counts. Each sample
-checks its result and asserts that no GC occurred during timing. Host
-scheduling produced some large outliers, so these are focused measurements,
-not a bound on application performance.
+Base: local upstream master 826e234f. Host: AMD Ryzen 7 6800H, x86-64 KVM
+with one vCPU, QEMU pinned to host CPU 4. Times are TSC ticks, not core
+cycles. Each row reports medians of 11 alternating pairs; the paired ratio
+is the median of per-pair ratios, not a ratio of the median tick counts.
+Every timed trial checks its result and that no GC occurred.
 
-Case                            Upstream        Patched       Paired ratio
-1,000 same-parent redefinitions  17,166,048      18,090,112     1.063033
-5,000 unchanged checks         11,518,816      11,794,432     1.025032
-200,000 layout TYPEP hits        7,915,328       7,358,592     0.923067
-200,000 layout TYPEP misses      9,652,480       9,209,632     0.936629
-200,000 layout slot hits         7,993,280       7,452,576     0.910524
-200,000 layout slot misses       9,531,008       8,891,872     0.940747
+Case                             Before        Current       Paired ratio
+1,000 redefinitions, upstream     11,464,832     6,453,792       0.577993
+1,000 redefinitions, correct      12,952,160     6,456,032       0.507926
+1,000 direct-slot conversions      1,321,920     1,248,128       0.938475
+50,000 unchanged checks          109,752,288   108,725,408       1.004600
+640,000 layout TYPEP hits         23,231,072    23,260,736       0.958897
+640,000 layout TYPEP misses       27,501,024    24,950,464       0.928758
+640,000 layout slot hits          23,795,872    21,968,800       0.914804
+640,000 layout slot misses        26,295,392    24,656,096       0.919525
 
-The definition benchmark alternates slot initial forms on a child with one
-direct slot and no descendants. Its baseline is a copy of the original
-redefinition, population, and direct-slot conversion code. The old code
-incorrectly drops that direct slot; the fixed code creates its MOP slot
-definition. Allocations per 1,000 definitions were 352,000 bytes upstream
-and 464,000 bytes patched. The unchanged check compares copies of the old and
-current structure-definition compatibility paths and allocated zero bytes.
+The redefinition benchmark alternates the default of a direct slot on a
+child with an unchanged parent and layout, and no descendants. The upstream
+copy drops the direct slot's MOP metadata; the correct baseline preserves it
+using the first correct implementation. The current implementation preserves
+the same metadata and avoids constructing an unused layout. Allocations per
+1,000 definitions were 352,000 bytes upstream, 464,000 bytes in the first
+correct implementation, and 224,000 bytes now. The direct-slot conversion
+comparison uses the same correct slot metadata on both sides and allocated
+112,000 versus 96,000 bytes per 1,000 conversions.
 
-The layout tests compare the original compatibility helper with the new TYPEP
-and slot helpers on the same cold-built descendant, with complete current
-vectors. They allocate zero bytes, and do not time obsolete-layout fallback.
-The existing image's generic-function dispatch was also measured after moving
-a warm-built descendant back and forth between two parents. Each trial made
-200,000 warmed calls, allocated zero bytes, and ran without GC. The paired
-median was 9,763,392 ticks for parent A and 9,881,376 for parent B, with a
-median B/A ratio of 1.002404. This compares two states of the patched image,
-not upstream versus patched throughput. ARM64 and application workloads were
-not measured.
+Unchanged-definition compatibility checks and layout checks allocated zero
+bytes. Layout checks compare the original helper with the current TYPEP and
+slot helpers on the same cold-built descendant and complete current vectors;
+they do not time obsolete-layout fallback. Warmed generic-function dispatch
+after moving a descendant between two parents used 640,000 calls per sample,
+allocated zero bytes, and produced a median B/A ratio of 1.027566. This
+compares two states of the patched image, not upstream against patched code.
+
+Compiled TYPEP and parent-accessor measurements from this same image are in
+structure-layout-benchmark-results.txt. These focused microbenchmarks do not
+measure whole-application throughput, cold-boot performance, or ARM64.
 
 Reproduction, from Mezzano/:
 
   sbcl --non-interactive --load tools/tests/structure-reparent-image.lisp
-  taskset -c 4 timeout 180 qemu-system-x86_64 -enable-kvm -machine q35 -m 3G -smp 1 \
+  taskset -c 4 timeout 240 qemu-system-x86_64 -enable-kvm -machine q35 -m 3G -smp 1 \
     -drive file=/tmp/mezzano-structure-reparent/native.image,format=raw -snapshot \
     -serial stdio -monitor none -display none -vga std -net none -no-reboot \
     > /tmp/mezzano-structure-reparent/serial.log 2>&1
 
-The private image prints STRUCTURE-REPARENT-ALL-PASSED after both guest
-regressions and the benchmark. QEMU continues running and must then be stopped
-or left to the timeout. The separate live-image regression can be run by
-loading tools/tests/structure-reparent-guest.lisp and calling its RUN function.
+The private image prints STRUCTURE-REPARENT-ALL-PASSED after the vector,
+reparenting, and cold-layout regressions and both benchmarks. QEMU continues
+running and must then be stopped or left to the timeout. The live-image
+reparenting regression can also be run by loading
+tools/tests/structure-reparent-guest.lisp and calling its RUN function.

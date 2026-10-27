@@ -39,9 +39,9 @@ Compatibility vectors describe storage, not just class membership. A direct
 access must reject a superseded instance or any obsolete layout along the path
 to the target layout. Structure `TYPEP` checks fall back to the class parent
 chain for those stale paths; a complete, current vector without the target is
-a fast negative result. Redefining a structure also replaces its layout when
-its inherited layout path changes, even if its physical slot layout did not
-change.
+a fast negative result. When a structure's inheritance changes without a
+storage change, it and its descendants keep their layouts and receive new
+compatibility vectors.
 
 Layouts are allocated in the `wired` area since they are used by the GC. Allowing them to be movable would complicate the GC.
 
@@ -112,10 +112,10 @@ updated. Structure direct slots exclude slots inherited from the parent.
 Cached generic-function and initarg information for the affected
 classes is invalidated. Compiled type checks fall back to the current class
 hierarchy for obsolete layouts, while compiled slot accesses use the checked
-access path. Cyclic inheritance is rejected. If a reparented structure has
-subclasses, its effective slots must remain compatible: the operation otherwise
-signals an error before changing the class graph, since descendant slot
-definitions and layouts are not yet rebuilt.
+access path. Cyclic inheritance is rejected. A structure with subclasses can
+only be redefined if its effective slots remain compatible: otherwise it
+signals an error before changing the class, since descendant slot definitions
+and layouts are not yet rebuilt.
 
 ## Tricky nonsense for unnecessary optimization
 

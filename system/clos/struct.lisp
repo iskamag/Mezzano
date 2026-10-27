@@ -138,11 +138,30 @@
   (flush-emf-tables-on-class-redefinition class)
   (flush-initarg-caches class))
 
-(defun structure-descendants-compatible-p (class sdef old-layout new-layout)
+(defun structure-definition-layout-compatible-p (layout sdef)
+  ;; Compare the prospective layout without allocating it.  The instance
+  ;; slots contain alternating names and encoded locations.
+  (let ((instance-slots (sys.int::layout-instance-slots layout))
+        (new-slots (sys.int::structure-definition-slots sdef)))
+    (and (eql (sys.int::layout-heap-size layout)
+              (sys.int::structure-definition-size sdef))
+         (equal (sys.int::layout-heap-layout layout)
+                (sys.int::layout-heap-layout (sys.int::structure-definition-layout sdef)))
+         (equal (sys.int::layout-area layout) (sys.int::structure-definition-area sdef))
+         (vectorp instance-slots)
+         (= (length instance-slots) (* 2 (length new-slots)))
+         (loop for slot in new-slots
+               for i from 0 by 2
+               always (and (eql (aref instance-slots i)
+                                (sys.int::structure-slot-definition-name slot))
+                           (eql (aref instance-slots (1+ i))
+                                (sys.int::structure-slot-definition-location slot)))))))
+
+(defun structure-descendants-compatible-p (class sdef layout-compatible-p)
   ;; Descendants retain their own slot definitions and layouts.  Until those
-  ;; can be rebuilt, only reparent a class with descendants when the complete
+  ;; can be rebuilt, only redefine a class with descendants when the complete
   ;; effective slot description remains compatible.
-  (and (class-layouts-compatible-p old-layout new-layout)
+  (and layout-compatible-p
        (= (length (safe-class-slots class))
           (length (sys.int::structure-definition-slots sdef)))
        ;; Cold-built effective slots can be ordered differently from an SDEF.
@@ -160,6 +179,14 @@
                          (equal (std-slot-value old-slot 'documentation)
                                 (sys.int::structure-slot-definition-documentation new-slot))))))
 
+(defun structure-has-direct-subclasses-p (class)
+  ;; Avoid materializing a weak list when it is already empty.  For a
+  ;; nonempty list use the normal reader, which discards dead references.
+  (let ((subclasses (std-slot-value class 'direct-subclasses)))
+    (and subclasses
+         (mezzano.garbage-collection.weak-objects::weak-list-objects subclasses)
+         (safe-class-direct-subclasses class))))
+
 ;; This does not use the normal REINITIALIZE-INSTANCE machinery as
 ;; the new structure definition has a specific layout that it is expecting
 ;; the redefined class to follow.
@@ -173,39 +200,36 @@
                          (find-class 'structure-object)))
          (parent-changed (not (eq old-parent new-parent)))
          (prev-layout (class-layout existing-class))
-         (new-layout (sys.int::make-layout :class existing-class
-                                           :hash (safe-class-hash existing-class)
-                                           :obsolete nil
-                                           :heap-size (sys.int::structure-definition-size sdef)
-                                           :heap-layout (sys.int::layout-heap-layout (sys.int::structure-definition-layout sdef))
-                                           :area (sys.int::structure-definition-area sdef)
-                                           :instance-slots (sys.int::convert-structure-definition-instance-slots sdef)
-                                           ;; Filled before publication if storage changes.
-                                           :compatible nil))
-         (layout-changed (not (class-layouts-compatible-p prev-layout new-layout))))
+         (layout-compatible-p (structure-definition-layout-compatible-p prev-layout sdef)))
     (when (and parent-changed
                (member existing-class (safe-class-precedence-list new-parent)))
       (error "Cannot make ~S a subclass of its own descendant ~S."
              (class-name existing-class) (class-name new-parent)))
-    (when (and parent-changed
-               (safe-class-direct-subclasses existing-class)
-               (not (structure-descendants-compatible-p existing-class sdef prev-layout new-layout)))
-      (error "Cannot reparent structure ~S with subclasses while changing its slots."
+    (when (and (structure-has-direct-subclasses-p existing-class)
+               (not (structure-descendants-compatible-p existing-class sdef layout-compatible-p)))
+      (error "Cannot redefine structure ~S with subclasses while changing its slots."
              (class-name existing-class)))
     (sys.int::populate-struct-class-from-structure-defintion existing-class sdef new-parent)
     (when parent-changed
       (when old-parent
         (remove-direct-subclass old-parent existing-class))
       (add-direct-subclass new-parent existing-class))
-    (when layout-changed
+    (when (not layout-compatible-p)
       ;; Existing storage must be migrated when its physical layout changes.
-      (setf (sys.int::%struct-slot new-layout 'sys.int::layout 'sys.int::compatible)
-            (sys.int::make-structure-compatible-layouts new-parent))
-      (sys.int::finish-compatible-layouts new-layout)
-      (setf (mezzano.runtime::instance-access-by-name existing-class 'mezzano.clos::slot-storage-layout)
-            new-layout)
-      (setf (sys.int::layout-obsolete prev-layout) new-layout))
-    (when (or parent-changed layout-changed)
+      (let ((new-layout
+              (sys.int::finish-compatible-layouts
+               (sys.int::make-layout :class existing-class
+                                     :hash (safe-class-hash existing-class)
+                                     :obsolete nil
+                                     :heap-size (sys.int::structure-definition-size sdef)
+                                     :heap-layout (sys.int::layout-heap-layout (sys.int::structure-definition-layout sdef))
+                                     :area (sys.int::structure-definition-area sdef)
+                                     :instance-slots (sys.int::convert-structure-definition-instance-slots sdef)
+                                     :compatible (sys.int::make-structure-compatible-layouts new-parent)))))
+        (setf (mezzano.runtime::instance-access-by-name existing-class 'mezzano.clos::slot-storage-layout)
+              new-layout)
+        (setf (sys.int::layout-obsolete prev-layout) new-layout)))
+    (when (or parent-changed (not layout-compatible-p))
       (refresh-structure-subclasses-after-redefinition existing-class parent-changed)))
   existing-class)
 

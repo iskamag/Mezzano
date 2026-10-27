@@ -226,8 +226,9 @@
                             (return ,stale-form))
                           (when (eq l ,layout-var)
                             (return t)))
-                     finally (when (or (sys.int::layout-obsolete object-layout)
-                                       (sys.int::layout-obsolete ,layout-var))
+                     ;; Every published structure vector starts with its own
+                     ;; layout, whose obsoleteness was checked in the loop.
+                     finally (when (sys.int::layout-obsolete ,layout-var)
                                (return ,stale-form)))))))))
 
 (defun sys.int::structure-layout-compatible-p (object layout)

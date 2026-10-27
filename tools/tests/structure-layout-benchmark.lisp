@@ -80,7 +80,7 @@
             label (median old) (median new) (median ratios))
     (finish-output)))
 
-(defun run (&key (repeats 40000) (pairs 11))
+(defun run (&key (repeats 40000) (accessor-repeats repeats) (pairs 11))
   (let ((*package* (find-package :mezzano.structure-layout-benchmark)))
     (eval '(defstruct parent value))
     (eval '(defstruct (child (:include parent)) child-value))
@@ -119,7 +119,8 @@
       (dotimes (i 64)
         (setf (svref mixed i)
               (case (mod i 4) (0 parent) (1 child) (2 unrelated) (3 7))))
-      (format t "~&LAYOUT-BENCH-BEGIN repeats=~D objects=64 pairs=~D~%" repeats pairs)
+      (format t "~&LAYOUT-BENCH-BEGIN repeats=~D accessor-repeats=~D objects=64 pairs=~D~%"
+              repeats accessor-repeats pairs)
       (format t "LAYOUT-BENCH-CODE-BYTES old=~D new=~D~%"
               (- (mezzano.internals::function-code-size old) 16)
               (- (mezzano.internals::function-code-size new) 16))
@@ -142,7 +143,7 @@
                    (make-array 0 :area :wired))
              (compare-paired :parent-accessor accessor (make-array 64 :initial-element legacy)
                              accessor (make-array 64 :initial-element child)
-                             repeats (* 64 3) pairs))
+                             accessor-repeats (* 64 3) pairs))
         (setf (mezzano.internals::%struct-slot
                legacy-layout 'mezzano.internals::layout 'mezzano.internals::compatible)
               legacy-vector))

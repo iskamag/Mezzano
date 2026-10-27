@@ -17,6 +17,20 @@
   (assert (eq (not (null (member child (mezzano.clos:class-direct-subclasses parent))))
               present)))
 
+(defun assert-layout-predicates-agree (class definition)
+  ;; The allocation-free comparison must agree with the existing comparison
+  ;; against a fully constructed prospective layout.
+  (let* ((old (mezzano.clos:class-layout class))
+         (new (mezzano.internals::make-layout
+               :class class
+               :heap-size (mezzano.internals::structure-definition-size definition)
+               :heap-layout (mezzano.internals::layout-heap-layout
+                             (mezzano.internals::structure-definition-layout definition))
+               :area (mezzano.internals::structure-definition-area definition)
+               :instance-slots (mezzano.internals::convert-structure-definition-instance-slots definition))))
+    (assert (eq (not (null (mezzano.clos::class-layouts-compatible-p old new)))
+                (not (null (mezzano.clos::structure-definition-layout-compatible-p old definition)))))))
+
 (defun run ()
   (let ((*package* (find-package :mezzano.structure-reparent-test)))
     (eval '(defstruct old-parent))
@@ -119,6 +133,21 @@
     ;; existing descendant objects and their parent accessors.
     (eval '(defstruct shared-old (first 11) (second 22)))
     (eval '(defstruct shared-new (first 11) (second 22)))
+    (assert (equal (slot-names (mezzano.clos:class-direct-slots (find-class 'shared-old)))
+                   '(first second)))
+    (eval '(defstruct (direct-metadata (:include shared-old))
+             (one 17 :type integer) (two t :read-only t)))
+    (let ((class (find-class 'direct-metadata)))
+      (flet ((check-direct-slots ()
+               (let ((slots (mezzano.clos:class-direct-slots class)))
+                 (assert (equal (slot-names slots) '(one two)))
+                 (assert (eq (mezzano.clos:slot-definition-type (first slots)) 'integer))
+                 (assert (= (mezzano.clos:slot-definition-initform (first slots)) 17))
+                 (assert (mezzano.clos:structure-slot-definition-read-only (second slots))))))
+        (check-direct-slots)
+        (eval '(defstruct (direct-metadata (:include shared-new))
+                 (one 17 :type integer) (two t :read-only t)))
+        (check-direct-slots)))
     (eval '(defstruct (shared-middle (:include shared-old)) marker))
     (eval '(defstruct (shared-leaf (:include shared-middle))))
     (let ((object (make-shared-leaf :first 3 :second 4 :marker 5))
@@ -137,6 +166,26 @@
     (eval '(defstruct new-shape new-slot))
     (eval '(defstruct (changing (:include old-shape)) marker))
     (eval '(defstruct (changing-leaf (:include changing)) leaf-value))
+    (dolist (class-name '(old-shape new-shape changing-leaf))
+      (dolist (definition-name '(old-shape new-shape changing-leaf))
+        (assert-layout-predicates-agree
+         (find-class class-name)
+         (mezzano.internals::convert-structure-class-to-structure-definition
+          (find-class definition-name)))))
+    ;; A same-parent layout change could otherwise alias a child's direct
+    ;; slot with the newly inherited parent slot.
+    (eval '(defstruct layout-parent (inherited 1)))
+    (eval '(defstruct (layout-child (:include layout-parent)) (local 2)))
+    (let ((object (make-layout-child :inherited 11 :local 22)))
+      (dolist (definition '((defstruct layout-parent (inherited 1) (added 9))
+                            (defstruct layout-parent (inherited 3))))
+        (let ((message (handler-case (progn (eval definition) nil)
+                         (error (condition) (format nil "~A" condition)))))
+          (assert (and message (search "while changing its slots" message :test #'char-equal)))))
+      (assert (= (layout-parent-inherited object) 11))
+      (assert (= (layout-child-local object) 22))
+      (assert (equal (slot-names (mezzano.clos:class-slots (find-class 'layout-child)))
+                     '(inherited local))))
     (let* ((old (find-class 'old-shape))
            (new (find-class 'new-shape))
            (changing (find-class 'changing))

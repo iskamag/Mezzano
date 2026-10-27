@@ -59,14 +59,18 @@
     (check-layouts 'cold-child '(cold-child mezzano.supervisor::acpi-table-header structure-object))
     (assert (funcall (compiled-typep 'mezzano.supervisor::acpi-table-header)
                      (make-cold-child)))
-    ;; A cold-compiled TYPEP also resolves the class of an obsolete target
-    ;; layout after a runtime redefinition.
-    (let ((object (make-static-child :value 5))
+    ;; Changing inherited slots with live descendants is rejected before the
+    ;; old layout and the child's slot metadata can become inconsistent.
+    (let ((object (make-static-child :value 5 :child-value 22))
           (old-layout (class-layout 'static-parent)))
       (assert (cold-compiled-static-parent-p object))
-      (eval '(defstruct static-parent value (added 9)))
-      (assert (mezzano.internals::layout-obsolete old-layout))
-      (assert (cold-compiled-static-parent-p object)))
+      (let ((message (handler-case
+                         (progn (eval '(defstruct static-parent value (added 9))) nil)
+                       (error (condition) (format nil "~A" condition)))))
+        (assert (and message (search "while changing its slots" message :test #'char-equal))))
+      (assert (not (mezzano.internals::layout-obsolete old-layout)))
+      (assert (cold-compiled-static-parent-p object))
+      (assert (= (static-child-child-value object) 22)))
     ;; Structure definitions have unpublished layouts before class conversion.
     (let* ((base (mezzano.internals::make-struct-definition
                   'definition-base nil nil nil 0 nil nil nil nil))

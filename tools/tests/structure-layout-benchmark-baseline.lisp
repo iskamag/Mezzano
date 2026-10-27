@@ -1,4 +1,4 @@
-;;;; The upstream compatibility predicate from slop before this change.
+;;;; The upstream compatibility predicate before this change.
 ;;;; Compile and load wired before structure-layout-benchmark.lisp.
 (in-package :mezzano.internals)
 

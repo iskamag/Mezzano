@@ -6,6 +6,7 @@
 (cold-generator:set-up-cross-compiler :architecture :x86-64)
 (dolist (file '("tools/tests/structure-reparent-cold-classes.lisp"
                 "tools/tests/structure-compatible-layouts-guest.lisp"
+                "tools/tests/structure-layout-benchmark.lisp"
                 "tools/tests/structure-reparent-guest.lisp"
                 "tools/tests/structure-reparent-benchmark.lisp"))
   (mezzano.compiler::load-for-cross-compiler file))
@@ -20,13 +21,18 @@
     (write-line "(mezzano.structure-reparent-test:run)" out)
     (write-line "(mezzano.structure-reparent-test::run-cold)" out)
     (write-line "(mezzano.structure-reparent-benchmark:run)" out)
+    (write-line "(mezzano.structure-layout-benchmark:run :repeats 40000 :accessor-repeats 10000 :pairs 11)" out)
     (write-line "(mezzano.supervisor:debug-print-line \"STRUCTURE-REPARENT-ALL-PASSED\")" out))
-  (let ((cold-generator::*source-files*
+  (let ((cold-generator::*supervisor-source-files*
+          (append cold-generator::*supervisor-source-files*
+                  (list "tools/tests/structure-layout-benchmark-baseline.lisp")))
+        (cold-generator::*source-files*
           (append cold-generator::*source-files*
                   (list "tools/tests/structure-reparent-cold-classes.lisp")))
         (cold-generator::*warm-source-files*
           (append (remove "ipl.lisp" cold-generator::*warm-source-files* :test #'equal)
                   (list "tools/tests/structure-compatible-layouts-guest.lisp"
+                        "tools/tests/structure-layout-benchmark.lisp"
                         "tools/tests/structure-reparent-guest.lisp"
                         "tools/tests/structure-reparent-benchmark.lisp"
                         (namestring loader)))))
