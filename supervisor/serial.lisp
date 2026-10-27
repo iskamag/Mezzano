@@ -254,10 +254,64 @@
     (simple-irq-attach *debug-serial-irq-handler*)
     (simple-irq-unmask *debug-serial-irq-handler*)))
 
+;;; Receive buffering.
+;;;
+;;; The IRQ masks itself on the first received byte and the reader unmasks
+;;; after taking it. Bytes that arrive while masked sit in the 16-byte
+;;; hardware FIFO, so any burst larger than that silently overflows.
+;;;
+;;; Drain the FIFO into a reader-owned buffer whenever a byte is requested,
+;;; and re-check it after acknowledging a pending IRQ before waiting again.
+;;; Only the reader thread touches this buffer, so it needs no locking.
+
+(defconstant +debug-serial-rx-buffer-size+ 512)
+
+(sys.int::defglobal *debug-serial-rx-buffer* nil)
+(sys.int::defglobal *debug-serial-rx-index*)
+(sys.int::defglobal *debug-serial-rx-count*)
+
+(defun debug-serial-rx-init ()
+  (setf *debug-serial-rx-buffer* (make-array +debug-serial-rx-buffer-size+
+                                             :element-type '(unsigned-byte 8))
+        *debug-serial-rx-index* 0
+        *debug-serial-rx-count* 0))
+
+(defun debug-serial-rx-drain ()
+  "Move available UART RX bytes into the software buffer until it is full.
+Called only from the reader thread, with the IRQ masked or unmasked."
+  (loop
+     (when (or (= *debug-serial-rx-count* +debug-serial-rx-buffer-size+)
+               (not (logbitp +serial-lsr-data-available+ (uart-16550-reg +serial-LSR+))))
+       (return))
+     (let ((idx (logand (+ *debug-serial-rx-index* *debug-serial-rx-count*)
+                        (1- +debug-serial-rx-buffer-size+))))
+       (setf (aref *debug-serial-rx-buffer* idx) (uart-16550-reg +serial-RBR+))
+       (incf *debug-serial-rx-count*))))
+
+(defun debug-serial-rx-pop ()
+  "Pop one buffered byte, or NIL if the buffer is empty."
+  (when (plusp *debug-serial-rx-count*)
+    (let ((byte (aref *debug-serial-rx-buffer* *debug-serial-rx-index*)))
+      (setf *debug-serial-rx-index*
+            (logand (1+ *debug-serial-rx-index*)
+                    (1- +debug-serial-rx-buffer-size+)))
+      (decf *debug-serial-rx-count*)
+      byte)))
+
 (defun debug-serial-read-byte ()
-  (mezzano.supervisor:wait-for-objects *debug-serial-irq-handler*)
-  (prog1 (debug-serial-read-byte-1-blocking)
-    (mezzano.supervisor:simple-irq-unmask *debug-serial-irq-handler*)))
+  (unless *debug-serial-rx-buffer*
+    (debug-serial-rx-init))
+  (loop
+    (debug-serial-rx-drain)
+    (let ((byte (debug-serial-rx-pop)))
+      (when byte (return byte)))
+    ;; A previous drain may have consumed the data that caused this IRQ.
+    ;; Acknowledge it, then check the FIFO again before sleeping.
+    (simple-irq-unmask *debug-serial-irq-handler*)
+    (debug-serial-rx-drain)
+    (let ((byte (debug-serial-rx-pop)))
+      (when byte (return byte)))
+    (wait-for-objects *debug-serial-irq-handler*)))
 
 (defun utf8-sequence-length (byte)
   (cond
