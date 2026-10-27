@@ -5,6 +5,7 @@
 (asdf:load-system :lispos)
 (cold-generator:set-up-cross-compiler :architecture :x86-64)
 (dolist (file '("tools/tests/structure-reparent-cold-classes.lisp"
+                "tools/tests/structure-compatible-layouts-guest.lisp"
                 "tools/tests/structure-reparent-guest.lisp"
                 "tools/tests/structure-reparent-benchmark.lisp"))
   (mezzano.compiler::load-for-cross-compiler file))
@@ -15,6 +16,7 @@
   (ensure-directories-exist loader)
   (with-open-file (out loader :direction :output :if-exists :supersede)
     (write-line "(mezzano.supervisor:debug-print-line \"STRUCTURE-REPARENT-TEST-BEGIN\")" out)
+    (write-line "(mezzano.structure-layout-test:run)" out)
     (write-line "(mezzano.structure-reparent-test:run)" out)
     (write-line "(mezzano.structure-reparent-test::run-cold)" out)
     (write-line "(mezzano.structure-reparent-benchmark:run)" out)
@@ -24,7 +26,8 @@
                   (list "tools/tests/structure-reparent-cold-classes.lisp")))
         (cold-generator::*warm-source-files*
           (append (remove "ipl.lisp" cold-generator::*warm-source-files* :test #'equal)
-                  (list "tools/tests/structure-reparent-guest.lisp"
+                  (list "tools/tests/structure-compatible-layouts-guest.lisp"
+                        "tools/tests/structure-reparent-guest.lisp"
                         "tools/tests/structure-reparent-benchmark.lisp"
                         (namestring loader)))))
     (cold-generator::make-image

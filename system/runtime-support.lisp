@@ -321,16 +321,14 @@
 (defun convert-structure-definition-direct-slots (sdef parent-class)
   (let* ((parent-slots (when (structure-definition-parent sdef)
                          (mezzano.runtime::instance-access-by-name parent-class 'mezzano.clos::effective-slots)))
-         (direct-slots (remove-if (lambda (slot)
-                                    (find (structure-slot-definition-name slot)
-                                          parent-slots
-                                          :key (lambda (parent-slot)
-                                                 (mezzano.runtime::instance-access-by-name parent-slot 'mezzano.clos::name))))
-                                  (structure-definition-slots sdef)))
          (s-d-s-d (find-class 'mezzano.clos::structure-direct-slot-definition))
          (s-d-s-d-layout (mezzano.runtime::instance-access-by-name s-d-s-d 'mezzano.clos::slot-storage-layout)))
     (loop
-       for slot in direct-slots
+       for slot in (structure-definition-slots sdef)
+       unless (find (structure-slot-definition-name slot)
+                    parent-slots
+                    :key (lambda (parent-slot)
+                           (mezzano.runtime::instance-access-by-name parent-slot 'mezzano.clos::name)))
        collect (let ((new (sys.int::%allocate-instance s-d-s-d-layout)))
                  (setf (mezzano.runtime::instance-access-by-name new 'mezzano.clos::name)
                        (structure-slot-definition-name slot))

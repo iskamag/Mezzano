@@ -102,7 +102,7 @@
       (assert (not (mezzano.internals::structure-layout-compatible-p old (class-layout 'mutable))))
       (assert (= (mutable-value old) 17))
       (check-layouts 'mutable '(mutable structure-object)))
-    ;; An obsolete intermediate layout invalidates the remaining ancestor path.
+    ;; Reparenting refreshes ancestry vectors without changing compatible storage.
     (eval '(defstruct old-base))
     (eval '(defstruct new-base))
     (eval '(defstruct (middle (:include old-base)) marker))
@@ -114,8 +114,9 @@
       (assert (funcall old-p object))
       (assert (not (funcall new-p object)))
       (eval '(defstruct (middle (:include new-base)) marker))
-      (assert (mezzano.internals::layout-obsolete old-middle))
+      (assert (eq old-middle (class-layout 'middle)))
       (check-layouts 'middle '(middle new-base structure-object))
+      (check-layouts 'leaf '(leaf middle new-base structure-object))
       (assert (not (funcall old-p object)))
       (assert (funcall new-p object))
       (assert (not (mezzano.internals::structure-layout-compatible-p object (class-layout 'old-base)))))
