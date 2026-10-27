@@ -1,5 +1,25 @@
 # Some random useful code snippets and notes on debugging tools
 
+## Serial console detached from the terminal
+
+The debug serial REPL normally lives on QEMU's stdio, so it dies with the
+terminal that started the VM. Run the VM with the console on a unix socket
+instead and attach whenever you like:
+
+```
+make serial-kvm    # QEMU serial -> serial.sock, output also kept in serial.log
+make serial        # attach; detach with ^C, the guest keeps running
+```
+
+`serial.log` captures guest output from boot, including anything produced
+while nothing is attached. Output written while detached is not replayed to
+later clients, so `serial.log` is the record of it. The REPL's read position is
+kept in the guest: a line left half-typed before detaching can be finished
+after reattaching. Only one client can be attached at a time.
+
+For asynchronous evaluations, captured output, and per-job debugger control
+without Swank, see [Agent harness](../../tools/agent-harness/README.md).
+
 ## Magic button
 
 Press `M-F11` to dump all thread stacks and some other things to the cold-stream.
