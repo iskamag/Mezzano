@@ -43,6 +43,16 @@ a fast negative result. When a structure's inheritance changes without a
 storage change, it and its descendants keep their layouts and receive new
 compatibility vectors.
 
+When inherited slots change, structure definitions retain enough information
+to rebuild their descendants' effective slots and layouts. The old layouts are
+marked obsolete, and their slot metadata is kept until old instances have been
+collected. Migration copies fixed-vector elements as well as scalar slots.
+Constructors carry a version token so saved or inlined constructors can use a
+slow path after their class changes; current constructors keep a fast check.
+A sealed structure that includes an unsealed parent can still acquire a new
+layout when that parent changes, so its compiled accesses must check for an
+obsolete layout.
+
 Layouts are allocated in the `wired` area since they are used by the GC. Allowing them to be movable would complicate the GC.
 
 The first two words after the header in a funcallable instances are used to implement function calling. This and the different tag bits are the only differences between normal instances and funcallable instances. These two words can conceptually be thought of as hidden slots in the object, and code creating new layouts must be aware of them when computing the layout.
@@ -112,10 +122,12 @@ updated. Structure direct slots exclude slots inherited from the parent.
 Cached generic-function and initarg information for the affected
 classes is invalidated. Compiled type checks fall back to the current class
 hierarchy for obsolete layouts, while compiled slot accesses use the checked
-access path. Cyclic inheritance is rejected. A structure with subclasses can
-only be redefined if its effective slots remain compatible: otherwise it
-signals an error before changing the class, since descendant slot definitions
-and layouts are not yet rebuilt.
+access path. Cyclic inheritance and incompatible descendant slot definitions
+are rejected before the class graph changes. Other inherited-slot changes
+rebuild descendant metadata, layouts, and affected constructor functions.
+As with standard-class redefinition, these updates are not atomic with
+respect to concurrent use of the affected classes. Callers must arrange for
+other threads using those classes to be quiescent during redefinition.
 
 ## Tricky nonsense for unnecessary optimization
 

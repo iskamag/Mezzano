@@ -130,7 +130,8 @@
 
 (defclass structure-class (instance-class)
   ((parent)
-   (has-standard-constructor))
+   (has-standard-constructor)
+   (definition-recipe :initform nil))
   (:area :wired)
   (:sealed t))
 

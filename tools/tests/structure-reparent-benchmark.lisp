@@ -498,9 +498,9 @@
           (if (evenp i) (progn (old-trial) (new-trial))
               (progn (new-trial) (old-trial))))
         (setf (aref compat-ratios i) (/ (float (aref compat-new i) 1d0) (aref compat-old i)))
-        (format t "REPARENT-BENCH-COMPAT ~D old=~D new=~D ratio=~,4F~%"
+        (format t "REPARENT-BENCH-UNCHANGED ~D old=~D new=~D ratio=~,4F~%"
                 i (aref compat-old i) (aref compat-new i) (aref compat-ratios i)))
-      (format t "REPARENT-BENCH-COMPAT-MEDIAN old=~D new=~D ratio=~,4F old-bytes=~D new-bytes=~D~%"
+      (format t "REPARENT-BENCH-UNCHANGED-MEDIAN old=~D new=~D ratio=~,4F old-bytes=~D new-bytes=~D~%"
               (median compat-old) (median compat-new) (median compat-ratios)
               compat-old-bytes compat-new-bytes)
       (let ((cold-object (mezzano.internals::make-reparent-cold-leaf))

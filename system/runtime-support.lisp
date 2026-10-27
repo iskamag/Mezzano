@@ -445,6 +445,8 @@
           (mezzano.clos::next-class-hash-value))
     (setf (mezzano.runtime::instance-access-by-name new-class 'mezzano.clos::prototype)
           mezzano.clos::*secret-unbound-value*)
+    (setf (mezzano.runtime::instance-access-by-name new-class 'mezzano.clos::definition-recipe)
+          nil)
     (setf (mezzano.runtime::instance-access-by-name new-class 'mezzano.clos::slot-storage-layout)
           (finish-compatible-layouts
            (make-layout :class new-class
@@ -463,10 +465,11 @@
               (mezzano.runtime::instance-access-by-name parent-class 'mezzano.clos::direct-subclasses)))
     new-class))
 
-(defun structure-slot-definitions-trivially-compatible-p (existing-slot new-slot)
+(defun structure-slot-definitions-trivially-compatible-p (existing-slot new-slot &optional name-verified)
   (and existing-slot
-       (eql (mezzano.runtime::instance-access-by-name existing-slot 'mezzano.clos::name)
-            (sys.int::structure-slot-definition-name new-slot))
+       (or name-verified
+           (eql (mezzano.runtime::instance-access-by-name existing-slot 'mezzano.clos::name)
+                (sys.int::structure-slot-definition-name new-slot)))
        (equal (sys.int::structure-slot-definition-type new-slot)
               (mezzano.runtime::instance-access-by-name existing-slot 'mezzano.clos::type))
        (eql (sys.int::structure-slot-definition-read-only new-slot)
@@ -480,71 +483,121 @@
        (eql (sys.int::structure-slot-definition-dcas-sibling new-slot)
             (mezzano.runtime::instance-access-by-name existing-slot 'mezzano.clos::dcas-sibling))
        (equal (sys.int::structure-slot-definition-initform new-slot)
-              (mezzano.runtime::instance-access-by-name existing-slot 'mezzano.clos::initform))))
-
-(defun structure-slot-definition-trivially-compatible-p (existing-structure-class new-slot)
-  ;; Keep these checks in line with the paired-slot predicate above.  This
-  ;; lookup path is also used while loading unchanged structure definitions.
-  (let ((existing-slot (find (sys.int::structure-slot-definition-name new-slot)
-                             (mezzano.runtime::instance-access-by-name existing-structure-class 'mezzano.clos::effective-slots)
-                             :key (lambda (slot)
-                                    (mezzano.runtime::instance-access-by-name slot 'mezzano.clos::name)))))
-    (and existing-slot
-         (equal (sys.int::structure-slot-definition-type new-slot)
-                (mezzano.runtime::instance-access-by-name existing-slot 'mezzano.clos::type))
-         (eql (sys.int::structure-slot-definition-read-only new-slot)
-              (mezzano.runtime::instance-access-by-name existing-slot 'mezzano.clos::read-only))
-         (eql (sys.int::structure-slot-definition-location new-slot)
-              (mezzano.runtime::instance-access-by-name existing-slot 'mezzano.clos::location))
-         (eql (sys.int::structure-slot-definition-fixed-vector new-slot)
-              (mezzano.runtime::instance-access-by-name existing-slot 'mezzano.clos::fixed-vector))
-         (eql (sys.int::structure-slot-definition-align new-slot)
-              (mezzano.runtime::instance-access-by-name existing-slot 'mezzano.clos::align))
-         (eql (sys.int::structure-slot-definition-dcas-sibling new-slot)
-              (mezzano.runtime::instance-access-by-name existing-slot 'mezzano.clos::dcas-sibling))
-         (equal (sys.int::structure-slot-definition-initform new-slot)
-                (mezzano.runtime::instance-access-by-name existing-slot 'mezzano.clos::initform)))))
+              (mezzano.runtime::instance-access-by-name existing-slot 'mezzano.clos::initform))
+       (equal (sys.int::structure-slot-definition-documentation new-slot)
+              (mezzano.runtime::instance-access-by-name existing-slot 'mezzano.clos::documentation))))
 
 (defun structure-definition-trivially-compatible-p (existing-structure-class sdef)
   (let* ((parent (structure-definition-parent sdef))
          (parent-class (or (and parent (%defstruct parent))
-                           (find-class 'structure-object))))
+                           (find-class 'structure-object)))
+         (old-slots (mezzano.runtime::instance-access-by-name existing-structure-class 'mezzano.clos::effective-slots))
+         (layout (mezzano.runtime::instance-access-by-name existing-structure-class 'mezzano.clos::slot-storage-layout)))
     (and (eql (mezzano.runtime::instance-access-by-name existing-structure-class 'mezzano.clos::name)
               (structure-definition-name sdef))
          (eql (mezzano.runtime::instance-access-by-name existing-structure-class 'mezzano.clos::parent)
               parent-class)
          (eql (mezzano.runtime::instance-access-by-name existing-structure-class 'mezzano.clos::allocation-area)
               (structure-definition-area sdef))
-         (eql (sys.int::layout-heap-size (mezzano.runtime::instance-access-by-name existing-structure-class 'mezzano.clos::slot-storage-layout))
+         (eql (sys.int::layout-heap-size layout)
               (structure-definition-size sdef))
-         (equal (sys.int::layout-heap-layout (mezzano.runtime::instance-access-by-name existing-structure-class 'mezzano.clos::slot-storage-layout))
+         (equal (sys.int::layout-heap-layout layout)
                 (sys.int::layout-heap-layout (structure-definition-layout sdef)))
          (eql (mezzano.runtime::instance-access-by-name existing-structure-class 'mezzano.clos::sealed)
               (structure-definition-sealed sdef))
-         (eql (length (mezzano.runtime::instance-access-by-name existing-structure-class 'mezzano.clos::effective-slots))
+         (eql (mezzano.runtime::instance-access-by-name existing-structure-class 'mezzano.clos::has-standard-constructor)
+              (structure-definition-has-standard-constructor sdef))
+         (equal (mezzano.runtime::instance-access-by-name existing-structure-class 'documentation)
+                (structure-definition-docstring sdef))
+         (eql (length old-slots)
               (length (sys.int::structure-definition-slots sdef)))
-         (every (lambda (slot)
-                  (structure-slot-definition-trivially-compatible-p existing-structure-class slot))
-                (sys.int::structure-definition-slots sdef)))))
+         (loop for paired-slot in old-slots
+               for slot in (sys.int::structure-definition-slots sdef)
+               for name = (sys.int::structure-slot-definition-name slot)
+               for old-slot = (if (eql (mezzano.runtime::instance-access-by-name paired-slot 'mezzano.clos::name) name)
+                                  paired-slot
+                                  (find name old-slots
+                                        :key (lambda (entry)
+                                               (mezzano.runtime::instance-access-by-name entry 'mezzano.clos::name))))
+               always (structure-slot-definitions-trivially-compatible-p old-slot slot t)))))
 
-(defun %defstruct (structure-type &key location)
+(defun structure-parent-for-definition (name)
+  ;; FIND-CLASS is available during cold initialization, before CLASS-OF and
+  ;; the general TYPEP machinery used by GET-STRUCTURE-TYPE.
+  (find-class name))
+
+(defun %defstruct (structure-type &key location (recipe nil recipe-supplied-p))
   (declare (notinline (setf slot-value))) ; bootstrap hack
+  (when recipe-supplied-p
+    (setf (getf recipe :boa-original-initializers) (getf recipe :initializers))
+    ;; A compiled DEFSTRUCT site can run again after an earlier class was
+    ;; removed or redefined; its literal token must not become current again.
+    (let ((token (getf recipe :constructor-token)))
+      (when (and token (boundp token))
+        (setf (getf recipe :constructor-token)
+              (make-symbol "STRUCTURE-CONSTRUCTOR-VERSION")))))
   (when (mezzano.runtime::structure-class-p structure-type)
     ;; Happens during cold load.
     (when location
       (setf (mezzano.runtime::instance-access-by-name structure-type 'mezzano.clos::source-location)
             location))
+    (when recipe-supplied-p
+      (let* ((old (mezzano.runtime::instance-access-by-name
+                   structure-type 'mezzano.clos::definition-recipe))
+             (token (getf old :constructor-token)))
+        (when token
+          (when (eq token (getf recipe :constructor-token))
+            (setf (getf recipe :constructor-token)
+                  (make-symbol "STRUCTURE-CONSTRUCTOR-VERSION")))
+          (setf (symbol-value token) old)))
+      (setf (mezzano.runtime::instance-access-by-name structure-type 'mezzano.clos::definition-recipe)
+            recipe))
     (return-from %defstruct structure-type))
   (let* ((name (structure-definition-name structure-type))
          (existing (find-class name nil)))
     (cond (existing
-           (when (not (structure-definition-trivially-compatible-p existing structure-type))
-             (mezzano.clos::redefine-structure-type existing structure-type))
+           (let* ((old-recipe (and recipe-supplied-p
+                                   (mezzano.runtime::instance-access-by-name
+                                    existing 'mezzano.clos::definition-recipe)))
+                  (refresh-initializers
+                    (and old-recipe
+                         (or (getf old-recipe :dynamic-initializers)
+                             (getf recipe :dynamic-initializers))
+                         (mezzano.clos::structure-has-direct-subclasses-p existing)))
+                  (needs-redefinition
+                    (or refresh-initializers
+                        (not (structure-definition-trivially-compatible-p existing structure-type)))))
+             (let ((token (getf old-recipe :constructor-token)))
+               (when (and token recipe-supplied-p
+                          (eq token (getf recipe :constructor-token)))
+                 (setf (getf recipe :constructor-token)
+                       (make-symbol "STRUCTURE-CONSTRUCTOR-VERSION"))))
+             (when needs-redefinition
+               (unless recipe-supplied-p
+                 (setf old-recipe (mezzano.runtime::instance-access-by-name
+                                   existing 'mezzano.clos::definition-recipe)))
+               (mezzano.clos::redefine-structure-type existing structure-type
+                                                      (and recipe-supplied-p recipe)
+                                                      refresh-initializers))
+             (let ((token (and (or recipe-supplied-p needs-redefinition)
+                               (getf old-recipe :constructor-token))))
+               (when token
+                 (setf (symbol-value token) old-recipe))))
            (when location
-             (setf (slot-value existing 'mezzano.clos::source-location) location))
+             ;; Structure definitions are also installed before CLOS slot
+             ;; accessors are available during cold boot.
+             (setf (mezzano.runtime::instance-access-by-name existing 'mezzano.clos::source-location)
+                   location))
+           (when recipe-supplied-p
+             (setf (mezzano.runtime::instance-access-by-name existing 'mezzano.clos::definition-recipe)
+                   recipe))
            existing)
           (t
-           (setf (find-class name) (convert-structure-definition-to-class structure-type location))))))
+           (let ((class (convert-structure-definition-to-class structure-type location)))
+             (when recipe-supplied-p
+               (setf (mezzano.runtime::instance-access-by-name class 'mezzano.clos::definition-recipe)
+                     recipe))
+             (setf (find-class name) class))))))
 
 (defparameter *incompatible-constant-redefinition-is-an-error* nil)
 (defparameter *defconstant-redefinition-comparator* 'eql)

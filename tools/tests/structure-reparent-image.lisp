@@ -8,7 +8,8 @@
                 "tools/tests/structure-compatible-layouts-guest.lisp"
                 "tools/tests/structure-layout-benchmark.lisp"
                 "tools/tests/structure-reparent-guest.lisp"
-                "tools/tests/structure-reparent-benchmark.lisp"))
+                "tools/tests/structure-reparent-benchmark.lisp"
+                "tools/tests/structure-migration-benchmark.lisp"))
   (mezzano.compiler::load-for-cross-compiler file))
 (let* ((output (uiop:ensure-directory-pathname
                 (or (uiop:getenv "MEZZANO_REPARENT_TEST_OUTPUT")
@@ -21,6 +22,11 @@
     (write-line "(mezzano.structure-reparent-test:run)" out)
     (write-line "(mezzano.structure-reparent-test::run-cold)" out)
     (write-line "(mezzano.structure-reparent-benchmark:run)" out)
+    (write-line "(mezzano.structure-migration-benchmark:run :count 100000)" out)
+    (write-line "(mezzano.structure-migration-benchmark::run-boa)" out)
+    (write-line "(mezzano.structure-migration-benchmark::run-guard-overhead)" out)
+    (write-line "(mezzano.structure-migration-benchmark::run-redefinition)" out)
+    (write-line "(mezzano.structure-migration-benchmark::run-metadata)" out)
     (write-line "(mezzano.structure-layout-benchmark:run :repeats 40000 :accessor-repeats 10000 :pairs 11)" out)
     (write-line "(mezzano.supervisor:debug-print-line \"STRUCTURE-REPARENT-ALL-PASSED\")" out))
   (let ((cold-generator::*supervisor-source-files*
@@ -35,6 +41,7 @@
                         "tools/tests/structure-layout-benchmark.lisp"
                         "tools/tests/structure-reparent-guest.lisp"
                         "tools/tests/structure-reparent-benchmark.lisp"
+                        "tools/tests/structure-migration-benchmark.lisp"
                         (namestring loader)))))
     (cold-generator::make-image
      (merge-pathnames "native" output) :image-size (* 5 1024 1024 1024)

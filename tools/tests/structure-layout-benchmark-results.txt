@@ -1,3 +1,6 @@
+Historical results from before descendant migration. For current measurements, see
+structure-migration-benchmark-results.txt.
+
 Compiled structure layout benchmark, 2026-10-28
 
 Base: local upstream master 826e234f. Host: AMD Ryzen 7 6800H, x86-64 KVM
