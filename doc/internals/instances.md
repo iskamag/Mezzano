@@ -106,6 +106,17 @@ The GC is aware of instances and obsolete instances. When it tries to transport 
 
 Since structure objects are also implemented using instances they get class redefinition effectively "for free", unlike most other Common Lisp implementations.
 
+When a structure's included parent changes, its direct-subclass links, its
+descendants' class precedence lists, and their layout compatibility vectors are
+updated. Structure direct slots exclude slots inherited from the parent.
+Cached generic-function and initarg information for the affected
+classes is invalidated. Compiled type checks fall back to the current class
+hierarchy for obsolete layouts, while compiled slot accesses use the checked
+access path. Cyclic inheritance is rejected. If a reparented structure has
+subclasses, its effective slots must remain compatible: the operation otherwise
+signals an error before changing the class graph, since descendant slot
+definitions and layouts are not yet rebuilt.
+
 ## Tricky nonsense for unnecessary optimization
 
 The two object tags (`+OBJECT-TAG-INSTANCE+` and `+OBJECT-TAG-FUNCALLABLE-INSTANCE+`) have been carefully chosen to be different by exactly one bit, so that it's cheap to test if an object is one of either kind. This only really matters for `CLASS-OF` and is an optimization that could be omitted.

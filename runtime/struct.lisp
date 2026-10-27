@@ -226,7 +226,8 @@
                             (return ,stale-form))
                           (when (eq l ,layout-var)
                             (return t)))
-                     finally (when (sys.int::layout-obsolete ,layout-var)
+                     finally (when (or (sys.int::layout-obsolete object-layout)
+                                       (sys.int::layout-obsolete ,layout-var))
                                (return ,stale-form)))))))))
 
 (defun sys.int::structure-layout-compatible-p (object layout)

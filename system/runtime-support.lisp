@@ -318,12 +318,14 @@
   (set-function-docstring name documentation)
   name)
 
-(defun convert-structure-definition-direct-slots (sdef)
-  (let* ((direct-slots (remove-if (lambda (slot)
-                                    (and (structure-definition-parent sdef)
-                                         (find (structure-slot-definition-name slot)
-                                               (structure-definition-slots sdef)
-                                               :key #'structure-slot-definition-name)))
+(defun convert-structure-definition-direct-slots (sdef parent-class)
+  (let* ((parent-slots (when (structure-definition-parent sdef)
+                         (mezzano.runtime::instance-access-by-name parent-class 'mezzano.clos::effective-slots)))
+         (direct-slots (remove-if (lambda (slot)
+                                    (find (structure-slot-definition-name slot)
+                                          parent-slots
+                                          :key (lambda (parent-slot)
+                                                 (mezzano.runtime::instance-access-by-name parent-slot 'mezzano.clos::name))))
                                   (structure-definition-slots sdef)))
          (s-d-s-d (find-class 'mezzano.clos::structure-direct-slot-definition))
          (s-d-s-d-layout (mezzano.runtime::instance-access-by-name s-d-s-d 'mezzano.clos::slot-storage-layout)))
@@ -385,9 +387,10 @@
              (aref instance-slots (1+ i)) (structure-slot-definition-location slot))
      finally (return instance-slots)))
 
-(defun populate-struct-class-from-structure-defintion (new-class sdef)
+(defun populate-struct-class-from-structure-defintion (new-class sdef &optional resolved-parent)
   (let* ((parent (structure-definition-parent sdef))
-         (parent-class (or (and parent (%defstruct parent))
+         (parent-class (or resolved-parent
+                           (and parent (%defstruct parent))
                            (find-class 'structure-object))))
     (when (mezzano.runtime::instance-access-by-name parent-class 'mezzano.clos::sealed)
       (error "Attempted to make structure class ~S that includes sealed structure ~S"
@@ -398,7 +401,7 @@
     (setf (mezzano.runtime::instance-access-by-name new-class 'mezzano.clos::direct-superclasses)
           (list parent-class))
     (setf (mezzano.runtime::instance-access-by-name new-class 'mezzano.clos::direct-slots)
-          (convert-structure-definition-direct-slots sdef))
+          (convert-structure-definition-direct-slots sdef parent-class))
     (setf (mezzano.runtime::instance-access-by-name new-class 'mezzano.clos::precedence-list)
           (list* new-class (mezzano.runtime::instance-access-by-name parent-class 'mezzano.clos::precedence-list)))
     (setf (mezzano.runtime::instance-access-by-name new-class 'mezzano.clos::effective-slots)
@@ -432,7 +435,7 @@
          (parent-class (or (and parent (%defstruct parent))
                            (find-class 'structure-object))))
     (populate-struct-class-from-structure-defintion
-     new-class sdef)
+     new-class sdef parent-class)
     (setf (mezzano.runtime::instance-access-by-name new-class 'mezzano.clos::dependents)
           '())
     (setf (mezzano.runtime::instance-access-by-name new-class 'mezzano.clos::direct-subclasses)
@@ -461,7 +464,28 @@
               (mezzano.runtime::instance-access-by-name parent-class 'mezzano.clos::direct-subclasses)))
     new-class))
 
+(defun structure-slot-definitions-trivially-compatible-p (existing-slot new-slot)
+  (and existing-slot
+       (eql (mezzano.runtime::instance-access-by-name existing-slot 'mezzano.clos::name)
+            (sys.int::structure-slot-definition-name new-slot))
+       (equal (sys.int::structure-slot-definition-type new-slot)
+              (mezzano.runtime::instance-access-by-name existing-slot 'mezzano.clos::type))
+       (eql (sys.int::structure-slot-definition-read-only new-slot)
+            (mezzano.runtime::instance-access-by-name existing-slot 'mezzano.clos::read-only))
+       (eql (sys.int::structure-slot-definition-location new-slot)
+            (mezzano.runtime::instance-access-by-name existing-slot 'mezzano.clos::location))
+       (eql (sys.int::structure-slot-definition-fixed-vector new-slot)
+            (mezzano.runtime::instance-access-by-name existing-slot 'mezzano.clos::fixed-vector))
+       (eql (sys.int::structure-slot-definition-align new-slot)
+            (mezzano.runtime::instance-access-by-name existing-slot 'mezzano.clos::align))
+       (eql (sys.int::structure-slot-definition-dcas-sibling new-slot)
+            (mezzano.runtime::instance-access-by-name existing-slot 'mezzano.clos::dcas-sibling))
+       (equal (sys.int::structure-slot-definition-initform new-slot)
+              (mezzano.runtime::instance-access-by-name existing-slot 'mezzano.clos::initform))))
+
 (defun structure-slot-definition-trivially-compatible-p (existing-structure-class new-slot)
+  ;; Keep these checks in line with the paired-slot predicate above.  This
+  ;; lookup path is also used while loading unchanged structure definitions.
   (let ((existing-slot (find (sys.int::structure-slot-definition-name new-slot)
                              (mezzano.runtime::instance-access-by-name existing-structure-class 'mezzano.clos::effective-slots)
                              :key (lambda (slot)
