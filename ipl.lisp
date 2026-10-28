@@ -16,6 +16,10 @@
   (mezzano.supervisor:panic (format nil "~A" condition)))
 (setf mezzano.debug:*global-debugger* 'ipl-debugger)
 
+;; Reset all inline-caches here so generic functions defined during the
+;; bootstrap era can actually participate in caching.
+(mezzano.runtime::reset-all-inline-caches)
+
 ;; Fast eval mode.
 (setf sys.int::*eval-hook* 'mezzano.fast-eval:eval-in-lexenv)
 
@@ -149,13 +153,8 @@ Make sure there is a virtio-net NIC attached.~%")
 (require :png-read)
 (require :cl-jpeg)
 (require :skippy)
-(require :cl-video)
-(require :cl-video-avi)
-(require :cl-video-gif)
-(require :cl-video-wav)
-(require :cl-wav)
-;; Swank doesn't really support logical pathname shenanigans.
 
+;; Swank doesn't really support logical pathname shenanigans.
 (load (merge-pathnames (make-pathname :directory '(:relative "slime") :name "swank-loader" :type "lisp")
                        (user-homedir-pathname)))
 (eval (read-from-string "(swank-loader::init)"))
@@ -241,8 +240,6 @@ Make sure there is a virtio-net NIC attached.~%")
 (sys.int::cal "sys:source;applications;fancy-repl.lisp")
 (sys.int::cal "sys:source;gui;desktop.lisp")
 (sys.int::cal "sys:source;gui;image-viewer.lisp")
-(sys.int::cal "sys:source;gui;trentino.lisp")
-(sys.int::cal "sys:source;gui;music-player.lisp")
 (sys.int::cal "sys:source;applications;filer.lisp")
 (sys.int::cal "sys:source;applications;memory-monitor.lisp")
 (sys.int::cal "sys:source;gui;starfield.lisp")

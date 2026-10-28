@@ -1,0 +1,30 @@
+Weak NIL-key hash-table bug found during validation
+  The NIL plist test exposed a recursive-lock panic. The same panic reproduced
+  in a freshly booted, unmodified image before any GC/page changes were loaded.
+  PROBE-HASH-TABLE-SLOT represented dead entries and tombstones as (NIL, NIL),
+  then compared the key without checking LIVEP. A NIL lookup could return the
+  tombstone's slot, and WEAK-POINTER-VALUE would receive a marker instead of a
+  weak pointer. Reporting that error while holding the symbol-plists lock
+  recursively acquired that lock.
+
+  system/hash-table.lisp now requires LIVEP before matching the key. The fix
+  applies to EQ, EQL, EQUAL and EQUALP weak tables. Cold compilation regenerates
+  their functions normally; tools/tests/weak-hash-nil-hotload.lisp regenerates
+  only weak-table functions for an existing image, preserving table layouts.
+
+  Native validation after the fix:
+    weak-hash-nil-guest: 32 tombstone configurations, 8 dead-entry configurations
+    gc-scan-guest: three successful runs, each with 5 minors and 10 majors,
+      including NIL plist roots, cycles/sharing, old/pinned-to-young pointers,
+      mixed raw/boxed slots, and a run with transport metering enabled
+    physical-page-exists-guest: all six map entries' boundaries, holes,
+      out-of-range hints, large/negative page numbers, and 40000 concurrent lookups
+  Baseline panic log: /tmp/mezzano-gc-baseline-panic.log
+  Original validation panic log: /tmp/mezzano-gc-validation-panic.log
+
+  To run the validation, compile/load weak-hash-nil-guest.lisp,
+  gc-scan-guest.lisp and physical-page-exists-guest.lisp, then call RUN in
+  packages MEZZANO.WEAK-HASH-NIL-TEST, MEZZANO.GC-SCAN-TEST and
+  MEZZANO.PHYSICAL-PAGE-EXISTS-TEST respectively. Hot-load the weak-table fix
+  before calling (mezzano.gc-scan-test:run :check-nil-plist t). The GC test
+  and physical-page test belong to the separate GC optimization branch.

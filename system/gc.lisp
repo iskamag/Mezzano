@@ -787,6 +787,20 @@ This is required to make the GC interrupt safe."
                                      5)))
         (return-from scavenge-full-save-thread
           (scavenge-full-save-thread thread cycle-kind)))
+      ;; Must check before scavenging the data registers,
+      ;; otherwise the base register be scavanged before
+      ;; updating the linked register!
+      #+arm64
+      (ecase extra-registers
+        ((nil))
+        ((:rax)
+         ;; x9 (rax) contains an interior pointer into :x1 (r9)
+         (let ((offset (- (mezzano.supervisor:thread-state-rax thread)
+                          (mezzano.supervisor:thread-state-r9 thread))))
+           (scavengef (mezzano.supervisor:thread-state-r9-value thread) cycle-kind)
+           (setf (mezzano.supervisor:thread-state-rax thread)
+                 (+ (mezzano.supervisor:thread-state-r9 thread)
+                    offset)))))
       ;; Unconditionally scavenge the saved data registers.
       (scavenge-thread-data-registers thread cycle-kind)
       #+x86-64
@@ -801,17 +815,6 @@ This is required to make the GC interrupt safe."
          (scavengef (mezzano.supervisor:thread-state-rax-value thread) cycle-kind)
          (scavengef (mezzano.supervisor:thread-state-rcx-value thread) cycle-kind)
          (scavengef (mezzano.supervisor:thread-state-rdx-value thread) cycle-kind)))
-      #+arm64
-      (ecase extra-registers
-        ((nil))
-        ((:rax)
-         ;; x9 (rax) contains an interior pointer into :x1 (r9)
-         (let ((offset (- (mezzano.supervisor:thread-state-rax thread)
-                          (mezzano.supervisor:thread-state-r9 thread))))
-           (scavengef (mezzano.supervisor:thread-state-r9 thread) cycle-kind)
-           (setf (mezzano.supervisor:thread-state-rax thread)
-                 (+ (mezzano.supervisor:thread-state-r9 thread)
-                    offset)))))
       (when block-or-tagbody-thunk
         ;; Active NLX thunk, true stack/frame pointers stored in the NLX info
         ;; pointed to by RAX.
@@ -1118,8 +1121,8 @@ This is required to make the GC interrupt safe."
     (scavenge-many (+ address mc-size) pool-size cycle-kind)))
 
 (defun scan-function-reference (object cycle-kind)
-  ;; Scan the first 4 words normally.
-  (scan-generic object 4 cycle-kind)
+  ;; Scan the leading non-code words normally.
+  (scan-generic object (1+ +fref-code+) cycle-kind)
   ;; Now pull the target function out of the branch and scan that.
   ;; We may have caught (SETF FUNCTION-REFERENCE-FUNCTION) halfway
   ;; through an update.
@@ -1177,7 +1180,8 @@ a pointer to the new object. Leaves a forwarding pointer in place."
             (setf (%object-ref-t new-instance +function-entry-point+)
                   (%object-ref-t object +function-entry-point+))
             (setf (%object-ref-t new-instance +funcallable-instance-function+)
-                  (%object-ref-t object +funcallable-instance-function+)))
+                  (%object-ref-t object +funcallable-instance-function+))
+            (scavengef (%object-ref-t new-instance +funcallable-instance-function+) cycle-kind))
           (return-from transport-object
             (scavenge-object new-instance cycle-kind)))))
     (really-transport-object object cycle-kind)))
@@ -1706,8 +1710,8 @@ Additionally update the card table offset fields and clear the mark bits."
               ;; TODO: Not implemented.
               nil))))
     (#.+object-tag-function-reference+
-     ;; Only the first 4 words. The remaining words are code words.
-     (verify-generic object 4))
+     ;; The leading non-code words.
+     (verify-generic object (1+ +fref-code+)))
     (#.+object-tag-function+
      ;; Not implemented.
      nil)

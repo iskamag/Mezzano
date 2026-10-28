@@ -5,7 +5,8 @@
 (defstruct function-info
   compiler-macro
   inline-form
-  inline-mode)
+  inline-mode
+  inline-cache-p)
 
 (defvar *symbol-function-info*)
 (defvar *setf-function-info*)
@@ -49,7 +50,8 @@
 
 (defun known-declaration-p (declaration)
   (or (member declaration '(special constant global inline notinline
-                            maybe-inline type ftype declaration optimize))
+                            maybe-inline type ftype declaration optimize
+                            inline-caching))
       (type-specifier-p declaration)
       (member declaration *known-declarations*)))
 
@@ -97,6 +99,11 @@
          (check-type quality (member compilation-speed debug safety space speed))
          (check-type value (member 0 1 2 3))
          (setf (getf mezzano.compiler::*optimize-policy* quality) value))))
+    (inline-caching
+     (dolist (name (rest declaration-specifier))
+       (setf (function-info-inline-cache-p
+              (function-info-for name))
+             t)))
     (t
      (cond ((type-specifier-p (first declaration-specifier))
             ;; Actually a type declaration.
@@ -112,8 +119,9 @@
   (let ((info (function-info-for name nil)))
     (if info
         (values (eql (function-info-inline-mode info) 't)
-                (function-info-inline-form info))
-        (values nil nil))))
+                (function-info-inline-form info)
+                (function-info-inline-cache-p info))
+        (values nil nil nil))))
 
 ;;; Turn (APPLY fn args...) into (%APPLY fn (list* args...)), bypassing APPLY's
 ;;; rest-list generation.
@@ -682,7 +690,7 @@
   ;; (mov :rbx (:rip fref-function))
   ;; (jmp ...
   (setf (%object-ref-unsigned-byte-64 fref (+ +fref-code+ 1))
-        #xFFFFFFFFE91D8B48)
+        #xFFFFFFFFE11D8B48)
   ;; ... (:object :rbx entry-point))
   ;; (ud2)
   (setf (%object-ref-unsigned-byte-64 fref (+ +fref-code+ 2))
@@ -692,10 +700,14 @@
 (defun %fill-function-reference-code (fref)
   ;; Note: Doesn't actually follow the proper calling convention,
   ;; just enough for undefined functions to trap properly.
-  ;; (ldr :x6 (:pc fref-function))
-  ;; (ldr :x9 (:object :x6 #.sys.int::+function-entry-point+))
+  ;; Since the direct-call fast-path isn't implemented on arm64
+  ;; this code is only reached when named-calling a undefined
+  ;; function. So this code only needs to set things up enough
+  ;; for the call to RAISE-UNDEFINED-FUNCTION.
+  ;; (ldr :x7 (:pc fref-function))
+  ;; (ldr :x9 (:object :x7 #.sys.int::+function-entry-point+))
   (setf (%object-ref-unsigned-byte-64 fref (+ +fref-code+ 0))
-        #xF85FF0E958FFFFC6)
+        #xF85FF0E958FFFF87)
   ;; (br :x9)
   ;; (hlt 0)
   (setf (%object-ref-unsigned-byte-64 fref (+ +fref-code+ 1))
@@ -713,6 +725,7 @@
           (%function-reference-code-location
            (function-reference 'raise-undefined-function)))
     (setf (%object-ref-t fref +fref-function+) fref)
+    (setf (%object-ref-t fref +fref-dependents+) nil)
     (%fill-function-reference-code fref)
     fref))
 
@@ -784,6 +797,49 @@ then NIL will be returned."
         nil
         fn)))
 
+(defun register-function-reference-dependent (fref dependent)
+  (check-type fref function-reference)
+  (loop
+    with ptr = (make-weak-pointer dependent)
+    for prev = (%object-ref-t fref +fref-dependents+)
+    for new = (cons ptr prev)
+    do
+       (when (find dependent prev)
+         (return))
+       (when (eq (compare-and-swap
+                  (%object-ref-t fref +fref-dependents+)
+                  prev new)
+                 prev)
+         (return)))
+  (values))
+
+(defun remove-function-reference-dependent (fref dependent)
+  (check-type fref function-reference)
+  (loop
+    for current = (%object-ref-t fref +fref-dependents+)
+    for new = (loop for obj in current
+                    for item = (weak-pointer-value obj)
+                    when (and item (not (eql item dependent)))
+                      collect item)
+    until (eq (compare-and-swap
+               (%object-ref-t fref +fref-dependents+)
+               current new)
+              current))
+  (values))
+
+(defun map-function-reference-dependents (function fref)
+  (check-type fref function-reference)
+  (loop for obj in (%object-ref-t fref +fref-dependents+)
+        for item = (weak-pointer-value obj)
+        when item
+          do (funcall function item))
+  (values))
+
+;; Replaced with a generic later
+(defun update-function-reference-dependent (fref dependent)
+  (declare (ignore fref dependent))
+  nil)
+
 #+x86-64
 (defun %activate-function-reference-full-path (fref)
   (setf (%object-ref-unsigned-byte-32 fref (1+ (* +fref-code+ 2))) 0))
@@ -832,6 +888,10 @@ VALUE may be nil to make the fref unbound."
      ;; Bound to an unusual function. Full path.
      (setf (%object-ref-t fref +fref-function+) value)
      (%activate-function-reference-full-path fref)))
+  (flet ((doit (dependent)
+           (update-function-reference-dependent fref dependent)))
+    (declare (dynamic-extent doit))
+    (map-function-reference-dependents #'doit fref))
   value)
 
 (defun trace-wrapper-p (object)
@@ -862,6 +922,11 @@ VALUE may be nil to make the fref unbound."
     (when (trace-wrapper-p existing)
       ;; Update the traced function instead of setting the fref's function.
       (setf (trace-wrapper-original existing) value)
+      ;; Manually update dependents heres.
+      (flet ((doit (dependent)
+               (update-function-reference-dependent fref dependent)))
+        (declare (dynamic-extent doit))
+        (map-function-reference-dependents #'doit fref))
       (return-from fdefinition value))
     (setf (function-reference-function fref) value)))
 
@@ -883,7 +948,11 @@ VALUE may be nil to make the fref unbound."
         (when (trace-wrapper-p existing)
           ;; Untrace the function.
           (%untrace (function-reference-name fref)))
-        (setf (function-reference-function (function-reference name)) nil))))
+        (setf (function-reference-function (function-reference name)) nil))
+      (flet ((doit (dependent)
+               (update-function-reference-dependent fref dependent)))
+        (declare (dynamic-extent doit))
+        (map-function-reference-dependents #'doit fref))))
   name)
 
 (defun symbol-function (symbol)

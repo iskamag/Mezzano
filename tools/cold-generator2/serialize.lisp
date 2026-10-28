@@ -261,6 +261,8 @@ Must not call SERIALIZE-OBJECT."))
                                     image environment)))
     (setf (object-slot image value sys.int::+fref-undefined-entry-point+)
           (object-slot-location image undef-fref sys.int::+fref-code+)))
+  (setf (object-slot image value sys.int::+fref-dependents+)
+        (serialize-object nil image environment))
   (let* ((fn (env:function-reference-function object))
          (fn-value (serialize-object fn image environment)))
     (if fn
@@ -284,7 +286,7 @@ Must not call SERIALIZE-OBJECT."))
        ;; (mov :rbx (:rip fref-function))
        ;; (jmp ...
        (setf (object-slot image value (+ sys.int::+fref-code+ 1))
-             #xFFFFFFFFE91D8B48)
+             #xFFFFFFFFE11D8B48)
        ;; ... (:object :rbx entry-point))
        ;; (ud2)
        (setf (object-slot image value (+ sys.int::+fref-code+ 2))
@@ -295,7 +297,7 @@ Must not call SERIALIZE-OBJECT."))
        ;; (ldr :x7 (:pc fref-function))
        ;; (ldr :x9 (:object :x7 #.sys.int::+function-entry-point+))
        (setf (object-slot image value (+ sys.int::+fref-code+ 0))
-             #xF85FF0E958FFFFC7)
+             #xF85FF0E958FFFF87)
        ;; (br :x9)
        ;; (hlt 0)
        (setf (object-slot image value (+ sys.int::+fref-code+ 1))
@@ -777,8 +779,18 @@ Must not call SERIALIZE-OBJECT."))
 
 (defmethod initialize-object ((object env:cross-class-instance) value image environment)
   (let ((layout (env:cross-class-instance-layout object)))
-    (initialize-object-header image value sys.int::+object-tag-instance+
+    (initialize-object-header image value
+                              (if (env::cross-class-funcallable-instance-p object)
+                                  sys.int::+object-tag-funcallable-instance+
+                                  sys.int::+object-tag-instance+)
                               (serialize-object layout image environment))
+    (when (env::cross-class-funcallable-instance-p object)
+      ;; Initialize the entry point for funcallable instances.
+      ;; This doesn't init the actual function, just the thunk!
+      (let ((tramp (serialize-object
+                    (env:cross-symbol-value environment 'sys.int::*funcallable-instance-trampoline*)
+                    image environment)))
+        (setf (object-slot image value 0) (object-slot image tramp 0))))
     (loop
        for i below (length (sys.int::layout-instance-slots layout)) by 2
        for slot-name = (svref (sys.int::layout-instance-slots layout) i)
@@ -800,6 +812,30 @@ Must not call SERIALIZE-OBJECT."))
       (setf env::%real-cref (env:make-structure environment 'mezzano.clos::class-reference
                                                 :name (env:class-reference-name object))))
     (serialize-object env::%real-cref image environment)))
+
+(defmethod serialize-object ((object env::inline-cache-proxy) image environment)
+  (let ((existing (gethash object (image-object-values image))))
+    (when existing
+      (return-from serialize-object existing)))
+  (with-slots (env::%fref) object
+    (let ((real-cache (env:allocate-cross-class-instance
+                       environment
+                       (env:cross-class-instance-slot-value
+                        (env:find-environment-class
+                         environment
+                         (env:translate-symbol environment 'mezzano.runtime::inline-cache))
+                        (env:translate-symbol environment 'mezzano.clos::slot-storage-layout))
+                       t)))
+      (setf (env:cross-class-instance-slot-value
+             real-cache
+             (env:translate-symbol environment 'mezzano.runtime::%fref))
+            env::%fref)
+      (setf (env:cross-class-instance-slot-value
+             real-cache
+             (env:translate-symbol environment 'mezzano.runtime::%function))
+            nil)
+      (setf (gethash object (image-object-values image))
+            (serialize-object real-cache image environment)))))
 
 (defun image-symbol-value (image environment symbol)
   (let ((cell (serialize-object

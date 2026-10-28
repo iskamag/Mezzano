@@ -201,7 +201,8 @@
 (defconstant +fref-undefined-entry-point+ 0)
 (defconstant +fref-name+ 1)
 (defconstant +fref-function+ 2)
-(defconstant +fref-code+ 3)
+(defconstant +fref-dependents+ 3)
+(defconstant +fref-code+ 4)
 
 ;;; Layout of complex arrays.
 (defconstant +complex-array-storage+ 0)
@@ -365,6 +366,7 @@ reserved on the disk, but no specific block has been allocated.")
 (defconstant +llf-complex-short-float+       #x2C)
 (defconstant +llf-class-reference+           #x2D)
 (defconstant +llf-typed-integer-array+       #x2E)
+(defconstant +llf-inline-cache+              #x2F)
 
 ;;; Fields in the Unicode info tables.
 
