@@ -1,0 +1,174 @@
+#+TITLE: Handoff: CLOS cache publication can race with method changes
+#+DATE: 2026-10-28
+
+* Status and provenance
+
+This is a source-level concurrency finding, not a deterministic runtime
+failure reproduced during this session. Do not report the GC stress tests
+as evidence that concurrent method mutation is safe: they exercise a
+different interleaving.
+
+The relevant publication gaps PRE-DATE this session's refactor. They are
+present in commit 826e234f (x86-64: Add missing shift builtin):
+
+- SLOW-SINGLE-DISPATCH-METHOD-LOOKUP* captures the GF's table before computing
+  an entry, then inserts into that captured table later.
+- SLOW-SINGLE-DISPATCH-METHOD-LOOKUP computes an effective method first, then
+  fetches the GF's current table when inserting it.
+- SLOW-METHOD-LOOKUP has the analogous compute-then-fetch-current-table order.
+- Table insertion and clearing each lock the table independently; GF
+  finalization clears, replaces the table, and installs a discriminator in
+  separate steps.
+
+Current implementation under review: work/clos-storage at a4152b2e, merged
+into slop at 9ba0ca51. The latest performance change makes metadata reads
+direct and GC-safe. It does not change the publication synchronization above.
+
+An experiment retaining the shared EMF table in compiled slot call sites
+was discarded and never committed. Do not resurrect it based solely on the
+claim that clearing old cells makes detached tables permanently empty.
+The committed call sites fetch the GF's current table on last-cell misses.
+
+* Contract matters
+
+[[file:instances.md][Instance internals]] already requires quiescence during class redefinition
+and migration; the physical-storage protocol does not make those operations
+atomic. Do not silently treat concurrent class redefinition as supported.
+
+Determine the intended contract for concurrent ADD-METHOD/REMOVE-METHOD and
+GF reinitialization separately. No equivalent guarantee was established in
+this investigation. If those require quiescence too, document that boundary;
+if they are supported, the publication protocol needs a fix. Reproduce first
+with method changes on an unchanged class, avoiding the class-layout question.
+
+This concern is stale dispatch/cache state. It is distinct from GC relocating
+storage after a slot offset is selected. A correct physical-layout guard does
+not detect a method change on a class whose layout stays identical. There is
+no demonstrated memory-corruption result from this finding.
+
+* Relevant code
+
+In [[file:../../system/clos/closette.lisp][system/clos/closette.lisp]]:
+
+- RESET-GF-EMF-TABLE clears an existing table; it can preserve table identity.
+- FINALIZE-GENERIC-FUNCTION calls reset, replaces CLASSES-TO-EMF-TABLE, then
+  installs a newly computed discriminating function.
+- SLOW-SINGLE-DISPATCH-METHOD-LOOKUP*, :READER/:WRITER cases, captures EMF-TABLE
+  before method selection and later SETFs SINGLE-DISPATCH-EMF-ENTRY into it.
+- The :NEVER-CALLED case also installs a discriminator after method selection.
+- SLOW-SINGLE-DISPATCH-METHOD-LOOKUP publishes EMFUN into
+  (CLASSES-TO-EMF-TABLE GF) after computing it.
+- SLOW-METHOD-LOOKUP does the same through INSERT-INTO-EMF-CACHE.
+- SLOW-UNSPECIALIZED-DISPATCH-METHOD-LOOKUP installs EMFUN directly as the GF's
+  function after computing it. Audit that publication as well.
+- FLUSH-EMF-TABLES-ON-CLASS-REDEFINITION resets registered GF caches.
+
+In [[file:../../system/clos/single-dispatch-emf-table.lisp][single-dispatch-emf-table.lisp]], the entry setter and clear function each
+hold SINGLE-DISPATCH-EMF-TABLE-UPDATE-LOCK. Neither establishes that a computed
+entry belongs to the GF's current definition/generation.
+
+In [[file:../../system/clos/fast-class-hash-table.lisp][fast-class-hash-table.lisp]], CLEAR-FAST-CLASS-HASH-TABLE invalidates existing
+weak-cell values before dropping storage. This revokes those cells, but does
+not prohibit a delayed insertion from allocating a NEW live cell afterward.
+
+* Two interleavings to reproduce
+
+** A. Repopulating a detached table
+
+1. Thread A enters the slow reader/writer path, captures table T0, selects
+   methods, and constructs entry E0. Pause before cache insertion.
+2. Thread B changes methods and finishes finalization: clears T0, publishes
+   T1, installs the new discriminator.
+3. A resumes and inserts E0 into its captured T0 under T0's update lock.
+4. T0 is now detached but contains a live entry again.
+
+A saved or in-flight discriminator may still reference T0. Establish which
+public call sequence can consume that stale entry; merely observing a
+repopulated unreachable table does not prove a user-visible wrong result.
+This interleaving invalidates the proposed retained-table optimization's
+safety argument regardless.
+
+** B. Publishing an old result into the current table
+
+1. A computes effective method E0 using the old method set. Pause immediately
+   before its final cache publication in SLOW-SINGLE-DISPATCH-METHOD-LOOKUP.
+2. B replaces/removes a method and completes finalization, publishing T1.
+3. A fetches (CLASSES-TO-EMF-TABLE GF), gets T1, and inserts E0 into T1.
+4. A subsequent call begun AFTER both threads finish can find E0 in the
+   current cache and execute old behavior.
+
+This is the more direct public-behavior test. Also test delayed publication
+of a discriminator/unspecialized EMFUN overwriting a newer installed function.
+Returning old behavior from the original overlapping call alone is not the
+failure criterion; stale behavior on later calls is.
+
+* Deterministic test plan
+
+Use a test GF and a fixed receiver class, with old/new methods returning
+visibly different markers. Force a cache miss. Add a temporary test-only
+pause hook after old method/entry computation and before publication. Gate
+that hook to the selected GF and worker so setup, compiler activity, and the
+mutator cannot accidentally block on it.
+
+Use events/semaphores, not sleeps:
+
+- Wait for A to reach the publication barrier.
+- Perform the real ADD-METHOD/REMOVE-METHOD operation in B and wait for it to
+  finish, including finalization.
+- Release A and join it.
+- Inspect old/current table identity and contents, then call the public GF
+  repeatedly after completion and assert the new result.
+
+Exercise the accessor path separately, plus ordinary single dispatch and
+unspecialized dispatch. Check clearing without table replacement as well as
+replacement. Keep the receiver layout unchanged in the first reproducer.
+Run the same reproducer against 826e234f if establishing historical behavior.
+Do not substitute direct cache mutation for the actual publication path.
+
+* Fix direction and traps
+
+The required invariant is that publication validates the SAME method/cache
+state used for computation. A generation or immutable state token is a likely
+solution, but the exact representation is not selected here.
+
+- Obtain a stable state/token before method selection.
+- Compute outside locks that would cover arbitrary MOP/user callbacks.
+- Under synchronization shared with mutation/invalidation, validate the token
+  and publish the entry or discriminator. If stale, discard/retry.
+- Invalidation must advance the token even if the table object is reused.
+- Retired tables must reject late publication if readers can retain them.
+- Method-state changes and token transitions need a coherent ordering; adding
+  a check only after computation is insufficient if mutation can be observed
+  midway through method selection.
+
+Checking table identity without synchronization leaves a check/store race.
+Checking only current table identity also misses reset-in-place and stale
+computations deliberately inserted into a newly fetched table. Locking only
+insertion and clearing, as today, does not validate the computation's age.
+
+Do not hold a nonrecursive table mutex across effective-method computation,
+MOP calls, method execution, or migration hooks: reentry/deadlock is possible.
+Audit lock ordering with GF mutation and redefinition-flusher registration.
+Preserve lock-free successful dispatch if possible; concentrate extra work
+on misses and mutation. GC safepoints alone do not solve this race between
+mutator threads.
+
+* Existing validation and performance constraints
+
+Existing tests cover sequential method/cache invalidation, retained weak
+cells, supersession, reclamation, weak keys, and concurrent slot access with
+GC. They do not deterministically interleave method mutation with slow-cache
+publication. Start with tools/tests/clos-fast-guest.lisp and
+clos-slot-call-site.lisp, but add a dedicated publication regression.
+
+Keep implementation commits on work/clos-storage (master plus its structure
+layout prerequisites), then merge into slop. Do not put implementation commits
+directly on slop. Use make serial-kvm and the existing image for investigation;
+no repeated image matrix. All implementation changes belong in Mezzano.
+
+Latest same-image three-compile control: old metadata getters analysis
+2.960581s / CFG 1.639513s; optimized getters 2.639839s / 1.520724s CPU, no GC.
+See tools/tests/clos-fast-results.txt for methodology and historical baselines.
+A race fix should preserve that successful-dispatch cost. If a chosen fix
+changes structure layout, make clean and rebuild as required by AGENTS.md;
+do not use make clean otherwise.
