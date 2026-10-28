@@ -209,8 +209,17 @@
   type
   data)
 
-(defun sys.int::%defstruct (def &key location)
-  (declare (ignore location))
+(defun sys.int::structure-parent-for-definition (name)
+  (sys.int::get-structure-type name))
+
+(defun sys.int::%object-ref-t (object index)
+  ;; Generated constructors test the version symbol's value-cell field.  The
+  ;; cross compiler runs some constructors on the host while bootstrapping.
+  (assert (and (symbolp object) (= index sys.int::+symbol-value+)))
+  (when (boundp object) t))
+
+(defun sys.int::%defstruct (def &key location recipe)
+  (declare (ignore location recipe))
   (when (gethash (sys.int::structure-definition-name def) *structure-types*)
     ;; FIXME: Check compatibility here.
     (return-from sys.int::%defstruct def))

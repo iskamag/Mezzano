@@ -350,7 +350,9 @@
                     (setf (primordial-slot-value class (env:translate-symbol environment 'mezzano.clos::parent))
                           (second (primordial-slot-value class (env:translate-symbol environment 'mezzano.clos::precedence-list))))
                     (setf (primordial-slot-value class (env:translate-symbol environment 'mezzano.clos::has-standard-constructor))
-                          (env:structure-definition-has-standard-constructor sdef))))))
+                          (env:structure-definition-has-standard-constructor sdef))
+                    (setf (primordial-slot-value class (env:translate-symbol environment 'documentation))
+                          (env:structure-definition-docstring sdef))))))
           (t
            (let ((instance-slots (remove-if-not (lambda (x) (eql (primordial-slot-value x (env:translate-symbol environment 'mezzano.clos::allocation)) :instance))
                                                 (primordial-slot-value class (env:translate-symbol environment 'mezzano.clos::effective-slots))))

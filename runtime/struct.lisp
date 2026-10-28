@@ -206,14 +206,63 @@
     (when (eq object-class structure-class)
       (return t))))
 
+(defmacro structure-layout-match-p (object layout stale-form)
+  ;; Share the fast path, but let TYPEP resolve class membership on a stale
+  ;; path while slot access declines to use stale storage.  A complete,
+  ;; current vector that does not contain LAYOUT is a definite miss.
+  (let ((object-var (gensym "OBJECT"))
+        (layout-var (gensym "LAYOUT")))
+    `(let ((,object-var ,object)
+           (,layout-var ,layout))
+       (when (sys.int::instance-p ,object-var)
+         (let ((object-layout (sys.int::%instance-layout ,object-var)))
+           (if (sys.int::layout-new-instance object-layout)
+               ,stale-form
+               ;; The fixed vector length bounds the raw element reads.
+               (loop with compatible of-type simple-vector = (sys.int::layout-compatible object-layout)
+                     for i of-type fixnum below (length compatible)
+                     do (let ((l (sys.int::%object-ref-t compatible i)))
+                          (when (sys.int::layout-obsolete l)
+                            (return ,stale-form))
+                          (when (eq l ,layout-var)
+                            (return t)))
+                     ;; Every published structure vector starts with its own
+                     ;; layout, whose obsoleteness was checked in the loop.
+                     finally (when (sys.int::layout-obsolete ,layout-var)
+                               (return ,stale-form)))))))))
+
 (defun sys.int::structure-layout-compatible-p (object layout)
-  "Test if an object is compatible with the given layout."
+  "Test if OBJECT's current storage is compatible with LAYOUT."
   (declare (optimize (speed 3) (safety 0) (debug 0)))
-  (when (sys.int::instance-p object)
-    (loop with object-layout of-type sys.int::layout = (sys.int::%instance-layout object)
-          with compatible of-type simple-vector = (sys.int::layout-compatible object-layout)
-          for l across compatible
-            thereis (eq l layout))))
+  (structure-layout-match-p object layout nil))
+
+(defun sys.int::structure-layout-typep (object layout)
+  "Test structure class membership, falling back only for a stale path."
+  (declare (optimize (speed 3) (safety 0) (debug 0)))
+  (structure-layout-match-p object layout
+                            (sys.int::structure-type-p object (sys.int::layout-class layout))))
+
+(defun sys.int::make-structure-compatible-layouts (parent)
+  "Make a wired vector with room for a layout and its parent layouts."
+  (let ((parents
+          (loop for current = parent then next
+                while current
+                for class-p = (structure-class-p current)
+                for layout = (if class-p
+                                 (instance-access-by-name current 'mezzano.clos::slot-storage-layout)
+                                 (sys.int::structure-definition-layout current))
+                for next = (if class-p
+                               (instance-access-by-name current 'mezzano.clos::parent)
+                               (sys.int::structure-definition-parent current))
+                when layout collect layout)))
+    (make-array (1+ (length parents))
+                :initial-contents (cons nil parents)
+                :area :wired)))
+
+(defun sys.int::finish-compatible-layouts (layout)
+  "Install LAYOUT in the first element of its unpublished compatible vector."
+  (setf (svref (sys.int::layout-compatible layout) 0) layout)
+  layout)
 
 (defun sys.int::%allocate-struct (structure-class)
   (when (symbolp structure-class)
@@ -316,8 +365,8 @@
                                                                           collect (sys.int::structure-slot-definition-name slot)
                                                                           collect (sys.int::structure-slot-definition-location slot))
                                                      :area :wired)
-                         ;; TODO
-                         :compatible (make-array 0 :area :wired))))
+                         :compatible (sys.int::make-structure-compatible-layouts parent))))
+    (sys.int::finish-compatible-layouts layout-object)
     (setf (sys.int::structure-definition-layout def) layout-object)
     def))
 

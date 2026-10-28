@@ -1,0 +1,35 @@
+Historical results from before descendant migration. For current measurements, see
+structure-migration-benchmark-results.txt.
+
+Compiled structure layout benchmark, 2026-10-28
+
+Base: local upstream master 826e234f. Host: AMD Ryzen 7 6800H, x86-64 KVM
+with one vCPU, QEMU pinned to host CPU 4. The six TYPEP cases perform
+2,560,000 operations per sample; the parent-accessor case performs 640,000.
+Each result is the median of 11 alternating pairs. Times are TSC ticks, not
+core cycles, and the ratio is the median of paired ratios. Every timed sample
+checks its result, zero allocation, and zero GC.
+
+Case                    Upstream ticks   Current ticks   Paired current/upstream
+Exact structure             51,577,664      52,005,632              1.005093
+Child structure             88,086,976      85,953,472              0.971006
+Grandchild structure       102,775,776      95,846,368              0.924520
+Unrelated structure         90,175,104      90,007,424              0.998140
+Fixnum miss                 59,130,304      59,131,232              0.995097
+Mixed inputs                72,191,552      72,400,896              0.999984
+Parent accessor          2,915,935,520      23,013,376              0.007925
+
+For TYPEP, the old and current compiled expansions use the same objects and
+complete vectors, so this comparison isolates the check rather than the old
+incorrect TYPEP result on an empty vector. Both compatibility helpers are
+compiled wired, and the benchmark verifies that the baseline calls the
+upstream helper. For the accessor, one test child is temporarily given the
+old empty vector, and the same compiled accessor is used on both children;
+the older case emulates the original slow fallback rather than loading an old
+image. These measurements do not include obsolete-layout fallback, ARM64,
+cold-boot timing, or application throughput.
+
+The regression and both benchmarks ran in the private image built by
+structure-reparent-image.lisp; the command is recorded in
+structure-reparent-benchmark-results.txt. The original standalone image builder
+structure-layout-benchmark-image.lisp also remains available.

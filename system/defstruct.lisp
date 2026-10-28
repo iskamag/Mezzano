@@ -295,18 +295,64 @@
        (check-type ,value ,type)
        ,value)))
 
-(defun generate-simple-defstruct-constructor (struct-name struct-type name area)
+(defun constructor-obsolete-test (token)
+  ;; The uninterned token has no value cell until its definition is replaced.
+  ;; This is a single field read in a current constructor.
+  ;; Splice the constant: cold-start evals generated constructors before
+  ;; constants have value cells, so a variable read would be unbound.
+  `(%object-ref-t ',token ,+symbol-value+))
+
+(defun generate-standard-defstruct-constructor (struct-name struct-type name area token)
+  (let* ((slots (structure-definition-slots struct-type))
+         (supplied (loop for slot in slots collect (gensym "SUPPLIED")))
+         (parameters (loop for slot in slots collect (gensym "ARGUMENT")))
+         (ordinary-lambda-list
+           (list* '&key (mapcar (lambda (slot)
+                                  (list (structure-slot-definition-name slot)
+                                        (structure-slot-definition-initform slot)))
+                                slots)))
+         (ordinary (third (generate-defstruct-constructor
+                           struct-name struct-type name ordinary-lambda-list area)))
+         (fast-body (cdddr ordinary)))
+    `(progn
+       (declaim (maybe-inline ,name))
+       (defun ,name (&key ,@(loop for slot in slots for flag in supplied for argument in parameters
+                                  collect (list (list (intern (string (structure-slot-definition-name slot)) "KEYWORD")
+                                                      argument)
+                                                nil flag)))
+         (if ,(constructor-obsolete-test token)
+             (let* ,(loop for slot in slots for flag in supplied for argument in parameters
+                          for slot-name = (structure-slot-definition-name slot)
+                          for initform = (structure-slot-definition-initform slot)
+                          collect `(,slot-name
+                                    (if ,flag ,argument
+                                        (mezzano.clos::current-structure-constructor-default
+                                         ',struct-name ',slot-name ',initform
+                                         (lambda () ,initform) ',token))))
+               (mezzano.clos::construct-rebuilt-boa
+                ',struct-name
+                (list ,@(loop for slot in slots
+                              for slot-name = (structure-slot-definition-name slot)
+                              collect `(cons ',slot-name ,slot-name)))
+                nil ',token))
+             (let* ,(loop for slot in slots for flag in supplied for argument in parameters
+                          for slot-name = (structure-slot-definition-name slot)
+                          collect `(,slot-name (if ,flag ,argument
+                                                   ,(structure-slot-definition-initform slot))))
+               ,@fast-body))))))
+
+(defun generate-simple-defstruct-constructor (struct-name struct-type name area &optional token)
   ;; Due to issues with the compiler, structures with a large number of slots
   ;; can't use the &key mechanism for initargs. This is temporary and should be
   ;; removed when the compiler is improved.
   (cond ((< (length (structure-definition-slots struct-type)) *defstruct-constructor-slot-threshold*)
-         (generate-defstruct-constructor struct-name
-                                         struct-type
-                                         name
-                                         (list* '&key (mapcar (lambda (slot)
-                                                                (list (structure-slot-definition-name slot) (structure-slot-definition-initform slot)))
-                                                              (structure-definition-slots struct-type)))
-                                         area))
+         (if token
+             (generate-standard-defstruct-constructor struct-name struct-type name area token)
+             (generate-defstruct-constructor struct-name struct-type name
+                                             (list* '&key (mapcar (lambda (slot)
+                                                                    (list (structure-slot-definition-name slot) (structure-slot-definition-initform slot)))
+                                                                  (structure-definition-slots struct-type)))
+                                             area)))
         (t
          (let ((initargs (gensym "INITARGS"))
                (tmp (gensym "INSTANCE")))
@@ -332,6 +378,10 @@
                                                         for s in (structure-definition-slots struct-type)
                                                         collect (intern (symbol-name (structure-slot-definition-name s)) "KEYWORD"))))
                         (error "Invalid initarg ~S" (car itr))))))
+                ,@(when token
+                    `((when ,(constructor-obsolete-test token)
+                        (return-from ,name
+                          (mezzano.clos::construct-rebuilt-standard ',struct-name ,initargs)))))
                 (let ((,tmp (%allocate-struct ',struct-name)))
                   ,@(loop
                        for s in (structure-definition-slots struct-type)
@@ -352,7 +402,7 @@
                                                              ,(structure-slot-definition-initform s)))))
                   ,tmp)))))))
 
-(defun generate-defstruct-constructor (struct-name struct-type name lambda-list area)
+(defun generate-defstruct-constructor (struct-name struct-type name lambda-list area &optional token original-initforms)
   (multiple-value-bind (required optional rest enable-keys keys allow-other-keys aux)
       (parse-ordinary-lambda-list lambda-list)
     (declare (ignore enable-keys allow-other-keys))
@@ -371,6 +421,12 @@
       `(progn
          (declaim (maybe-inline ,name))
          (defun ,name ,lambda-list
+           ,@(when token
+               (let* ((rebuilt (generate-rebuilt-boa-constructor
+                                struct-name struct-type (list name lambda-list) token original-initforms))
+                      (call (third (third rebuilt))))
+                 `((when ,(constructor-obsolete-test token)
+                     (return-from ,name ,call)))))
            ,@(loop
                 for s in (structure-definition-slots struct-type)
                 when (not (member (structure-slot-definition-name s) default-slots))
@@ -398,6 +454,80 @@
                                                ,val))
                                           (structure-slot-definition-name s)))))
              ,tmp))))))
+
+(defun generate-rebuilt-boa-constructor (struct-name struct-type constructor &optional token original-initforms)
+  ;; This function is retained as a closure at the original DEFSTRUCT site.
+  ;; A later ancestor redefinition can install it without losing the lexical
+  ;; environment of either the BOA lambda list or the slot defaults.
+  (let ((name (first constructor))
+        (lambda-list (second constructor)))
+    (multiple-value-bind (required optional rest enable-keys keys allow-other-keys aux)
+        (parse-ordinary-lambda-list lambda-list)
+      (declare (ignore enable-keys allow-other-keys))
+      (let ((assigned (remove-duplicates
+                       (append required (mapcar #'first optional)
+                               (remove nil (mapcar #'third optional))
+                               (when rest (list rest)) (mapcar #'cadar keys)
+                               (remove nil (mapcar #'third keys)) (mapcar #'first aux)))))
+        `(cons ',name
+               (lambda ,lambda-list
+                 (mezzano.clos::construct-rebuilt-boa
+                  ',struct-name
+                  (list ,@(loop for variable in assigned
+                                collect `(cons ',variable ,variable)))
+                  (list ,@(loop for slot in (structure-definition-slots struct-type)
+                                unless (member (structure-slot-definition-name slot) assigned)
+                                collect `(list ',(structure-slot-definition-name slot)
+                                               ',(if original-initforms
+                                                     (cdr (assoc (structure-slot-definition-name slot) original-initforms))
+                                                     (structure-slot-definition-initform slot))
+                                               (lambda () ,(structure-slot-definition-initform slot)))))
+                  ',token)))))))
+
+(defun generate-boa-blueprint (struct-type constructor)
+  ;; Capture default expressions at the DEFSTRUCT site, but make the BOA
+  ;; variables explicit parameters.  A rebuilt constructor can then compile
+  ;; a fresh lambda without losing lexical bindings or argument dependencies.
+  (multiple-value-bind (required optional rest enable-keys keys allow-other-keys aux closure count)
+      (parse-ordinary-lambda-list (second constructor))
+    (let* ((bound (copy-list required))
+           (optional-forms
+             (loop for (name initform supplied) in optional
+                   collect (prog1 `(list ',name
+                                         ,(if (constantp initform)
+                                              `(cons :constant ',initform)
+                                              `(lambda ,bound ,initform))
+                                         ',bound ',supplied)
+                             (setf bound (append bound (list name) (when supplied (list supplied)))))))
+           (rest-bound (when rest (setf bound (append bound (list rest)))))
+           (key-forms
+             (loop for ((keyword name) initform supplied) in keys
+                   collect (prog1 `(list '(,keyword ,name)
+                                         ,(if (constantp initform)
+                                              `(cons :constant ',initform)
+                                              `(lambda ,bound ,initform))
+                                         ',bound ',supplied)
+                             (setf bound (append bound (list name) (when supplied (list supplied)))))))
+           (aux-forms
+             (loop for (name initform) in aux
+                   collect (prog1 `(list ',name
+                                         ,(if (constantp initform)
+                                              `(cons :constant ',initform)
+                                              `(lambda ,bound ,initform))
+                                         ',bound)
+                             (setf bound (append bound (list name))))))
+           (extra-bound (setf bound (append bound (when closure (list closure)) (when count (list count))))))
+      (declare (ignore rest-bound extra-bound))
+      `(list :name ',(first constructor) :required ',required
+             :optional (list ,@optional-forms) :rest ',rest :enable-keys ',enable-keys
+             :keys (list ,@key-forms) :allow-other-keys ',allow-other-keys
+             :aux (list ,@aux-forms) :closure ',closure :count ',count :variables ',bound
+             :slot-defaults
+             (list ,@(loop for slot in (structure-definition-slots struct-type)
+                           for name = (structure-slot-definition-name slot)
+                           for initform = (structure-slot-definition-initform slot)
+                           unless (or (member name bound) (constantp initform))
+                           collect `(list ',name ',initform (lambda ,bound ,initform))))))))
 
 (defun generate-defstruct-list/vector-constructor (leader-name slots name lambda-list construction-function)
   (multiple-value-bind (required optional rest enable-keys keys allow-other-keys aux)
@@ -574,7 +704,9 @@
                                  included-structure
                                  included-slot-descriptions
                                  t)
-      (let ((struct-type (make-struct-definition name
+      (let ((constructor-token (unless (and sealed (null included-structure-name))
+                                 (make-symbol "STRUCTURE-CONSTRUCTOR-VERSION")))
+            (struct-type (make-struct-definition name
                                                  slots
                                                  included-structure
                                                  area
@@ -584,8 +716,51 @@
                                                  docstring
                                                  (some #'symbolp constructors))))
         `(progn
-           (eval-when (:compile-toplevel :load-toplevel :execute)
+           (eval-when (:compile-toplevel)
              (%defstruct ',struct-type :location (lambda () (declare (lambda-name (defstruct ,name))))))
+           (eval-when (:load-toplevel :execute)
+             ;; Construct the definition at load time so that the recipe and
+             ;; captured initfunctions are available before redefinition.
+             (%defstruct
+              (make-struct-definition ',name
+                                      (list ,@(loop for slot in slots
+                                                    collect `(make-struct-slot-definition
+                                                              ',(structure-slot-definition-name slot)
+                                                              ',(structure-slot-definition-accessor slot)
+                                                              ',(structure-slot-definition-initform slot)
+                                                              ',(structure-slot-definition-type slot)
+                                                              ',(structure-slot-definition-read-only slot)
+                                                              ',(structure-slot-definition-location slot)
+                                                              ',(structure-slot-definition-fixed-vector slot)
+                                                              ',(structure-slot-definition-align slot)
+                                                              ',(structure-slot-definition-dcas-sibling slot)
+                                                              ',(structure-slot-definition-documentation slot))))
+                                      ,(when included-structure-name
+                                         `(structure-parent-for-definition ',included-structure-name))
+                                      ',area ',size ',layout
+                                      ',sealed ',docstring ',(some #'symbolp constructors))
+              :location (lambda () (declare (lambda-name (defstruct ,name))))
+              :recipe (list :package ,(package-name *package*) :conc-name ',conc-name
+                            :direct-slots ',slot-descriptions :included-slots ',included-slot-descriptions
+                            :constructors ',constructors
+                            :constructor-token ',constructor-token
+                            :dynamic-initializers
+                            ',(some (lambda (slot)
+                                      (not (constantp (structure-slot-definition-initform slot))))
+                                    slots)
+                            :boa-functions
+                            (list ,@(loop for constructor in constructors
+                                          unless (symbolp constructor)
+                                          collect (generate-rebuilt-boa-constructor name struct-type constructor constructor-token)))
+                            :boa-blueprints
+                            (list ,@(loop for constructor in constructors
+                                          unless (symbolp constructor)
+                                          collect (generate-boa-blueprint struct-type constructor)))
+                            :initializers
+                            (list ,@(loop for slot in slots
+                                          unless (constantp (structure-slot-definition-initform slot))
+                                          collect `(cons ',(structure-slot-definition-name slot)
+                                                         (lambda () ,(structure-slot-definition-initform slot))))))))
            ,@(when predicate
                (list `(declaim (inline ,predicate))
                      `(defun ,predicate (object)
@@ -614,8 +789,11 @@
            ,@(loop
                 for x in constructors
                 collect (if (symbolp x)
-                            (generate-simple-defstruct-constructor name struct-type x area)
-                            (generate-defstruct-constructor name struct-type (first x) (second x) area)))
+                            (generate-simple-defstruct-constructor name struct-type x area constructor-token)
+                            (generate-defstruct-constructor name struct-type (first x) (second x) area constructor-token)))
+           ,@(when constructor-token
+               `((when ,(constructor-obsolete-test constructor-token)
+                   (mezzano.clos::finish-repeated-structure-definition ',name ',constructor-token))))
            ',name)))))
 
 (defun generate-list-defstruct (name slot-descriptions conc-name constructors predicate area copier

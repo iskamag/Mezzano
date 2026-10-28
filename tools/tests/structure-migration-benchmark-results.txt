@@ -1,0 +1,74 @@
+Structure descendant migration: correctness and performance, 2026-10-28
+
+Branch base: upstream master 826e234f. Host: AMD Ryzen 7 6800H; x86-64 KVM,
+2 vCPUs, QEMU pinned to host CPUs 4 and 5. Measurements were run in a
+private cold-built image, with the functions under test also exercised from
+the serial REPL; the metadata and constructor optimizations were loaded into
+the running image before their respective trials. Elapsed performance figures
+are TSC ticks, not core cycles.
+Each comparison is the median of 11 alternating pairs; ratios are medians of
+the individual ratios. Timed constructor samples with GC were retried.
+
+Case                                  Before       Current    Paired ratio
+100,000 standard constructors        33,239,584    33,593,760      1.003624
+100,000 BOA constructors             30,126,880    31,355,776      1.035110
+100,000 constructors, guard cost      33,359,456    35,371,744      1.076701
+1,000 redefinitions, correct base     12,114,496     7,693,280      0.618261
+50,000 unchanged-definition checks   111,148,864   117,108,064      1.069551
+640,000 layout TYPEP hits             22,538,400    21,662,240      0.951964
+640,000 layout TYPEP misses           26,932,064    25,917,376      0.953611
+640,000 layout slot hits              23,419,840    21,064,032      0.908743
+640,000 layout slot misses            26,779,616    23,223,104      0.885373
+640,000 parent accessor calls      2,837,716,800    21,305,696      0.007508
+
+The first two constructor comparisons use matching classes before and after
+one parent adds a slot and a descendant is rebuilt. The BOA comparison omits
+a constant optional argument. Their 100,000 allocations
+consumed 3,200,000 bytes on both sides. The guard-cost comparison uses the
+same class and compares the original unguarded constructor generator with the
+new guarded generator; it also allocated 3,200,000 bytes on each side. The
+"correct base" is the earlier correct redefinition implementation with no
+descendants. The unchanged-definition comparison uses the upstream check,
+which did not compare all class and slot metadata; the current check does.
+These checks and layout trials allocated no bytes. The parent-accessor
+comparison uses the same compiled accessor and object with the original empty
+compatibility vector emulated on the baseline side; it measures the previously
+slow fallback, not whole-application throughput.
+
+As a separate cost measurement, changing the physical layout of a parent
+with a child and grandchild took 180–250 ms per transition, with a 240 ms
+median across six transitions. This includes rebuilding and compiling both
+descendants' accessors and constructors. The upstream path left descendants
+stale, so there is no correct upstream baseline for this operation. This is a
+short microbenchmark and does not measure whole-application performance,
+startup time, multi-threaded redefinition, or ARM64.
+Concurrent use of affected classes during redefinition requires quiescing
+those threads; redefinition is not atomic.
+
+For metadata-only default changes with the same two descendants, a paired
+six-sample trial of two consecutive redefinitions had a 370 ms median when
+accessor recompilation was forced and a 230 ms median when unchanged
+accessors were retained. Both cases still rebuild the constructors.
+
+Regression checks passed for cold- and runtime-defined structures, old
+instances and compiled accessors, saved and explicitly inlined constructors,
+BOA constructors with lexical and dependent defaults, repeated definitions,
+fixed-vector resizing,
+zero-length vectors, read-only slots, sealed descendants, changed slot types,
+class and slot metadata, generic dispatch caches, and conflicting slots.
+The checks were run in the serial REPL of the cold-built image. No compatibility between
+images produced by different Mezzano versions was tested or required.
+
+Reproduction from Mezzano/:
+
+  MEZZANO_REPARENT_TEST_OUTPUT=/tmp/mezzano-structure-reparent \
+    sbcl --non-interactive --load tools/tests/structure-reparent-image.lisp
+  taskset -c 4,5 timeout 240 qemu-system-x86_64 -enable-kvm -machine q35 \
+    -m 3G -smp 2 -drive file=/tmp/mezzano-structure-reparent/native.image,format=raw \
+    -snapshot -serial stdio -monitor none -display none -vga std -net none \
+    -no-reboot > /tmp/mezzano-structure-reparent/serial.log 2>&1
+
+The image prints STRUCTURE-REPARENT-ALL-PASSED after the regression suites and
+benchmarks. QEMU does not exit by itself. The temporary serial REPL support
+used for interactive runs was added only to the isolated test checkout; it is
+not part of this branch.
