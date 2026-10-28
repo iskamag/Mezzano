@@ -160,7 +160,8 @@ the old or new values are expected to be unbound.")
 ;; TODO: This and FAST-SLOT-WRITE should use the correct slot access function.
 ;; It doesn't really matter though, as instances and funcallable instances
 ;; are all compatible.
-(defun fast-slot-read (instance location slot-definition)
+(defun #+x86-64 fast-slot-read-slow #-x86-64 fast-slot-read
+    (instance location slot-definition)
   (multiple-value-bind (slots layout)
       ;; This is required in case the instance is obsolete.
       (fetch-up-to-date-instance-slots-and-layout instance)
@@ -174,13 +175,65 @@ the old or new values are expected to be unbound.")
                                     (safe-slot-definition-name slot-definition))))
           val))))
 
-(defun fast-slot-write (new-value instance location slot-definition)
+(defun #+x86-64 fast-slot-write-slow #-x86-64 fast-slot-write
+    (new-value instance location slot-definition)
   (declare (ignore slot-definition))
   (multiple-value-bind (slots layout)
       ;; This is required in case the instance is obsolete.
       (fetch-up-to-date-instance-slots-and-layout instance)
     (declare (ignore layout))
     (setf (standard-instance-access slots location) new-value)))
+
+;; Keep the common boxed instance-slot path frameless. Shared slots, obsolete
+;; or superseded instances, and unbound reads retain the Lisp implementation.
+;; R8/R9/R10 (and R11 for writes) are preserved on every slow-path branch.
+;; Only raw offsets live in integer registers; object references stay in value
+;; registers so collection/preemption does not require a restart region.
+#+x86-64
+(sys.int::define-lap-function fast-slot-read ((instance location slot-definition))
+  (:gc :no-frame :incoming-arguments :rcx :layout #*0)
+  (mezzano.lap.x86:cmp64 :rcx 6)
+  (mezzano.lap.x86:jne slow)
+  (mezzano.lap.x86:test64 :r9 1)
+  (mezzano.lap.x86:jnz slow)
+  (mezzano.lap.x86:mov64 :r11 (:object :r8 -1))
+  (mezzano.lap.x86:shr64 :r11 #.sys.int::+object-data-shift+)
+  (mezzano.lap.x86:cmp64 (:object-location :r11 #.sys.int::+layout-new-instance+) nil)
+  (mezzano.lap.x86:jne slow)
+  (mezzano.lap.x86:cmp64 (:object-location :r11 #.sys.int::+layout-obsolete+) nil)
+  (mezzano.lap.x86:jne slow)
+  (mezzano.lap.x86:mov64 :rax :r9)
+  (mezzano.lap.x86:sar64 :rax #.(+ 7 sys.int::+n-fixnum-bits+))
+  (mezzano.lap.x86:mov64 :r11 (:r8 (:rax 8) -1))
+  (mezzano.lap.x86:mov64 :rbx (:symbol-global-cell *secret-unbound-value*))
+  (mezzano.lap.x86:cmp64 :r11 (:object :rbx #.sys.int::+symbol-value-cell-value+))
+  (mezzano.lap.x86:je slow)
+  (mezzano.lap.x86:mov64 :r8 :r11)
+  (mezzano.lap.x86:mov32 :ecx 2)
+  (mezzano.lap.x86:ret)
+  slow
+  (mezzano.lap.x86:jmp (:named-call fast-slot-read-slow)))
+
+#+x86-64
+(sys.int::define-lap-function fast-slot-write ((value instance location slot-definition))
+  (:gc :no-frame :incoming-arguments :rcx :layout #*0)
+  (mezzano.lap.x86:cmp64 :rcx 8)
+  (mezzano.lap.x86:jne slow)
+  (mezzano.lap.x86:test64 :r10 1)
+  (mezzano.lap.x86:jnz slow)
+  (mezzano.lap.x86:mov64 :r12 (:object :r9 -1))
+  (mezzano.lap.x86:shr64 :r12 #.sys.int::+object-data-shift+)
+  (mezzano.lap.x86:cmp64 (:object-location :r12 #.sys.int::+layout-new-instance+) nil)
+  (mezzano.lap.x86:jne slow)
+  (mezzano.lap.x86:cmp64 (:object-location :r12 #.sys.int::+layout-obsolete+) nil)
+  (mezzano.lap.x86:jne slow)
+  (mezzano.lap.x86:mov64 :rax :r10)
+  (mezzano.lap.x86:sar64 :rax #.(+ 7 sys.int::+n-fixnum-bits+))
+  (mezzano.lap.x86:mov64 (:r9 (:rax 8) -1) :r8)
+  (mezzano.lap.x86:mov32 :ecx 2)
+  (mezzano.lap.x86:ret)
+  slow
+  (mezzano.lap.x86:jmp (:named-call fast-slot-write-slow)))
 
 (defun fetch-up-to-date-instance-slots-and-layout (instance)
   (loop

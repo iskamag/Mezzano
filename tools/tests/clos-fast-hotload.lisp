@@ -1,0 +1,16 @@
+;;;; Load only the changed runtime definitions, preserving existing classes.
+(in-package :mezzano.clos)
+(let ((old-fast (class-layout (find-class 'fast-class-hash-table)))
+      (old-single (class-layout (find-class 'single-dispatch-emf-table))))
+  (load "SYS:SOURCE;SYSTEM;CLOS;FAST-CLASS-HASH-TABLE.LISP")
+  (load "SYS:SOURCE;SYSTEM;CLOS;SINGLE-DISPATCH-EMF-TABLE.LISP")
+  (assert (eq old-fast (class-layout (find-class 'fast-class-hash-table))))
+  (assert (eq old-single (class-layout (find-class 'single-dispatch-emf-table)))))
+(with-open-file (s "SYS:SOURCE;SYSTEM;CLOS;CLOSETTE.LISP")
+  (loop for form = (read s nil :eof) until (eq form :eof)
+        when (and (consp form)
+                  (member (car form) '(defun sys.int::define-lap-function))
+                  (member (second form) '(fast-slot-read fast-slot-read-slow
+                                           fast-slot-write fast-slot-write-slow)))
+          do (eval form)))
+(format t "CLOS fast paths hotloaded; structure layouts unchanged.~%")

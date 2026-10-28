@@ -14,7 +14,8 @@
 (sys.int::defglobal *default-fast-class-hash-table-size* 16)
 
 (defstruct (fast-class-hash-table
-             (:constructor make-fast-class-hash-table ()))
+             (:constructor make-fast-class-hash-table ())
+             :slot-locations)
   ;; Table can use one of three possible representation:
   ;; NIL - There are no entries.
   ;; A weak-pointer - There is a single entry. The key is the class and the value is the value.
