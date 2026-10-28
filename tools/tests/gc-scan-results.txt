@@ -1,0 +1,116 @@
+GC scanning and physical-page lookup experiments, 2026-10-28
+
+Environment
+  x86-64 Mezzano, QEMU/KVM, 4 vCPUs, 4 GiB RAM.
+  Started through make serial-kvm, with a temporary qemu wrapper adding
+  -snapshot and -gdb tcp:127.0.0.1:12345. No cold rebuild or layout change.
+  Benchmark: unchanged /home/iskam/boehm-gc.lisp, GC-BENCHMARK at depth 23.
+  Compile/load and explicit full collection are outside the timed interval.
+  Benchmark assertions remained enabled. GDB was detached during timing.
+
+Finding
+  GDB sampled all CPUs and read *GC-IN-PROGRESS* on every stop, rather than
+  counting only stacks containing GC-WORKER. In 3000 randomized stops, 396
+  had GC active. There were 581 non-idle CPU samples during those stops:
+    168 self samples: TLB-SHOOTDOWN-IPI-HANDLER
+    202 inclusive samples: PAGER-THREAD
+    144 inclusive samples: RELEASE-MEMORY-RANGE-IN-PAGER
+    117 inclusive samples: RELEASE-PHYSICAL-PAGES wrapper
+     83 inclusive samples: PHYSICAL-PAGE-EXISTS
+     64 inclusive samples: GC-WORKER
+  These categories overlap and CPUs run concurrently; they are not additive
+  wall-time percentages. Stack walking and nearest-address symbolization are
+  approximate. The raw profile is /tmp/mezzano-gc-samples.json for this session.
+
+  Physical-page release repeatedly searched the boot memory map while checking
+  buddy frames. A validated cache of the last matching map-entry index avoids
+  most linear searches. Only the index is shared; bounds are read afresh, so
+  concurrent hint updates cannot create mismatched start/end pairs.
+
+  Scanner improvements remove generic arithmetic from bounded loops and avoid
+  revisiting immediate/NIL slots. NIL remains an explicit major root, and its
+  mutable fields remain in the minor remembered set. SCAVENGE-OBJECT is inlined
+  only in SCAVENGE-MANY; recursive instance-header handling stays out of line.
+
+Experiments
+  Repeated full collections of a retained Boehm depth-20 tree:
+    original: approximately 3.7 s for five collections
+    scanner + type declarations: approximately 2.9 s
+  This diagnostic exposed scanner costs but overpredicted the benefit for the
+  complete Boehm benchmark, whose minor collections spend much time in paging.
+
+  Scanner/type changes alone, original/candidate/candidate/original:
+    mode         total seconds   GC seconds   minor/major
+    original       72.36           9.49         20/0
+    candidate      72.68           9.00         20/0
+    candidate      73.40           9.43         21/0
+    original       74.24           9.81         21/0
+  Roughly 4.5% less GC time; no clear total-runtime improvement.
+
+  Page-map hint alone (first prototype, with extra arithmetic declarations):
+    candidate      70.98           7.80         22/0
+    original       73.78           9.70         22/0
+  The final page lookup keeps the original numeric semantics and omits those
+  declarations. The combined trials below use that final version.
+
+  Combined changes, same image, candidate/original/candidate/original:
+    candidate      71.14           7.67         23/0
+    original       73.96           9.60         23/0
+    candidate      73.18           7.77         24/0
+    original       76.03          11.61         24/1
+  The matched 23-minor pair gives 20.1% less GC time (25.2% faster) and
+  3.8% less total time. The final original trial also performed a major GC,
+  so its larger GC difference is not a like-for-like speedup measurement.
+
+  Small object-copy special cases and skipping duplicate instance-header
+  scanning did not provide a useful measured gain and were discarded.
+
+Reproducing live A/B comparisons
+  1. Compile/load tools/tests/gc-scan-benchmark.lisp in the original image.
+     (mezzano.gc-scan-benchmark:capture :baseline)
+  2. Compile the changed system/gc.lisp and supervisor/physical.lisp. Load each
+     LLF wired with:
+       (with-open-file (s llf :element-type '(unsigned-byte 8))
+         (mezzano.internals::load-llf s t))
+     (mezzano.gc-scan-benchmark:capture :candidate)
+  3. Compile/load the unchanged Boehm benchmark, then:
+       (mezzano.gc-scan-benchmark:run #'gc-benchmark :depth 23 :pairs 2)
+     This alternates baseline/candidate order and restores the candidate.
+     No other allocating benchmark, test suite, or debugger should run during
+     measurements. Report GC counts alongside times; heap state drifts across
+     trials. Do not extrapolate these results to another workload or RAM size.
+
+Reproducing GDB sampling
+  Load tools/generate-bochs-map-file.lisp and generate a live map to a host-
+  visible file. Wait for generation to finish before starting GDB. For the flag
+  file expected by tools/gc-sample.py, write these two decimal integers:
+    (+ (logand (mezzano.internals::lisp-object-address
+                 (mezzano.internals::%object-ref-t
+                   'mezzano.internals::*gc-in-progress*
+                   mezzano.internals::+symbol-value+)) -16)
+       (* 8 (1+ mezzano.internals::+symbol-value-cell-value+)))
+    (mezzano.internals::lisp-object-address nil)
+  The script's docstring gives the host command and environment variables.
+
+Validation and independent weak-table fix
+  The GC/page changes were validated on the slop integration image with the
+  separate weak NIL-key hash-table fix active. See that branch's
+  tools/tests/weak-hash-nil-results.txt for the bug and regression results.
+  GC-SCAN-TEST:RUN defaults to omitting the NIL plist diagnostic so this branch
+  can be tested independently. With the weak-table fix applied, pass
+  :CHECK-NIL-PLIST T to exercise it as well.
+
+  Native validation: three GC test runs (5 minor and 10 major collections each),
+  including NIL plist roots and a run with transport metering enabled;
+  physical-page boundary/hole/out-of-range checks and 40000 concurrent lookups.
+
+Final fresh-image confirmation (weak-table fix active in both modes)
+  mode         total seconds   TSC ticks      GC seconds  allocated bytes  minor/major
+  baseline       74.05       236503333600        9.63       30064229536       19/0
+  candidate      70.37       224760410464        7.19       30064229536       19/0
+  GC time reduced by 25.3% (1.339x speedup); total time reduced by 5.0%
+  (1.052x speedup). The fixed benchmark helper reports exactly equal allocation
+  bytes and collection counts. This was a single confirmation pair following
+  the earlier alternating trials; it is not a broad workload guarantee.
+  Both implementations coexisted and were selected in the same running image.
+  The candidate and weak-table fix were left active in the running guest.
