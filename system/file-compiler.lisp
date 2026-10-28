@@ -839,6 +839,7 @@ NOTE: Non-compound forms (after macro-expansion) are ignored."
              (*compile-parallel* (and parallel
                                       (or (eql parallel :force)
                                           (> mezzano.supervisor::*n-up-cpus* 1))))
+             (mezzano.compiler::*file-local-inline-forms* (make-hash-table :test 'eq :synchronized t))
              (*deferred-functions* '())
              (*llf-forms* nil)
              (omap (make-hash-table))

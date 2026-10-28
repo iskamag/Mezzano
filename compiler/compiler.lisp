@@ -22,7 +22,8 @@
 Currently disabled by default as it has a severe performance impact.")
 
 (defun compiler-state-bindings ()
-  (let ((symbols '(*should-inline-functions*
+  (let ((symbols '(*file-local-inline-forms*
+                   *should-inline-functions*
                    *perform-tce*
                    *trace-asm*
                    *jump-table-size-min*
