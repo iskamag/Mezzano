@@ -1159,8 +1159,8 @@ This is required to make the GC interrupt safe."
     (t (scan-error object))))
 
 (defun transport-object (object cycle-kind)
-  "Transport LENGTH words from oldspace to newspace, returning
-a pointer to the new object. Leaves a forwarding pointer in place."
+  "Copy OBJECT from oldspace to newspace, preserving its layout.
+Return the new object and leave a forwarding pointer in place."
   (let* ((address (object-base-address object))
          (first-word (memref-t address 0)))
     ;; Check for a GC forwarding pointer.
@@ -1170,29 +1170,14 @@ a pointer to the new object. Leaves a forwarding pointer in place."
       (return-from transport-object
         (%%assemble-value (object-base-address first-word)
                           (%tag-field object))))
-    (when (or (instance-p object)
-              (funcallable-instance-p object))
-      (let* ((layout (%instance-layout object))
-             (new-instance (layout-new-instance layout)))
-        (when new-instance
-          ;; This is an obsolete instance. Don't transport it at all,
-          ;; instead replace it with the updated instance.
-          ;; FIXME: There's a race-condition here.
-          ;; If a one thread is accessing an obsolete instance (because it
-          ;; was superseded partway through the access) then this will
-          ;; update the old instance to point at the new instance and the
-          ;; thread will perform the access on the new instance with the old
-          ;; slot location. Such accesses should be performed in a GC restart
-          ;; region or similar. Or this could be turned off, it's just an
-          ;; optimization.
-          (when (funcallable-instance-p object)
-            ;; Keep the funcallable instance entry point correct.
-            (setf (%object-ref-t new-instance +function-entry-point+)
-                  (%object-ref-t object +function-entry-point+))
-            (setf (%object-ref-t new-instance +funcallable-instance-function+)
-                  (%object-ref-t object +funcallable-instance-function+)))
-          (return-from transport-object
-            (scavenge-object new-instance cycle-kind)))))
+    ;; Do not replace superseded instances with LAYOUT-NEW-INSTANCE here.
+    ;; A stopped thread may already have selected a slot offset for OBJECT's
+    ;; physical layout. Substituting a different instance would resume that
+    ;; access against the wrong layout, including stores into unrelated slots.
+    ;; Copy the original storage and retain its replacement link instead;
+    ;; CLOS resolves that link when starting a new access. This also keeps a
+    ;; pending SUPERSEDE-INSTANCE update attached to the original object.
+    ;; Obsolete storage remains live while the original object is reachable.
     (really-transport-object object cycle-kind)))
 
 (defun allocate-for-transport (object address length)
