@@ -148,6 +148,8 @@
         *the-class-standard-effective-slot-definition* (find-class 'standard-effective-slot-definition)
         *the-class-standard-gf* (find-class 'standard-generic-function)
         *the-layout-standard-generic-function* (primordial-slot-value *the-class-standard-gf* 'slot-storage-layout)
+        *standard-generic-function-emf-table-location*
+        (primordial-slot-location-in-layout *the-layout-standard-generic-function* 'classes-to-emf-table)
         *the-class-standard-method* (find-class 'standard-method)
         *the-layout-standard-method* (primordial-slot-value *the-class-standard-method* 'slot-storage-layout)
         *the-class-standard-reader-method* (find-class 'standard-reader-method)

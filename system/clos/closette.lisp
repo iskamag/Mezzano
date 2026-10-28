@@ -101,6 +101,7 @@ the old or new values are expected to be unbound.")
 (sys.int::defglobal *the-class-t*)
 (sys.int::defglobal *the-class-standard-gf*) ;standard-generic-function's class metaobject
 (sys.int::defglobal *the-layout-standard-generic-function*)
+(sys.int::defglobal *standard-generic-function-emf-table-location*)
 (sys.int::defglobal *the-class-standard-method*)    ;standard-method's class metaobject
 (sys.int::defglobal *the-layout-standard-method*)
 (sys.int::defglobal *the-class-standard-reader-method*)
@@ -695,14 +696,27 @@ the old or new values are expected to be unbound.")
          (class-name class))))
 
 (defun safe-class-precedence-list (class)
-  (cond ((standard-class-instance-p class)
-         (standard-instance-access class *standard-class-precedence-list-location*))
-        ((built-in-class-instance-p class)
-         (standard-instance-access class *built-in-class-precedence-list-location*))
-        ((funcallable-standard-class-instance-p class)
-         (std-slot-value class 'precedence-list))
-        (t
-         (class-precedence-list class))))
+  ;; Keep the layout guard and known-offset read on the same physical object.
+  (when (sys.int::instance-or-funcallable-instance-p class)
+    (let* ((storage (sys.int::%instance-storage class))
+           (layout (sys.int::%storage-layout storage)))
+      (declare (type sys.int::layout layout))
+      (unless (or (sys.int::layout-obsolete layout)
+                  (sys.int::layout-new-instance layout))
+        (cond ((eq layout *the-layout-standard-class*)
+               (return-from safe-class-precedence-list
+                 (sys.int::%storage-ref-t
+                  storage (mezzano.runtime::location-offset-t
+                           (the fixnum *standard-class-precedence-list-location*)))))
+              ((eq layout *the-layout-built-in-class*)
+               (return-from safe-class-precedence-list
+                 (sys.int::%storage-ref-t
+                  storage (mezzano.runtime::location-offset-t
+                           (the fixnum *built-in-class-precedence-list-location*)))))
+              ((eq layout *the-layout-funcallable-standard-class*)
+               (return-from safe-class-precedence-list
+                 (std-slot-value class 'precedence-list)))))))
+  (class-precedence-list class))
 (defun (setf safe-class-precedence-list) (value class)
   (setf (std-slot-value class 'precedence-list) value))
 
@@ -1338,6 +1352,21 @@ Other arguments are included directly."
   (setf (std-slot-value generic-function 'relevant-arguments) value))
 
 (defun classes-to-emf-table (generic-function)
+  ;; Read the authoritative slot on every call-site miss, without searching
+  ;; the standard GF layout by name. Superseded/private layouts take the slow
+  ;; path, and the storage root keeps a selected offset valid across GC.
+  (when (sys.int::funcallable-instance-p generic-function)
+    (let* ((storage (sys.int::%instance-storage generic-function))
+           (layout (sys.int::%storage-layout storage)))
+      (declare (type sys.int::layout layout))
+      (when (and (eq layout *the-layout-standard-generic-function*)
+                 (not (sys.int::layout-obsolete layout))
+                 (not (sys.int::layout-new-instance layout)))
+        (let ((value (sys.int::%storage-ref-t
+                      storage (mezzano.runtime::location-offset-t
+                               (the fixnum *standard-generic-function-emf-table-location*)))))
+          (unless (eq value *secret-unbound-value*)
+            (return-from classes-to-emf-table value))))))
   (std-slot-value generic-function 'classes-to-emf-table))
 (defun (setf classes-to-emf-table) (new-value generic-function)
   (setf (std-slot-value generic-function 'classes-to-emf-table) new-value))
