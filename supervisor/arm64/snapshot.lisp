@@ -1,9 +1,9 @@
 (in-package :mezzano.supervisor)
 
 (defun snapshot-mark-cow-dirty-pages ()
-  (begin-tlb-shootdown)
   ;; Mark all non-wired dirty pages as read-only and set their CoW bits.
-  (labels ((mark-level (pml index next-fn)
+  (let ((prepare-p t))
+    (labels ((mark-level (pml index next-fn)
              ;;(debug-print-line " PML " pml " index " index)
              (let* ((entry (sys.int::memref-unsigned-byte-64 pml index))
                     (next-pml (convert-to-pmap-address
@@ -24,21 +24,24 @@
                  (panic "Page table entry marked CoW when it shouldn't be."))
                (when (logtest entry +arm64-tte-dirty+)
                  (let ((frame (ash (pte-physical-address (sys.int::memref-unsigned-byte-64 pml1 pml1e)) -12)))
-                   (snapshot-add-writeback-frame frame)
-                   ;; Clear dirty and writable bits, set copy-on-write bit.
-                   (setf (sys.int::memref-unsigned-byte-64 pml1 pml1e)
-                         (make-pte frame
-                                   :copy-on-write t)))))))
-    (declare (dynamic-extent #'mark-level
-                             #'mark-pml4e-cow #'mark-pml3e-cow
-                             #'mark-pml2e-cow #'mark-pml1e-cow))
-    (let ((pml4 (convert-to-pmap-address (logand (%ttbr0-el1) (lognot #xFFF)))))
-      ;; Skip wired area, entry 0.
-      (loop for i from 1 below 64 ; pinned area to wired stack area.
-         do (mark-pml4e-cow pml4 i))
-      ;; Skip wired stack area, entry 64.
-      (loop for i from 65 below 256 ; stack area to end of persistent memory.
-         do (mark-pml4e-cow pml4 i))))
-  (flush-tlb)
-  (tlb-shootdown-all)
-  (finish-tlb-shootdown))
+                   (if prepare-p
+                       (snapshot-add-writeback-frame frame)
+                       ;; Peers are excluded when the CoW PTE is published.
+                       (setf (sys.int::memref-unsigned-byte-64 pml1 pml1e)
+                             (make-pte frame :copy-on-write t))))))))
+      (declare (dynamic-extent #'mark-level
+                               #'mark-pml4e-cow #'mark-pml3e-cow
+                               #'mark-pml2e-cow #'mark-pml1e-cow))
+      (let ((pml4 (convert-to-pmap-address (logand (%ttbr0-el1) (lognot #xFFF)))))
+        (flet ((walk ()
+                 ;; Skip wired area, entry 0, and wired stack area, entry 64.
+                 (loop for i from 1 below 64 do (mark-pml4e-cow pml4 i))
+                 (loop for i from 65 below 256 do (mark-pml4e-cow pml4 i))))
+          (declare (dynamic-extent #'walk))
+          ;; Store allocation can refill metadata, so do it before begin.
+          (walk)
+          (setf prepare-p nil)
+          (begin-tlb-shootdown)
+          (walk)
+          (tlb-shootdown-all)
+          (finish-tlb-shootdown))))))

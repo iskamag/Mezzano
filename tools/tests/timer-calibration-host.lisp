@@ -1,0 +1,55 @@
+;;; Run from Mezzano: sbcl --script tools/tests/timer-calibration-host.lisp
+;;; Actual calibration functions with deterministic PIT, TSC and LAPIC clocks.
+(defpackage :sys.int (:use :cl))
+(defpackage :timer-host
+  (:use :cl)
+  (:shadow #:get-internal-run-time #:internal-time-units-per-second))
+(in-package :timer-host)
+(defconstant internal-time-units-per-second 1000)
+(defconstant +lapic-reg-timer-initial-count+ 1)
+(defconstant +lapic-reg-timer-current-count+ 2)
+(defvar *clock* 0)
+(defvar *lapic-start* nil)
+(defvar *cpu-speed* 1000000)
+(defvar *lapic-timer-calibration* 0)
+(defun get-internal-run-time ()
+  (prog1 (* 10 (floor *clock* 10)) (incf *clock*)))
+(defun sys.int::tsc () (* *clock* 1000))
+(defun (setf lapic-reg) (value register)
+  (assert (= register +lapic-reg-timer-initial-count+))
+  (setf *lapic-start* (unless (zerop value) *clock*))
+  value)
+(defun lapic-reg (register)
+  (assert (= register +lapic-reg-timer-current-count+))
+  (assert *lapic-start*)
+  (- #xffffffff (* 10 (- *clock* *lapic-start*))))
+
+(defun load-functions (path names)
+  (with-open-file (in path)
+    (loop for pos = (file-position in)
+          for line = (read-line in nil)
+          while line
+          when (some (lambda (name)
+                       (search (format nil "(defun ~A " name) line)) names)
+            do (file-position in pos) (eval (read in)))))
+(load-functions "supervisor/x86-64/time.lisp"
+                '("wait-for-next-pit-tick" "calibrate-smoothed"
+                  "calibrate-tsc-1" "calibrate-tsc"))
+(load-functions "supervisor/x86-64/cpu.lisp"
+                '("lapic-timer-calibrate-pit" "lapic-timer-calibrate"))
+
+;; Arbitrary initial-boundary waits must not change either measured rate.
+(dotimes (offset 20)
+  (setf *clock* offset)
+  (assert (= (lapic-timer-calibrate-pit) 10000))
+  (assert (null *lapic-start*))
+  (setf *clock* offset)
+  (assert (= (calibrate-tsc-1) 1000000)))
+(let ((samples '(0.0 0.0 0.0 0.0 0.0 32.0)))
+  (assert (= (calibrate-smoothed (lambda () (pop samples))) 16))
+  (assert (null samples)))
+(calibrate-tsc)
+(lapic-timer-calibrate)
+(assert (= *cpu-speed* 1000000))
+(assert (= *lapic-timer-calibration* 10000))
+(format t "Timer calibration passed: 20 boundary phases, stopped LAPIC, six-sample smoothing.~%")

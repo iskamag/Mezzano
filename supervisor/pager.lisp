@@ -28,6 +28,28 @@
 
 (sys.int::defglobal *store-fudge-factor*)
 
+(defconstant +tlb-shootdown-batch-size+ 64)
+
+;; Bound the interval during which peers are held in the shootdown handler.
+(defconstant +pager-tlb-batch-pages+ 256)
+(sys.int::defglobal *pager-tlb-retired-frames*)
+
+(defun tlb-shootdown-single (address)
+  (ensure *tlb-shootdown-in-progress*)
+  (flush-tlb-single address))
+
+(defun tlb-shootdown-range (base length)
+  (ensure *tlb-shootdown-in-progress*)
+  (let ((pages (ceiling length #x1000)))
+    (if (<= pages +tlb-shootdown-batch-size+)
+        (dotimes (i pages)
+          (flush-tlb-single (+ base (* i #x1000))))
+        (flush-tlb))))
+
+(defun tlb-shootdown-all ()
+  (ensure *tlb-shootdown-in-progress*)
+  (flush-tlb))
+
 (defun pager-log (&rest things)
   (declare (dynamic-extent things))
   (when (eql *pager-noisy* t)
@@ -466,6 +488,54 @@ Returns NIL if the entry is missing and ALLOCATE is false."
                  "Range not aligned.")))
   (pager-rpc 'release-memory-range-in-pager base length))
 
+(defun update-memory-range-ptes-in-pager (base length releasep allow-wired stackp)
+  ;; The VM writer excludes fast page faults (which try the reader lock).
+  ;; Scratch storage is wired and shared only while holding that writer lock.
+  (ensure (rw-lock-write-held-p *vm-lock*))
+  (loop for offset from 0 below length by (* +pager-tlb-batch-pages+ #x1000)
+        for start = (+ base offset)
+        for size = (min (- length offset) (* +pager-tlb-batch-pages+ #x1000))
+        for pages = (truncate size #x1000)
+        do
+           (dotimes (i pages)
+             (setf (svref *pager-tlb-retired-frames* i) nil))
+           ;; No allocation or metadata refill may occur between this scan and
+           ;; retirement. With no resident PTEs there are no translations to drop.
+           (when (loop for i below pages
+                       for pte = (get-pte-for-address (+ start (* i #x1000)) nil)
+                       thereis (and pte (page-present-p pte 0)))
+             (begin-tlb-shootdown)
+             (dotimes (i pages)
+               (let* ((address (+ start (* i #x1000)))
+                      (pte (get-pte-for-address address nil)))
+                 (when (and pte (page-present-p pte 0))
+                   (let ((flags (unless releasep
+                                  (block-info-for-virtual-address address))))
+                     (cond ((or releasep
+                                (not (block-info-present-p flags))
+                                (block-info-zero-fill-p flags))
+                            (setf (svref *pager-tlb-retired-frames* i)
+                                  (ash (pte-physical-address (page-table-entry pte 0)) -12)
+                                  (page-table-entry pte 0) 0))
+                           (t
+                            (update-pte pte :writable
+                                        (and (block-info-writable-p flags)
+                                             (not (block-info-track-dirty-p flags))))))))))
+             (tlb-shootdown-range start size)
+             (finish-tlb-shootdown)
+             ;; FINISH acknowledges every peer before any frame can be reused.
+             (dotimes (i pages)
+               (let ((frame (svref *pager-tlb-retired-frames* i)))
+                 (when frame
+                   (release-vm-page frame :allow-wired allow-wired :stackp stackp)
+                   (setf (svref *pager-tlb-retired-frames* i) nil)))))
+           (when releasep
+             ;; Store metadata refill may evict pages. Retire the whole chunk
+             ;; before freeing its backing blocks, so no eviction can write
+             ;; through a block ID that has already been returned to the store.
+             (dotimes (i pages)
+               (release-block-at-virtual-address (+ start (* i #x1000)))))))
+
 (defun release-memory-range-in-pager (base length ignore3)
   (declare (ignore ignore3))
   (pager-log-op "Release range " base "-" (+ base length))
@@ -476,35 +546,9 @@ Returns NIL if the entry is missing and ALLOCATE is false."
                            sys.int::+card-table-entry-size+)))
           (card-length (* (truncate length sys.int::+card-size+)
                           sys.int::+card-table-entry-size+)))
-      (when (not (or stackp
-                     (mark-bit-region-p base)))
-        ;; Release card table pages.
-        (dotimes (i (truncate card-length #x1000))
-          ;; Update block map.
-          (release-block-at-virtual-address (+ card-base (* i #x1000)))
-          ;; Update page tables and release pages if possible.
-          (let ((pte (get-pte-for-address (+ card-base (* i #x1000)) nil)))
-            (when (and pte (page-present-p pte 0))
-              (release-vm-page (ash (pte-physical-address (page-table-entry pte 0)) -12)
-                               :allow-wired t)
-              (setf (page-table-entry pte 0) 0)))))
-      (dotimes (i (truncate length #x1000))
-        ;; Update block map.
-        (release-block-at-virtual-address (+ base (* i #x1000)))
-        ;; Update page tables and release pages if possible.
-        (let ((pte (get-pte-for-address (+ base (* i #x1000)) nil)))
-          (when (and pte (page-present-p pte 0))
-            (release-vm-page (ash (pte-physical-address (page-table-entry pte 0)) -12)
-                             ;; Allow wired stacks to be freed.
-                             :allow-wired stackp :stackp stackp)
-            (setf (page-table-entry pte 0) 0))))
-      (begin-tlb-shootdown)
-      (flush-tlb)
-      (when (not (or stackp
-                     (mark-bit-region-p base)))
-        (tlb-shootdown-range card-base card-length))
-      (tlb-shootdown-range base length)
-      (finish-tlb-shootdown))))
+      (when (not (or stackp (mark-bit-region-p base)))
+        (update-memory-range-ptes-in-pager card-base card-length t t nil))
+      (update-memory-range-ptes-in-pager base length t stackp stackp))))
 
 (defun protect-memory-range (base length flags)
   (assert (and (page-aligned-p base)
@@ -521,37 +565,19 @@ Returns NIL if the entry is missing and ALLOCATE is false."
 (defun protect-memory-range-in-pager (base length flags)
   (pager-log-op "Protect range " base "-" (+ base length) "  " flags)
   (with-rw-lock-write (*vm-lock*)
-    (begin-tlb-shootdown)
+    ;; These metadata writes neither allocate nor free backing store. The
+    ;; writer lock keeps fast faults from restoring the old permission bits.
     (dotimes (i (truncate length #x1000))
       (let* ((address (+ base (* i #x1000)))
              (block-info (or (block-info-for-virtual-address address)
                              (panic "Virtual address " address " not mapped??")))
              (page-flags (logior (logand block-info
-                                         ;; Clear bits.
                                          (lognot (logior sys.int::+block-map-present+
                                                          sys.int::+block-map-writable+
                                                          sys.int::+block-map-track-dirty+)))
                                  flags)))
-        (set-address-flags address page-flags)
-        ;; Update page tables and release pages if possible.
-        (let ((pte (get-pte-for-address address nil)))
-          (when (and pte (page-present-p pte 0))
-            (cond ((or (not (block-info-present-p page-flags))
-                       (block-info-zero-fill-p page-flags))
-                   ;; Page going away, but it's ok. It'll be back, zero-filled.
-                   #+(or)(debug-print-line "  flush page " (+ base (* i #x1000)) "  " (page-table-entry pte 0))
-                   (release-vm-page (ash (pte-physical-address (page-table-entry pte 0)) -12))
-                   (setf (page-table-entry pte 0) 0))
-                  ((and (block-info-writable-p page-flags)
-                        (not (block-info-track-dirty-p page-flags)))
-                   ;; Mark writable.
-                   (update-pte pte :writable t))
-                  (t
-                   ;; Mark read-only.
-                   (update-pte pte :writable nil)))))))
-    (flush-tlb)
-    (tlb-shootdown-all)
-    (finish-tlb-shootdown)))
+        (set-address-flags address page-flags)))
+    (update-memory-range-ptes-in-pager base length nil nil nil)))
 
 (defun update-wired-dirty-bits ()
   (pager-rpc 'update-wired-dirty-bits-in-pager))
@@ -583,7 +609,6 @@ Returns NIL if the entry is missing and ALLOCATE is false."
          ;; dirty bits in the wired area yet.
          #-arm64
          (update-pte pte :dirty nil))))
-    (flush-tlb)
     (tlb-shootdown-all)
     (finish-tlb-shootdown)))
 
@@ -658,8 +683,8 @@ mapped, then the entry will be NIL."
                                                        :dirty t
                                                        :cache-mode cache-mode)))
            (incf virt-offset sg-len))
+      ;; These were previously unmapped; publish them before return.
       (begin-tlb-shootdown)
-      (flush-tlb)
       (tlb-shootdown-range virtual-address virt-offset)
       (finish-tlb-shootdown)))
   t)
@@ -677,6 +702,7 @@ mapped, then the entry will be NIL."
   (pager-log-op "Unmap sg-vec " virtual-address " " sg-vec)
   (with-rw-lock-write (*vm-lock*)
     (let ((virt-offset 0))
+      (begin-tlb-shootdown)
       (loop
          for i below (sys.int::simple-vector-length sg-vec) by 2
          for phys-addr = (svref sg-vec i)
@@ -697,13 +723,13 @@ mapped, then the entry will be NIL."
                 (setf (sys.int::memref-unsigned-byte-64 bme) 0)
                 (when (and pte (page-present-p pte))
                   (setf (page-table-entry pte) 0)))
-           (release-physical-pages (truncate phys-addr #x1000)
-                                   (ceiling sg-len #x1000))
            (incf virt-offset sg-len))
-      (begin-tlb-shootdown)
-      (flush-tlb)
       (tlb-shootdown-range virtual-address virt-offset)
-      (finish-tlb-shootdown)))
+      (finish-tlb-shootdown)
+      ;; The old pages cannot be reused until all translations are gone.
+      (loop for i below (sys.int::simple-vector-length sg-vec) by 2
+            do (release-physical-pages (truncate (svref sg-vec i) #x1000)
+                                       (ceiling (svref sg-vec (1+ i)) #x1000)))))
   t)
 
 (defun pager-allocate-page (&key (new-type :active))
@@ -734,7 +760,6 @@ mapped, then the entry will be NIL."
         (remove-from-page-replacement-list candidate)
         (begin-tlb-shootdown)
         (setf (page-table-entry pte-addr) (make-pte 0 :present nil))
-        (flush-tlb-single candidate-virtual)
         (tlb-shootdown-single candidate-virtual)
         (finish-tlb-shootdown)
         ;; Maybe write it back to disk.
@@ -849,7 +874,6 @@ mapped, then the entry will be NIL."
         (begin-tlb-shootdown)
         (setf (page-table-entry pte) (make-pte (ash (pte-physical-address (page-table-entry pte)) -12)
                                                :writable (block-info-writable-p block-info)))
-        (flush-tlb-single address)
         (tlb-shootdown-single address)
         (finish-tlb-shootdown))
       #+(or)(debug-print-line "WFP " address " block " block-info " already mapped " (page-table-entry pte 0))
@@ -898,7 +922,6 @@ mapped, then the entry will be NIL."
                                              ;; Mark the page dirty to make sure the snapshotter & swap code know to swap it out.
                                              ;; The zero fill flag in the block map was cleared, but the on-disk data doesn't reflect that.
                                              :dirty is-zero-page))
-      (flush-tlb-single address)
       (tlb-shootdown-single address)
       (finish-tlb-shootdown)
       #+(or)
@@ -1122,6 +1145,9 @@ It will put the thread to sleep, while it waits for the page."
     (setf (thread-queue-next *pager-current-thread*) *pager-waiting-threads*
           *pager-waiting-threads* *pager-current-thread*
           *pager-current-thread* nil))
+  (unless (boundp '*pager-tlb-retired-frames*)
+    (setf *pager-tlb-retired-frames*
+          (sys.int::make-simple-vector +pager-tlb-batch-pages+ :wired)))
   (setf *pager-disk-request* (make-disk-request))
   ;; The VM lock is recreated each boot because it is only held by
   ;; the ephemeral pager & snapshot threads or by threads that have

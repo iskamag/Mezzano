@@ -1,0 +1,57 @@
+;;; Run with: sbcl --script tools/tests/pr220-preemption-host.lisp
+;;; Execute the real inhibitor helpers and LAPIC timer handler.
+
+(defpackage :mezzano.supervisor (:use :cl))
+(in-package :mezzano.supervisor)
+
+(defstruct cpu (inhibit-scheduling 0) (preemption-pending nil) (quiesce-deferred nil))
+(defvar *cpu* (make-cpu))
+(defvar *timer-resets* nil)
+(defvar *preemptions* 0)
+(defmacro safe-without-interrupts ((&rest captures) &body body)
+  (declare (ignore captures))
+  `(progn ,@body))
+(defmacro ensure (condition &optional message)
+  `(assert ,condition () ,@(when message `("~A" ,message))))
+(defun local-cpu () *cpu*)
+(defun preemption-timer-reset (remaining)
+  (push remaining *timer-resets*))
+(defun lapic-eoi () nil)
+(defconstant +lapic-reg-timer-current-count+ 0)
+(defun lapic-reg (register)
+  (declare (ignore register))
+  0)
+(defun lapic-timer-active () t)
+(defun maybe-preempt-via-interrupt (frame)
+  (declare (ignore frame))
+  (incf *preemptions*))
+
+(dolist (entry '(("../../supervisor/thread.lisp"
+                  "(defun inhibit-local-cpu-scheduling "
+                  "(defun allow-local-cpu-scheduling ")
+                 ("../../supervisor/x86-64/cpu.lisp"
+                  "(defun lapic-timer-handler ")))
+  (with-open-file (stream (merge-pathnames (first entry) *load-truename*))
+    (loop for position = (file-position stream)
+          for line = (read-line stream nil)
+          while line
+          when (some (lambda (prefix) (search prefix line)) (rest entry))
+            do (file-position stream position)
+               (eval (read stream)))))
+
+(inhibit-local-cpu-scheduling)
+(inhibit-local-cpu-scheduling)
+(lapic-timer-handler nil nil)
+(assert (cpu-preemption-pending *cpu*))
+(assert (= *preemptions* 0))
+(assert (null *timer-resets*))
+(allow-local-cpu-scheduling)
+(assert (= (cpu-inhibit-scheduling *cpu*) 1))
+(assert (null *timer-resets*))
+(allow-local-cpu-scheduling)
+(assert (zerop (cpu-inhibit-scheduling *cpu*)))
+(assert (not (cpu-preemption-pending *cpu*)))
+(assert (equal *timer-resets* '(1)))
+(lapic-timer-handler nil nil)
+(assert (= *preemptions* 1))
+(format t "PASS: inhibited timer expiry retries once without a new timeslice.~%")

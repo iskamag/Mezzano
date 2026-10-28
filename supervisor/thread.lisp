@@ -3,13 +3,14 @@
 (in-package :mezzano.supervisor)
 
 (sys.int::defglobal *global-thread-lock* nil
-  "This lock protects the special variables that make up the thread list/run queues and the thread objects.")
+  "MCS tail for the thread list, run queues, and thread objects. NIL is free.")
 (sys.int::defglobal *supervisor-priority-run-queue*)
 (sys.int::defglobal *high-priority-run-queue*)
 (sys.int::defglobal *normal-priority-run-queue*)
 (sys.int::defglobal *low-priority-run-queue*)
 (sys.int::defglobal *all-threads*)
 (sys.int::defglobal *n-running-cpus*)
+(sys.int::defglobal *mutex-pi-ready* nil)
 
 (sys.int::defglobal *world-stopper*)
 (sys.int::defglobal *pseudo-atomic-thread-count*)
@@ -59,7 +60,20 @@ can be reprotected.")
   (cons-allocation-count 0)
   (cons-fast-path-hits 0)
   (general-allocation-count 0)
-  (general-fast-path-hits 0))
+  (general-fast-path-hits 0)
+  ;; True while this CPU can be woken to look for runnable threads.
+  (idle-p nil)
+  ;; The current thread must stay on this CPU while positive.
+  (inhibit-scheduling 0 :type fixnum)
+  ;; A one-shot preemption event arrived while scheduling was inhibited.
+  (preemption-pending nil)
+  ;; A world-stop IPI arrived while this CPU had to remain on its thread.
+  (quiesce-deferred nil)
+  ;; A quiescing switch has not yet left the old thread's stack.
+  (quiesce-ack-pending nil)
+  ;; The singleton global thread lock uses this CPU as its MCS queue node.
+  (mcs-next nil)
+  (mcs-locked nil))
 
 (defstruct (thread
              (:area :wired)
@@ -176,7 +190,13 @@ can be reprotected.")
   (state-rflags 0 :type (signed-byte 64))
   (state-rsp 0 :type (signed-byte 64))
   ;; Used to save packed fpsr (low half)/fpcr (high half) state on arm64.
-  (state-ss  0 :type (signed-byte 64)))
+  (state-ss  0 :type (signed-byte 64))
+  ;; Keep PI fields after the fixed machine state: ARM LAP encodes several
+  ;; existing thread-slot offsets directly in load/store instructions.
+  ;; :supervisor is an execution domain, never a donated priority.
+  (base-priority :normal :type (member :low :normal :high :supervisor :idle))
+  (owned-mutexes nil)
+  (waiting-mutex nil))
 
 (define-doubly-linked-list-helpers run-queue
     thread-queue-next thread-queue-prev
@@ -228,19 +248,64 @@ can be reprotected.")
   (reg-value thread-state-ss-value  +thread-state-ss+))
 
 ;;; Locking.
+;;; This is the only MCS lock. Other place/symbol spinlocks retain their
+;;; separate implementation because one node per CPU cannot support nesting.
 
 (defun acquire-global-thread-lock ()
-  (acquire-symbol-spinlock *global-thread-lock*))
+  (ensure-interrupts-disabled)
+  (let ((self (local-cpu)))
+    (when (cpu-mcs-locked self)
+      (panic "Global thread lock acquired twice on CPU " self))
+    (setf (cpu-mcs-next self) nil
+          (cpu-mcs-locked self) nil)
+    #+arm64 (%dsb.ish)
+    (let ((previous nil))
+      (loop
+        (setf previous *global-thread-lock*)
+        (when (eq (sys.int::cas (sys.int::symbol-global-value '*global-thread-lock*)
+                                 previous self)
+                  previous)
+          (return)))
+      (if previous
+          (progn
+            (setf (cpu-mcs-next previous) self)
+            #+arm64 (%dsb.ish)
+            (loop until (cpu-mcs-locked self)
+                  do (sys.int::cpu-relax)))
+          (setf (cpu-mcs-locked self) t))
+      #+arm64 (%dsb.ish))
+    (values)))
 
 (defun release-global-thread-lock ()
-  (release-symbol-spinlock *global-thread-lock*))
+  (ensure-interrupts-disabled)
+  (let ((self (local-cpu)))
+    (ensure (cpu-mcs-locked self) "Global thread lock not held by CPU " self)
+    ;; Publish protected writes before making the successor runnable.
+    #+arm64 (%dsb.ish)
+    (unless (cpu-mcs-next self)
+      (when (eq (sys.int::cas (sys.int::symbol-global-value '*global-thread-lock*)
+                               self nil)
+                self)
+        (setf (cpu-mcs-locked self) nil)
+        (return-from release-global-thread-lock (values)))
+      ;; A successor exchanged the tail but has not linked itself yet.
+      (loop until (cpu-mcs-next self)
+            do (sys.int::cpu-relax)))
+    #+arm64 (%dsb.ish)
+    (setf (cpu-mcs-locked (cpu-mcs-next self)) t
+          (cpu-mcs-locked self) nil)
+    #+arm64 (%dsb.ish)
+    (values)))
 
 (defmacro with-global-thread-lock ((&optional) &body body)
-  `(with-symbol-spinlock (*global-thread-lock*)
-     ,@body))
+  `(progn
+     (acquire-global-thread-lock)
+     (unwind-protect
+          (progn ,@body)
+       (release-global-thread-lock))))
 
 (defun ensure-global-thread-lock-held ()
-  (ensure-symbol-spinlock-held *global-thread-lock*))
+  (ensure (cpu-mcs-locked (local-cpu)) "Global thread lock not held"))
 
 ;;; Run queue management.
 
@@ -260,12 +325,31 @@ can be reprotected.")
     (return-from push-run-queue))
   (push-run-queue-1 thread (run-queue-for-priority (thread-priority thread))))
 
+(defun thread-priority-rank (priority)
+  (ecase priority
+    (:idle 0) (:low 1) (:normal 2) (:high 3) (:supervisor 4)))
+
+(defun thread-priority-higher-p (first second)
+  (> (thread-priority-rank first) (thread-priority-rank second)))
+
+(defun set-thread-effective-priority (thread priority)
+  "Move a runnable thread between queues while holding the scheduler lock."
+  (ensure-global-thread-lock-held)
+  (let ((old (thread-priority thread)))
+    (unless (eql old priority)
+      (let ((queued (and (eql (thread-state thread) :runnable)
+                         (run-queue-linked-p thread))))
+        (when queued
+          (run-queue-remove thread (run-queue-for-priority old)))
+        (setf (thread-priority thread) priority)
+        (when queued
+          (push-run-queue thread))))))
+
 (defun pop-run-queue-1 (rq)
   (run-queue-pop-front rq))
 
 (defun pop-run-queue ()
-  ;; FIXME, HACK! Virtio drivers seem to be broken when the run outside the first PE on A64
-  ;; This constrains supervisor threads to just that PE.
+  ;; ARM supervisor threads run on the boot CPU.
   (or (and #+arm64 (eql (local-cpu) *bsp-cpu*)
            (pop-run-queue-1 *supervisor-priority-run-queue*))
       (pop-run-queue-1 *high-priority-run-queue*)
@@ -386,15 +470,45 @@ Interrupts must be off and the global thread lock must be held."
 
 (defun maybe-preempt-via-interrupt (interrupt-frame)
   (let ((current (current-thread)))
-    (acquire-global-thread-lock)
-    (cond ((or (and *world-stopper*
-                    (eql current *world-stopper*))
-               (eql (thread-priority current) :supervisor)
-               (eql current (local-cpu-idle-thread)))
-           (release-global-thread-lock))
+    (cond ((plusp (cpu-inhibit-scheduling (local-cpu)))
+           nil)
           (t
-           (setf (thread-state current) :runnable)
-           (%reschedule-via-interrupt interrupt-frame)))))
+           (acquire-global-thread-lock)
+           (cond ((or (and *world-stopper*
+                           (eql current *world-stopper*))
+                      (eql (thread-priority current) :supervisor)
+                      (eql current (local-cpu-idle-thread)))
+                  (release-global-thread-lock))
+                 (t
+                  (setf (thread-state current) :runnable)
+                  (%reschedule-via-interrupt interrupt-frame)))))))
+
+(defun inhibit-local-cpu-scheduling ()
+  ;; The CPU must not change between selecting it and incrementing the count.
+  (safe-without-interrupts ()
+    (incf (cpu-inhibit-scheduling (local-cpu)))))
+
+(defun allow-local-cpu-scheduling ()
+  (safe-without-interrupts ()
+    (let ((cpu (local-cpu)))
+      (ensure (plusp (cpu-inhibit-scheduling cpu)))
+      (decf (cpu-inhibit-scheduling cpu))
+      (when (and (zerop (cpu-inhibit-scheduling cpu))
+                 (cpu-preemption-pending cpu))
+        (setf (cpu-preemption-pending cpu) nil)
+        ;; Retry promptly without granting a fresh timeslice.
+        (preemption-timer-reset 1))
+      (when (and (zerop (cpu-inhibit-scheduling cpu))
+                 (cpu-quiesce-deferred cpu))
+        (setf (cpu-quiesce-deferred cpu) nil)
+        ;; Delivery waits until interrupts are reenabled by the caller.
+        (send-deferred-quiesce-ipi)))))
+
+(defmacro with-local-cpu-scheduling-inhibited (&body body)
+  `(progn
+     (inhibit-local-cpu-scheduling)
+     (unwind-protect (progn ,@body)
+       (allow-local-cpu-scheduling))))
 
 (defun %%switch-to-thread-via-wired-stack (current-thread sp fp next-thread)
   ;; Save frame pointer.
@@ -445,12 +559,20 @@ Interrupts must be off and the global thread lock must be held."
   (set-current-thread new-thread)
   ;; Restore FPU state.
   (restore-fpu-state new-thread)
-  ;; The global thread lock is dropped by the restore functions, not here.
-  ;; We are still running on the current (old) thread's stack, so cannot
-  ;; allow another CPU to switch on to it just yet.
-  ;; This can only occur when performing a voluntary switch away from
-  ;; a thread with a wired stack - one of the ephemeral supervisor threads.
-  ;; Check if the thread is full-save.
+  ;; A disabled-interrupt caller may still be using the old ephemeral
+  ;; thread's stack. The trampoline first moves to this CPU's private stack.
+  (%%finish-switch-via-cpu-stack new-thread))
+
+(defun %%finish-switch-on-cpu-stack (new-thread)
+  ;; No old thread stack is live here. The private stack belongs to this CPU,
+  ;; and interrupts remain disabled until the restore trampoline completes.
+  (release-global-thread-lock)
+  (let ((cpu (local-cpu)))
+    (when (cpu-quiesce-ack-pending cpu)
+      (setf (cpu-quiesce-ack-pending cpu) nil)
+      ;; The world stopper may run after this acknowledgment: no old thread
+      ;; stack or global thread lock may remain in use.
+      (sys.int::%atomic-fixnum-add-symbol '*non-quiescent-cpus-remaining* -1)))
   (if (thread-full-save-p new-thread)
       (%%restore-full-save-thread new-thread)
       (%%restore-partial-save-thread new-thread)))
@@ -486,6 +608,7 @@ Interrupts must be off and the global thread lock must be held."
     (setf (thread-stack thread) stack
           (thread-self thread) thread
           (thread-priority thread) priority
+          (thread-base-priority thread) priority
           (thread-join-event thread) (make-event :name thread))
     ;; Protect the guard area, making it fully inaccessible.
     (protect-memory-range (stack-base stack) +thread-stack-soft-guard-size+ 0)
@@ -525,7 +648,7 @@ Interrupts must be off and the global thread lock must be held."
     (setf (thread-full-save-p thread) t
           (thread-state thread) :runnable)
     (safe-without-interrupts (thread)
-      (with-symbol-spinlock (*global-thread-lock*)
+      (with-global-thread-lock ()
         (push-run-queue thread)
         ;; Add thread to global thread list.
         (setf (thread-global-prev *all-threads*) thread
@@ -614,11 +737,14 @@ not and WAIT-P is false."
        ;; the system idles. Not needed to be correct, but reduces activity
        ;; when idle.
        (ensure (not (preemption-timer-remaining)))
+       ;; Mark this CPU as idle for directed wakeup.
+       (setf (cpu-idle-p (local-cpu)) t)
        ;; Look for a thread to switch to.
        (acquire-global-thread-lock)
        (setf (thread-state self) :runnable)
        (let ((next (update-run-queue)))
          (cond ((not (eql next self))
+                (setf (cpu-idle-p (local-cpu)) nil)
                 (increment-n-running-cpus)
                 ;; Switch to thread.
                 (%run-on-wired-stack-without-interrupts (sp fp next self)
@@ -648,7 +774,8 @@ not and WAIT-P is false."
          (stack (%allocate-stack stack-size t)))
     (setf (thread-stack thread) stack
           (thread-self thread) thread
-          (thread-priority thread) priority)
+          (thread-priority thread) priority
+          (thread-base-priority thread) priority)
     (reset-ephemeral-thread thread entry-point initial-state priority)
     thread))
 
@@ -708,6 +835,9 @@ not and WAIT-P is false."
     ;; Remove from whatever wait queue too
   (setf (thread-state thread) state
         (thread-priority thread) (or priority :supervisor)
+        (thread-base-priority thread) (or priority :supervisor)
+        (thread-owned-mutexes thread) nil
+        (thread-waiting-mutex thread) nil
         (thread-special-stack-pointer thread) nil
         (thread-wait-item thread) nil
         (thread-pending-footholds thread) '()
@@ -726,7 +856,7 @@ not and WAIT-P is false."
 (defun initialize-threads ()
   (when (not (boundp '*global-thread-lock*))
     ;; First-run stuff.
-    (setf *global-thread-lock* :unlocked)
+    (setf *global-thread-lock* nil)
     (setf *supervisor-priority-run-queue* (make-run-queue :supervisor)
           *high-priority-run-queue* (make-run-queue :high)
           *normal-priority-run-queue* (make-run-queue :normal)
@@ -745,18 +875,24 @@ not and WAIT-P is false."
           (thread-global-next sys.int::*disk-io-thread*) nil
           (thread-global-prev sys.int::*disk-io-thread*) sys.int::*pager-thread*)
     (setf *default-stack-size* (* 1024 1024)))
+  ;; The cold generator supplies the BSP CPU; a restored image must start
+  ;; with an empty lock queue and a fresh node before any thread is runnable.
+  (setf *global-thread-lock* nil
+        (cpu-mcs-next *bsp-cpu*) nil
+        (cpu-mcs-locked *bsp-cpu*) nil)
   (setf *n-running-cpus* 1)
   (reset-ephemeral-thread sys.int::*bsp-idle-thread* #'idle-thread :runnable :idle)
   (reset-ephemeral-thread sys.int::*snapshot-thread* #'snapshot-thread :sleeping :supervisor)
   ;; Don't let the pager run until the paging disk has been found.
   (reset-ephemeral-thread sys.int::*pager-thread* #'pager-thread :sleeping :supervisor)
   (setf (thread-wait-item sys.int::*pager-thread*) "Waiting for paging disk")
-  (reset-ephemeral-thread sys.int::*disk-io-thread* #'disk-thread :runnable :supervisor))
+  (reset-ephemeral-thread sys.int::*disk-io-thread* #'disk-thread :runnable :supervisor)
+  (setf *mutex-pi-ready* t))
 
 (defun wake-thread (thread)
   "Wake a sleeping thread."
   (without-interrupts
-    (with-symbol-spinlock (*global-thread-lock*)
+    (with-global-thread-lock ()
       (wake-thread-1 thread))))
 
 (defun wake-thread-1 (thread)
@@ -911,12 +1047,15 @@ footholds will be reenabled, otherwise footholds will stay inhibited."
                     (let ((wi (thread-wait-item thread)))
                       (when (wait-queue-p wi)
                         (lock-wait-queue wi))
-                      (with-symbol-spinlock (*global-thread-lock*)
+                      (with-global-thread-lock ()
                         (cond ((eql (thread-state thread) :sleeping)
                                ;; Remove the thread from its associated wait-queue.
                                (ensure (wait-queue-p wi)
                                        "Thread " thread " sleeping on non-wait-queue " wi)
                                (remove-from-wait-queue thread wi)
+                               (when (and (mutex-p wi)
+                                          (eql (thread-waiting-mutex thread) wi))
+                                 (mutex-waiter-removed wi thread))
                                (unlock-wait-queue wi)
                                (wake-thread-1 thread)
                                t)
@@ -939,7 +1078,7 @@ footholds will be reenabled, otherwise footholds will stay inhibited."
   (let ((push-cons (sys.int::cons-in-area function nil :wired)))
     (flet ((push-foothold ()
              (safe-without-interrupts (thread push-cons)
-               (with-symbol-spinlock (*global-thread-lock*)
+               (with-global-thread-lock ()
                  (setf (cdr push-cons) (thread-pending-footholds thread)
                        (thread-pending-footholds thread) push-cons)))))
       (cond ((eql thread (current-thread))
@@ -974,7 +1113,7 @@ footholds will be reenabled, otherwise footholds will stay inhibited."
 ;; allow the thread to settle.
 (defun sample-thread-state (thread)
   (safe-without-interrupts (thread)
-    (with-symbol-spinlock (*global-thread-lock*)
+    (with-global-thread-lock ()
       (thread-state thread))))
 
 (defun stop-thread (thread)

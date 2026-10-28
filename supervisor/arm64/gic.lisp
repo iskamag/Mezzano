@@ -20,6 +20,8 @@
 (defconstant +gicd-sgir+ #xF00)
 (defconstant +gicd-cpendsgir+ #xF10)
 (defconstant +gicd-spendsgir+ #xF20)
+(defconstant +gic-sgi-all-but-self+ (ash 1 24))
+(defconstant +gic-sgi-self-only+ (ash 2 24))
 
 ;;; CPU interface registers.
 (defconstant +gicc-ctlr+ #x0000)
@@ -98,18 +100,27 @@
       (setf (svref *gic-irqs* i) (make-irq :platform-number i))))
   ;; Enable the distributor.
   (setf (gic-dist-reg +gicd-ctlr+) 1)
-  (configure-gic-cpu)
-  ;; Unmask our various IPIs
+  (configure-gic-cpu))
+
+(defun configure-gic-cpu ()
+  ;; The SGI target registers are banked. Their read-only target byte
+  ;; identifies this hardware CPU interface, independent of FDT order.
+  (let ((mask (if (= (gic-max-cpu) 1)
+                  ;; Uniprocessor GIC target registers may read as zero.
+                  1
+                  (ldb (byte 8 0) (gic-dist-reg +gicd-itargetsr0+)))))
+    (ensure (and (plusp mask) (zerop (logand mask (1- mask))))
+            "Unsupported GIC CPU target mask")
+    (setf (arm64-cpu-gic-target-mask (local-cpu)) mask))
+  ;; Enable the local CPU.
+  (setf (gic-cpui-reg +gicc-ctlr+) 1)
+  ;; Allow all priority levels.
+  (setf (gic-cpui-reg +gicc-pmr+) #xFF)
+  ;; SGI enable registers are banked; each CPU must unmask its own IPIs.
   (gic-unmask-interrupt +panic-sgi-id+)
   (gic-unmask-interrupt +wakeup-sgi-id+)
   (gic-unmask-interrupt +quiesce-sgi-id+)
   (gic-unmask-interrupt +magic-button-sgi-id+))
-
-(defun configure-gic-cpu ()
-  ;; Enable the local CPU.
-  (setf (gic-cpui-reg +gicc-ctlr+) 1)
-  ;; Allow all priority levels.
-  (setf (gic-cpui-reg +gicc-pmr+) #xFF))
 
 (defun gic-mask-interrupt (vector)
   (ensure (<= 0 vector 1019))
@@ -142,7 +153,8 @@
               ;; nothing, handled later
               nil)
              (#.+magic-button-sgi-id+
-              (magic-button-ipi-handler interrupt-frame))
+              ;; handled after EOI
+              nil)
              (t (debug-print-line "Received unknown SGI " vector))))
           (t
            ;; Normal external IRQ
@@ -154,6 +166,8 @@
     (setf (gic-cpui-reg +gicc-eoir+) iar)
     (cond ((eql vector +quiesce-sgi-id+)
            (quiesce-ipi-handler interrupt-frame))
+          ((eql vector +magic-button-sgi-id+)
+           (magic-button-ipi-handler interrupt-frame))
           (t
            (maybe-preempt-via-interrupt interrupt-frame)))))
 
@@ -174,10 +188,19 @@
 (defun platform-unmask-irq (vector)
   (gic-unmask-interrupt vector))
 
-(defun broadcast-ipi (vector)
+(defun send-ipi-to-all (vector &key including-self)
   (when (boundp '*gic-distributor-base*)
     (%dsb.ishst)
     (setf (gic-dist-reg +gicd-sgir+)
-          (logior (ash 1 24) ; all-but-self
-                  vector)))
+          (logior +gic-sgi-all-but-self+ vector))
+    (when including-self
+      (setf (gic-dist-reg +gicd-sgir+)
+            (logior +gic-sgi-self-only+ vector))))
   nil)
+
+(defun send-ipi-to-cpu (cpu vector)
+  (ensure (plusp (arm64-cpu-gic-target-mask cpu)))
+  (%dsb.ishst)
+  (setf (gic-dist-reg +gicd-sgir+)
+        (logior (ash (arm64-cpu-gic-target-mask cpu) 16)
+                vector)))
