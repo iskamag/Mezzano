@@ -1093,16 +1093,16 @@ Other arguments are included directly."
                                         (safe-class-slots class)))
          (instance-slot-vector
           (make-array (* (length instance-slots) 2)))
-         (layout (sys.int::make-layout
-                  :class class
-                  :hash (safe-class-hash class)
-                  :obsolete nil
-                  :heap-size (compute-class-heap-size class instance-slots)
-                  :heap-layout t
-                  :area (std-slot-value class 'allocation-area)
-                  :instance-slots instance-slot-vector
-                  ;; TODO (should just be self)
-                  :compatible (make-array 0 :area :wired))))
+         (layout (sys.int::finish-compatible-layouts
+                  (sys.int::make-layout
+                   :class class
+                   :hash (safe-class-hash class)
+                   :obsolete nil
+                   :heap-size (compute-class-heap-size class instance-slots)
+                   :heap-layout t
+                   :area (std-slot-value class 'allocation-area)
+                   :instance-slots instance-slot-vector
+                   :compatible (make-array 1 :area :wired)))))
     (loop
        for i from 0 by 2
        for slot in instance-slots
@@ -3758,6 +3758,9 @@ always match."
      for i below (length instance-slots) by 2
      collect (aref instance-slots i)))
 
+(sys.int::defglobal *obsolete-structure-layout-slots*
+    (make-hash-table :synchronized t :weakness :key))
+
 (defun update-instance-for-new-layout (instance)
   (let* ((class (class-of instance))
          (old-potentially-obsolete-layout (sys.int::%instance-layout instance))
@@ -3770,19 +3773,58 @@ always match."
          (added-slots (set-difference new-layout-slots old-layout-slots))
          (discarded-slots (set-difference old-layout-slots new-layout-slots))
          (new-instance (allocate-instance class))
-         (property-list '()))
+         (property-list '())
+         (old-structure-slots (gethash old-layout *obsolete-structure-layout-slots*)))
     ;; The complicated bit.
     ;; Slots have been added or removed.
     ;; Copy slots that were not added/discarded.
     (loop
        for slot in (intersection new-layout-slots old-layout-slots)
-       do
-         (setf (mezzano.runtime::instance-access new-instance (slot-location-using-layout slot new-layout))
-               (mezzano.runtime::instance-access old-instance (slot-location-using-layout slot old-layout))))
+       do (let* ((old-slot (find slot old-structure-slots :key #'slot-definition-name))
+                 (new-slot (and old-structure-slots
+                                (find slot (class-slots class) :key #'slot-definition-name)))
+                 (old-length (and old-slot (structure-slot-definition-fixed-vector old-slot)))
+                 (new-length (and new-slot (structure-slot-definition-fixed-vector new-slot)))
+                 (old-location (slot-location-using-layout slot old-layout))
+                 (new-location (slot-location-using-layout slot new-layout)))
+            (when (and old-length (zerop old-length) (not new-length))
+              ;; A zero-length vector has no value to copy into a scalar.
+              (let* ((recipe (std-slot-value class 'definition-recipe))
+                     (initializer (cdr (assoc slot (getf recipe :initializers))))
+                     (value (if initializer (funcall initializer)
+                                (eval (slot-definition-initform new-slot)))))
+                (unless (typep value (slot-definition-type new-slot))
+                  (error "The value ~S for slot ~S is not of type ~S."
+                         value slot (slot-definition-type new-slot)))
+                (setf (mezzano.runtime::instance-access new-instance new-location) value)))
+            (when (and new-length (> new-length (or old-length 1)))
+              (let* ((recipe (std-slot-value class 'definition-recipe))
+                     (initializer (cdr (assoc slot (getf recipe :initializers))))
+                     (value (if initializer (funcall initializer)
+                                (eval (slot-definition-initform new-slot)))))
+                (unless (typep value (slot-definition-type new-slot))
+                  (error "The value ~S for slot ~S is not of type ~S."
+                         value slot (slot-definition-type new-slot)))
+                (loop for i from (or old-length 1) below new-length
+                      do (setf (mezzano.runtime::instance-access new-instance new-location i) value))))
+            (dotimes (i (min (or old-length 1) (or new-length 1)))
+              (let ((value (mezzano.runtime::instance-access old-instance old-location i)))
+                (when (and new-slot (not (typep value (slot-definition-type new-slot))))
+                  (error "The old value ~S for slot ~S is not of type ~S."
+                         value slot (slot-definition-type new-slot)))
+                (setf (mezzano.runtime::instance-access new-instance new-location i) value)))))
     ;; Assemble the list of discarded values.
     (loop
        for slot in discarded-slots
-       do (let ((value (mezzano.runtime::instance-access old-instance (slot-location-using-layout slot old-layout))))
+       do (let* ((old-slot (find slot old-structure-slots :key #'slot-definition-name))
+                 (fixed (and old-slot (structure-slot-definition-fixed-vector old-slot)))
+                 (location (slot-location-using-layout slot old-layout))
+                 (value (if fixed
+                            (let ((vector (make-array fixed)))
+                              (dotimes (i fixed)
+                                (setf (aref vector i) (mezzano.runtime::instance-access old-instance location i)))
+                              vector)
+                            (mezzano.runtime::instance-access old-instance location))))
             (when (not (eql value *secret-unbound-value*))
               (setf property-list (list* slot value
                                          property-list)))))

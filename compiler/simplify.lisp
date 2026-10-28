@@ -1162,7 +1162,7 @@ First return value is a list of elements, second is the final dotted component (
                  :key #'mezzano.clos:slot-definition-name)))))
 
 (defun struct-type-test-form (object struct)
-  (if (mezzano.clos:class-sealed struct)
+  (if (sys.int::structure-layout-permanent-p struct)
       `(if (call sys.int::%value-has-tag-p ,object ',sys.int::+tag-object+)
            (call sys.int::%fast-instance-layout-eq-p
                  ,object

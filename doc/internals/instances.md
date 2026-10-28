@@ -30,6 +30,28 @@ It's a `sealed` structure-object allocated in the `wired` area with the followin
 * `HEAP-LAYOUT` - Used by the GC to know which words of the object contain Lisp values and which contain unboxed data. Either `NIL` meaning no values, `T` meaning all words contain values to be scanned, or a `SIMPLE-BIT-VECTOR` the size of the object with a `1` bit indicating that word contains a Lisp value.
 * `AREA` - Allocation area in which the object should be allocated.
 * `INSTANCE-SLOTS` - A `SIMPLE-VECTOR` containing two adjacent entries per slot in the instance. The first entry is the name of the slot, the second entry is the `location` of the slot in the instance.
+* `COMPATIBLE` - A wired `SIMPLE-VECTOR` used for direct structure slot access.
+  A structure layout records itself followed by its ancestor layouts, in
+  order; a normal standard-object layout records only itself. A copied layout
+  for a superseded instance shares the original vector.
+
+Compatibility vectors describe storage, not just class membership. A direct
+access must reject a superseded instance or any obsolete layout along the path
+to the target layout. Structure `TYPEP` checks fall back to the class parent
+chain for those stale paths; a complete, current vector without the target is
+a fast negative result. When a structure's inheritance changes without a
+storage change, it and its descendants keep their layouts and receive new
+compatibility vectors.
+
+When inherited slots change, structure definitions retain enough information
+to rebuild their descendants' effective slots and layouts. The old layouts are
+marked obsolete, and their slot metadata is kept until old instances have been
+collected. Migration copies fixed-vector elements as well as scalar slots.
+Constructors carry a version token so saved or inlined constructors can use a
+slow path after their class changes; current constructors keep a fast check.
+A sealed structure that includes an unsealed parent can still acquire a new
+layout when that parent changes, so its compiled accesses must check for an
+obsolete layout.
 
 Layouts are allocated in the `wired` area since they are used by the GC. Allowing them to be movable would complicate the GC.
 
@@ -93,6 +115,19 @@ The GC is aware of instances and obsolete instances. When it tries to transport 
 ## Structures
 
 Since structure objects are also implemented using instances they get class redefinition effectively "for free", unlike most other Common Lisp implementations.
+
+When a structure's included parent changes, its direct-subclass links, its
+descendants' class precedence lists, and their layout compatibility vectors are
+updated. Structure direct slots exclude slots inherited from the parent.
+Cached generic-function and initarg information for the affected
+classes is invalidated. Compiled type checks fall back to the current class
+hierarchy for obsolete layouts, while compiled slot accesses use the checked
+access path. Cyclic inheritance and incompatible descendant slot definitions
+are rejected before the class graph changes. Other inherited-slot changes
+rebuild descendant metadata, layouts, and affected constructor functions.
+As with standard-class redefinition, these updates are not atomic with
+respect to concurrent use of the affected classes. Callers must arrange for
+other threads using those classes to be quiescent during redefinition.
 
 ## Tricky nonsense for unnecessary optimization
 

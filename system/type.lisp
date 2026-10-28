@@ -909,6 +909,13 @@
                ,writer-form)))))))
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
+(defun structure-layout-permanent-p (class)
+  ;; A sealed structure cannot be redefined, but an unsealed included
+  ;; structure can still change its layout.  A sealed root is permanent.
+  (and (mezzano.clos:class-sealed class)
+       (let ((parent (second (mezzano.clos:class-precedence-list class))))
+         (or (null parent) (eq (class-name parent) 'structure-object)))))
+
 (defun compile-typep-expression (object type-specifier)
   (let ((type-symbol (cond ((symbolp type-specifier)
                             type-specifier)
@@ -945,7 +952,7 @@
           (object-sym (gensym "OBJECT")))
       (when struct-type
         (return-from compile-typep-expression
-          (if (mezzano.clos:class-sealed struct-type)
+          (if (structure-layout-permanent-p struct-type)
               `(let ((,object-sym ,object))
                  (and (%value-has-tag-p ,object-sym ,+tag-object+)
                       (%fast-instance-layout-eq-p
@@ -959,7 +966,9 @@
                         ,object-sym
                         ',(mezzano.runtime::%make-instance-header
                            (mezzano.clos:class-layout struct-type))))
-                   (structure-layout-compatible-p
+                   ;; On a stale path this checks class membership; a current
+                   ;; vector that does not contain the layout is a fast miss.
+                   (structure-layout-typep
                     ,object-sym
                     ',(mezzano.clos:class-layout struct-type)))))))))
   (when (eql type-specifier 'sequence)
