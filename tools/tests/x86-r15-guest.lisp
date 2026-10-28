@@ -91,6 +91,50 @@
     (assert (= (+ (cdr a) (cdr b) (cdr c) (cdr d)
                   (cdr e) (cdr f) (cdr g) (cdr h)) 36))))
 
+(defun x86-r15-mv-call (producer receiver)
+  (declare (optimize (speed 3) (safety 0) (debug 0))
+           (type function producer receiver))
+  ;; Keep the receiver across the producer call, forcing a saved R15 next to
+  ;; the outgoing stack arguments. Return all values to exercise the
+  ;; MULTIPLE-VALUE-FUNCALL-MULTIPLE-INSTRUCTION path.
+  (multiple-value-call receiver (funcall producer)))
+
+(mezzano.internals::define-lap-function x86-r15-mv-probe ((producer receiver))
+  ;; Call the compiled helper directly: a compiled adapter could restore R15
+  ;; itself and hide the overwrite. Preserve our own caller's R15 separately.
+  (:gc :no-frame :layout #*0)
+  (mezzano.lap.x86:push :rbp)
+  (:gc :no-frame :layout #*00)
+  (mezzano.lap.x86:mov64 :rbp :rsp)
+  (:gc :frame)
+  (mezzano.lap.x86:sub64 :rsp 16)
+  (mezzano.lap.x86:mov64 (:stack 0) :r15)
+  (:gc :frame :layout #*1)
+  (mezzano.lap.x86:mov64 :r15 #.(ash 12345 mezzano.internals::+n-fixnum-bits+))
+  (mezzano.lap.x86:mov64 :rcx #.(ash 2 mezzano.internals::+n-fixnum-bits+))
+  (mezzano.lap.x86:call (:named-call x86-r15-mv-call))
+  (mezzano.lap.x86:mov64 :r8 :r15)
+  (mezzano.lap.x86:mov64 :r15 (:stack 0))
+  (mezzano.lap.x86:mov64 :rcx #.(ash 1 mezzano.internals::+n-fixnum-bits+))
+  (mezzano.lap.x86:leave)
+  (:gc :no-frame :layout #*0)
+  (mezzano.lap.x86:ret))
+
+(defun run-x86-r15-mv-call-regression ()
+  (dolist (count '(0 1 5 6 7 8 9 10 16 17))
+    (let* ((expected (loop for i below count collect i))
+           (producer (lambda () (values-list expected)))
+           (receiver
+             (lambda (&rest arguments)
+               (assert (equal arguments expected))
+               (values-list arguments)))
+           (result (x86-r15-mv-probe producer receiver)))
+      (assert (eql result 12345)
+              () "MULTIPLE-VALUE-CALL with ~D arguments corrupted R15: ~S"
+              count result)
+      (assert (equal (multiple-value-list (x86-r15-mv-call producer receiver)) expected))))
+  t)
+
 (defun run-x86-r15-regressions ()
   (flet ((probe (name thunk)
            (mezzano.supervisor:debug-print-line "R15 BEGIN " name)
@@ -99,6 +143,8 @@
                           (eql (cdr result) 12345))))
            (mezzano.supervisor:debug-print-line "R15 PASS " name)))
     (probe :calls #'x86-r15-stress-calls)
+    (run-x86-r15-mv-call-regression)
+    (mezzano.supervisor:debug-print-line "R15 PASS MULTIPLE-VALUE-CALL")
     (probe :multiple-values
            (lambda ()
              (multiple-value-bind (a b c d e f g)

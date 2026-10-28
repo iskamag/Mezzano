@@ -818,7 +818,9 @@
             `(lap:add64 :rdi 8)
             `(lap:add64 :rsi 8)
             `(lap:sub64 :rax 8)
-            `(lap:jae ,loop-head)
+            ;; Stop at zero: another copy would overwrite the caller's frame
+            ;; when the outgoing arguments need no alignment padding.
+            `(lap:ja ,loop-head)
             loop-exit)
       ;; All done with the MV area.
       (emit-gc-info :pushed-values -5 :pushed-values-register :rcx))
