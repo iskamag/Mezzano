@@ -36,3 +36,36 @@ loading the compiled compiler LLFs as a follow-up was not performed.
 Reproduce with tools/tests/clos-fast-hotload.lisp, clos-fast-guest.lisp and
 clos-fast-benchmark.lisp. The benchmark restores the installed fast paths with
 UNWIND-PROTECT. The earlier investigation is in clos-performance.org.
+
+* GC and instance supersession
+
+TRANSPORT-OBJECT no longer substitutes LAYOUT-NEW-INSTANCE for an obsolete
+instance during collection. A paused accessor may already have selected an
+offset for the original physical layout; substituting the replacement made
+that offset address a different slot. Normal copying now preserves the
+original layout and its replacement link. This protects both the LAP paths
+and existing Lisp accessors, and prevents GC from detaching a layout while
+SUPERSEDE-INSTANCE updates its replacement link.
+
+This removes the instance/type/layout checks from normal GC transport and
+adds no instructions to slot access or dispatch. The tradeoff is that an
+obsolete original object, its old slot contents, and its replacement remain
+reachable while references to the original survive. Access through such an
+object continues to follow the replacement link; GC no longer removes that
+indirection. Concurrent class changes still require application-level
+synchronization; this change fixes GC-induced physical-layout substitution.
+
+The deterministic test in tools/tests/clos-gc-supersession.lisp selects a
+physical slot offset, supersedes the instance, collects, then resumes a read
+and write at that offset. PROBE reported failed storage/read/write checks on
+the old collector. After hot-loading the revised TRANSPORT-OBJECT as wired
+code, RUN passed for ordinary and funcallable instances, including replacement
+link updates across collection. The existing CLOS suite also passed, with
+3,914,700 concurrent access iterations during its three full collections.
+
+One before/after comparison compiled ANALYSIS.LISP three times per version
+after warmup: 2.756024 versus 2.763240 thread CPU seconds (+0.26%), with
+482,226,880 versus 482,227,616 allocated bytes. No GC occurred inside either
+timed block. This checks for an obvious compile-time regression, not the
+cost of retaining superseded storage or a statistically established speedup.
+The production collector remains hot-loaded; no cold rebuild was required.

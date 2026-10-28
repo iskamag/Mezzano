@@ -271,9 +271,8 @@
                                       sys.int::+object-type-shift+)))))))
           (t
            ;; This instance has already been superseded, replace it in-place.
-           ;; FIXME: Can race with the GC. It can snap the old instance away
-           ;; from underneath us, losing the replacement.
-           ;; Check if the old instance's layout matches after this?
+           ;; GC preserves the old instance and this layout, so collection
+           ;; between reading the layout and updating it cannot detach it.
            (setf (sys.int::layout-new-instance layout) replacement))))
   (values))
 

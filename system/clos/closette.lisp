@@ -221,7 +221,8 @@ the old or new values are expected to be unbound.")
 ;; or superseded instances, and unbound reads retain the Lisp implementation.
 ;; R8/R9/R10 (and R11 for writes) are preserved on every slow-path branch.
 ;; Only raw offsets live in integer registers; object references stay in value
-;; registers so collection/preemption does not require a restart region.
+;; registers. GC preserves each instance's physical layout, including after
+;; supersession, so it cannot invalidate an offset selected before collection.
 #+x86-64
 (sys.int::define-lap-function fast-slot-read ((instance location slot-definition))
   (:gc :no-frame :incoming-arguments :rcx :layout #*0)
