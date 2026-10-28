@@ -1,0 +1,38 @@
+#+TITLE: CLOS fast-path improvement
+#+DATE: 2026-10-28
+
+The x86-64 instance-dispatch and boxed slot-access paths now use short LAP
+routines. Instance layout extraction and class-cache probing are fused into a
+single frameless routine. Slot reads and writes directly check layout currency
+and access the boxed value. Built-in dispatch, superseded instances, shared
+slots and unbound slots retain the original Lisp implementations. No cache
+representation or structure layout changed; :slot-locations only generates
+constants for assembly addressing. Non-x86 targets retain the Lisp definitions.
+
+Measured by compiling two unchanged Mezzano source files in the running image.
+The final A/B swapped the installed LAP implementations against the retained
+original Lisp bodies, alternated order, and excluded warmup and pre-block GC.
+No GC occurred in these measured blocks. Values are median thread CPU seconds
+per compilation; allocation was effectively unchanged.
+
+| compiler/backend source | original seconds | fast seconds | reduction |
+|-------------------------+------------------+--------------+-----------|
+| ANALYSIS.LISP | 1.0027 | 0.9453 | 5.7% |
+| CFG.LISP | 0.5944 | 0.5456 | 8.2% |
+
+Earlier prototype measurements showed 9.9% and 8.6% reductions respectively;
+the table above uses the final source implementation. Host scheduling/frequency
+changes affect absolute timings, so compare the interleaved pairs rather than
+numbers from different runs. Raw output is in tools/tests/clos-fast-results.txt.
+
+The production definitions are hot-loaded and left active. Regression checks
+passed for cache hits/misses, collisions/tombstones, cache clearing, built-ins,
+shared/unbound/typed slots, method changes, class redefinition, CHANGE-CLASS,
+funcallable instances and concurrent access during three full GCs (3,813,610
+iterations). Structure identity checks confirmed no layout migration on load.
+No cold rebuild was performed. Further testing was stopped at the user's request;
+loading the compiled compiler LLFs as a follow-up was not performed.
+
+Reproduce with tools/tests/clos-fast-hotload.lisp, clos-fast-guest.lisp and
+clos-fast-benchmark.lisp. The benchmark restores the installed fast paths with
+UNWIND-PROTECT. The earlier investigation is in clos-performance.org.
