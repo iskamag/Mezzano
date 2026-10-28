@@ -36,6 +36,7 @@
    mezzano.compiler::simplify-dcas-struct-slot mezzano.compiler::simplify-struct-vector-slot
    mezzano.compiler::simplify-setf-struct-vector-slot mezzano.compiler::simplify-cas-struct-vector-slot))
 (clos-extract-definitions "SYS:SOURCE;RUNTIME;INSTANCE.LISP" "REMOTE:/tmp/clos-cost/location-hotload.lisp" :mezzano.runtime '(mezzano.runtime::location-offset-t))
+(clos-extract-definitions "SYS:SOURCE;SYSTEM;ARRAY.LISP" "REMOTE:/tmp/clos-cost/array-hotload.lisp" :mezzano.internals '(mezzano.internals::aref-1))
 (let ((*package* (find-package :mezzano.compiler)))
   (with-open-file (in "SYS:SOURCE;COMPILER;TRANSFORMS.LISP")
     (loop for form = (read in nil :eof) until (eq form :eof)
@@ -50,10 +51,25 @@
 (clos-extract-definitions "SYS:SOURCE;SYSTEM;CLOS;CLOSETTE.LISP" "REMOTE:/tmp/clos-cost/clos-hotload.lisp" :mezzano.clos
  '(mezzano.clos::standard-instance-access mezzano.clos::with-current-instance-storage
    class-of mezzano.clos::accessor-cache-cell mezzano.clos::write-cached-slot mezzano.clos::read-cached-slot
+   mezzano.clos::make-slot-value-reader mezzano.clos::make-slot-value-writer
+   mezzano.clos::slot-value-cache-cell
    mezzano.clos::read-accessor-entry mezzano.clos::write-accessor-entry
    mezzano.clos::compute-reader-discriminator mezzano.clos::compute-writer-discriminator
    mezzano.clos::compute-1-effective-discriminator mezzano.clos::slow-single-dispatch-method-lookup*
    mezzano.clos::slow-single-dispatch-method-lookup mezzano.clos::fetch-up-to-date-instance-slots-and-layout))
+(let ((*package* (find-package :mezzano.clos)))
+  (with-open-file (in "SYS:SOURCE;SYSTEM;CLOS;CLOSETTE.LISP")
+    (loop for form = (read in nil :eof) until (eq form :eof)
+          when (and (consp form) (eq (car form) 'define-compiler-macro)
+                    (member (second form) '(slot-value (setf slot-value)) :test #'equal))
+            do (eval form))))
+;; Existing compiled callers keep their old load-time constants until recompiled.
+;; Refresh the linked-list helpers used heavily by the compilation benchmark.
+(clos-extract-definitions "SYS:SOURCE;COMPILER;BACKEND;BACKEND.LISP" "REMOTE:/tmp/clos-cost/backend-links-hotload.lisp" :mezzano.compiler.backend
+ '(mezzano.compiler.backend::first-instruction mezzano.compiler.backend::last-instruction
+   mezzano.compiler.backend::next-instruction mezzano.compiler.backend::prev-instruction
+   mezzano.compiler.backend::insert-before mezzano.compiler.backend::insert-after
+   mezzano.compiler.backend::append-instruction mezzano.compiler.backend::remove-instruction))
 (let ((seen (make-hash-table :test 'eq)) (gfs nil))
  (do-all-symbols (symbol)
   (dolist (name (list symbol (list 'setf symbol)))

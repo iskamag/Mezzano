@@ -822,6 +822,14 @@
   (cas (%row-major-aref array (apply #'array-row-major-index array subscripts)) old new))
 
 (defun aref-1 (array index)
+  ;; The flat representation establishes rank and exposes the dimension in
+  ;; its header. Avoid rediscovering both through the general array interface.
+  (when (%simple-1d-array-p array)
+    (%bounds-check array index)
+    (return-from aref-1
+      (if (eql (%object-tag array) +object-tag-array-t+)
+          (%object-ref-t array index)
+          (%simple-array-aref array index))))
   (check-type index integer)
   (unless (= (array-rank array) 1)
     (error "Invalid number of indices to array ~S." array))
@@ -832,6 +840,12 @@
   (%row-major-aref array index))
 
 (defun (setf aref-1) (value array index)
+  (when (%simple-1d-array-p array)
+    (%bounds-check array index)
+    (return-from aref-1
+      (if (eql (%object-tag array) +object-tag-array-t+)
+          (setf (%object-ref-t array index) value)
+          (setf (%simple-array-aref array index) value))))
   (check-type index integer)
   (unless (= (array-rank array) 1)
     (error "Invalid number of indices to array ~S." array))
@@ -842,6 +856,10 @@
   (setf (%row-major-aref array index) value))
 
 (defun (cas aref-1) (old new array index)
+  (when (%simple-1d-array-p array)
+    (%bounds-check array index)
+    (return-from aref-1
+      (cas (%simple-array-aref array index) old new)))
   (check-type index integer)
   (unless (= (array-rank array) 1)
     (error "Invalid number of indices to array ~S." array))
