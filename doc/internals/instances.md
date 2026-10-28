@@ -52,6 +52,10 @@ slow path after their class changes; current constructors keep a fast check.
 Small standard keyword constructors are declared inline by default so known
 keyword calls can avoid building and scanning an argument list. A local
 `NOTINLINE` declaration still requests an ordinary call.
+When compiling a separate file, an imported constructor expansion containing
+an uninterned version token remains a named call: serializing a copy of that
+token would break redefinition checks. Definitions in the current file can
+share their original token and still inline.
 A sealed structure that includes an unsealed parent can still acquire a new
 layout when that parent changes, so its compiled accesses must check for an
 obsolete layout.

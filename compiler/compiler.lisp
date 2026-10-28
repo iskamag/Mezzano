@@ -26,7 +26,8 @@ Binding this to NIL affects newly compiled code, not the calling convention.")
 Currently disabled by default as it has a severe performance impact.")
 
 (defun compiler-state-bindings ()
-  (let ((symbols '(*should-inline-functions*
+  (let ((symbols '(*file-local-inline-forms*
+                   *should-inline-functions*
                    *perform-tce*
                    *use-x86-r15*
                    *trace-asm*
