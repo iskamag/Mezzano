@@ -534,6 +534,11 @@
     (setf (env:cross-symbol-value environment 'mezzano.runtime::*structure-class-layout*)
           (primordial-slot-value (env:find-environment-class environment 'structure-class)
                                  (env:translate-symbol environment 'mezzano.clos::slot-storage-layout)))
+    ;; Constructors run before INITIALIZE-CLOS during cold startup.
+    (setf (env:cross-symbol-value environment 'mezzano.runtime::*structure-class-slot-storage-layout-location*)
+          (primordial-slot-location-in-layout
+           (env:cross-symbol-value environment 'mezzano.runtime::*structure-class-layout*)
+           (env:translate-symbol environment 'mezzano.clos::slot-storage-layout)))
     (let ((unbound (env:make-structure environment 'mezzano.runtime::unbound-value :tag :unbound-slot)))
       (setf (env:cross-symbol-value environment 'mezzano.clos::*secret-unbound-value*)
             unbound)

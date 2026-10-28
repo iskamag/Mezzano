@@ -3,6 +3,8 @@
 (in-package :mezzano.runtime)
 
 (sys.int::defglobal *structure-class-layout*) ; layout of structure-class instances
+;; Initialized by the cold generator, before cold toplevel constructors run.
+(sys.int::defglobal *structure-class-slot-storage-layout-location*)
 
 (defun structure-class-p (object)
   ;; If the object's layout is structure-class's slot layout,
@@ -268,7 +270,9 @@
   (when (symbolp structure-class)
     (setf structure-class (find-class structure-class)))
   (assert (structure-class-p structure-class))
-  (let ((layout (instance-access-by-name structure-class 'mezzano.clos::slot-storage-layout)))
+  ;; Cache the location, not the layout: redefining a structure replaces its
+  ;; slot-storage-layout, but structure-class itself cannot be reinitialized.
+  (let ((layout (instance-access structure-class *structure-class-slot-storage-layout-location*)))
     (sys.int::%allocate-instance layout)))
 
 (defun %copy-structure-slow (structure class new)
