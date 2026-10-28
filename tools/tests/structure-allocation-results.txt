@@ -47,3 +47,58 @@ An older unrelated image could not provide a valid baseline. Its version-36
 LLFs also caused a documented version mismatch on this version-37 build.
 229 stale LLFs were moved aside to /tmp/mezzano-perf-stale-llf36 (not deleted).
 No make clean was used; no structure layout changed.
+
+Follow-up: direct read of the cached Lisp-value slot
+--------------------------------------------------
+The slot representation is fixed as well as its location. Replacing generic
+INSTANCE-ACCESS with %OBJECT-REF-T and LOCATION-OFFSET-T removes representation
+dispatch. Four alternating pairs in the same guest:
+
+Pair  Generic cached seconds  Direct seconds
+0     4.97                    4.32       (warmup; discard)
+1     5.18                    4.37
+2     5.28                    4.59
+3     5.14                    4.63
+
+All samples again allocate 3,355,179,104 bytes, with 1 minor and 0 major GCs.
+Median paired elapsed reduction: 13.1%. Do not multiply separate experiments'
+ratios as a substitute for a combined comparison; host timings drift.
+Direct profile: MAKE-NODE 33.7%, %ALLOCATE-INSTANCE 26.7%, low-level bump
+allocator 13.4%; INSTANCE-ACCESS / LOCATION-TYPE no longer sampled.
+The exact source function was hot-loaded with default compiler policy and
+all three regression suites passed after reloading their initial definitions.
+The layout suite mutates its static classes and cannot simply be called twice
+without reloading those definitions; doing so fails its obsolete-layout test.
+
+A separate experiment replacing %ALLOCATE-INSTANCE's two layout checks with
+one explicit CHECK-TYPE and optimized reads showed only ~1% median paired
+improvement, so it was not applied. Original helper restored automatically.
+
+Evidence: jobs 46139b291b384c87be2395114e441890 (direct-read comparison),
+a2f6150e15914e8b9897641711937315 (reloaded regressions),
+0611a1ee447640f9a924f74ae91a021a (single-check experiment).
+/tmp/mezzano-perf-direct-profile.txt
+/tmp/mezzano-perf-instance-gdb.txt
+/tmp/mezzano-perf-make-node-disassembly.txt
+Final direct-read cold build and boot passed: 47.93 s cold startup, 2.51 s GC,
+snapshot completed. After reboot all three regression suites passed again
+(job 5ba30a3c18a641efa54f9545c56df552). Cold boot log:
+/tmp/mezzano-perf-direct-cold-boot.log. Image now running:
+/tmp/mezzano-perf-direct-cold.image, same serial socket and GDB port.
+
+Final combined comparison on that freshly booted image (pair 0 discarded):
+Pair  Original name lookup  Final direct cached read
+1     6.27 s               4.72 s
+2     6.28 s               4.77 s
+3     6.30 s               4.77 s
+Median elapsed reduction: 24.0%; identical 3,355,179,104 bytes and 1 minor /
+0 major GCs per sample; 0.43 s GC. Job 9b1ca298a4364489ae354aa797402135.
+Profiles: /tmp/mezzano-perf-final-profile.txt and
+/tmp/mezzano-perf-final-baseline-profile.txt.
+The remaining largest cost is MAKE-NODE (36.4% of final direct samples).
+
+SBCL host reference rerun while the guest was idle: depth 20 steady samples
+1.068, 1.050, 1.052 seconds (median 1.052), about 3.362 GB allocated and
+0.119-0.124 s real GC time. Log: /tmp/mezzano-perf-sbcl-final.log.
+This compares host SBCL with KVM Mezzano and different GC configurations;
+it shows the remaining gap, not an isolated compiler speed ratio.

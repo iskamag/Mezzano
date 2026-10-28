@@ -272,7 +272,11 @@
   (assert (structure-class-p structure-class))
   ;; Cache the location, not the layout: redefining a structure replaces its
   ;; slot-storage-layout, but structure-class itself cannot be reinitialized.
-  (let ((layout (instance-access structure-class *structure-class-slot-storage-layout-location*)))
+  ;; SLOT-STORAGE-LAYOUT is a Lisp-value slot. Its representation, like its
+  ;; location, is fixed, so no generic representation dispatch is needed.
+  (let ((layout (sys.int::%object-ref-t
+                 structure-class
+                 (location-offset-t (the fixnum *structure-class-slot-storage-layout-location*)))))
     (sys.int::%allocate-instance layout)))
 
 (defun %copy-structure-slow (structure class new)
