@@ -648,11 +648,12 @@ This should only fill in the START- slots and ignore the END- slots.")
   mezzano.supervisor::*debug-serial-at-line-start*)
 
 (defmethod mezzano.gray:stream-clear-input ((stream debug-serial-repl))
-  ;; Clear the mixin's unread slot. The supervisor FIFO cannot be cleared.
-  (setf (slot-value stream 'unread-char) nil))
+  ;; Clear the mixin's unread slot and anything waiting in the supervisor.
+  (setf (slot-value stream 'unread-char) nil)
+  (mezzano.supervisor::debug-serial-clear-input))
 
 (defmethod mezzano.gray:stream-line-column ((stream debug-serial-repl))
-  nil)
+  mezzano.supervisor::*debug-serial-column*)
 
 (defun debug-serial-repl-main ()
   (let* ((terminal (make-instance 'debug-serial-repl
@@ -668,16 +669,26 @@ This should only fill in the START- slots and ignore the END- slots.")
 
 (defun debug-serial-repl-start (&rest args)
   (debug-serial-repl-stop)
-  (let ((interrupt 4))
+  ;; Platforms with a 16550-compatible UART run INITIALIZE-DEBUG-SERIAL during
+  ;; boot; the REPL only has a driver to talk to in that case.
+  (when (boundp 'mezzano.supervisor::*debug-serial-irq*)
     ;; Remove existing interrupt handlers.
-    (setf (mezzano.supervisor::irq-attachments (mezzano.supervisor::platform-irq interrupt)) nil)
-    ;; Make sure debug pseudostream is set to debug-serial-stream.
+    (setf (mezzano.supervisor::irq-attachments
+           (mezzano.supervisor::platform-irq mezzano.supervisor::*debug-serial-irq*))
+          nil)
+    ;; Make sure the debug pseudostream is set to debug-serial-stream and the
+    ;; port is programmed the way the platform set it up at boot.
     (mezzano.supervisor::initialize-debug-serial
-     #x3F8 0 #'mezzano.internals::io-port/8 #'(setf mezzano.internals::io-port/8) interrupt 115200))
-  (mezzano.supervisor::initialize-debug-serial-reads)
-  (mezzano.supervisor:make-thread
-   (lambda () (apply #'debug-serial-repl-main args))
-   :name "Debug Serial Lisp Listener"))
+     mezzano.supervisor::*debug-serial-io-port*
+     mezzano.supervisor::*debug-serial-io-shift*
+     mezzano.supervisor::*debug-serial-read-fn*
+     mezzano.supervisor::*debug-serial-write-fn*
+     mezzano.supervisor::*debug-serial-irq*
+     mezzano.supervisor::*debug-serial-baud*)
+    (mezzano.supervisor::initialize-debug-serial-reads)
+    (mezzano.supervisor:make-thread
+     (lambda () (apply #'debug-serial-repl-main args))
+     :name "Debug Serial Lisp Listener")))
 
 (defun debug-serial-repl-stop ()
   (dolist (thread (mezzano.supervisor:all-threads))
