@@ -298,7 +298,9 @@
 (defun constructor-obsolete-test (token)
   ;; The uninterned token has no value cell until its definition is replaced.
   ;; This is a single field read in a current constructor.
-  `(%object-ref-t ',token +symbol-value+))
+  ;; Splice the constant: cold-start evals generated constructors before
+  ;; constants have value cells, so a variable read would be unbound.
+  `(%object-ref-t ',token ,+symbol-value+))
 
 (defun generate-standard-defstruct-constructor (struct-name struct-type name area token)
   (let* ((slots (structure-definition-slots struct-type))
