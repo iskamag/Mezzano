@@ -64,3 +64,46 @@ explicit. Reader disassembly frame size fell from 144 to 96 bytes. Retained
 cache checks passed after these edits. Earlier A/B timings do not represent
 this final hotloaded state; no further timing/image comparisons were run.
 ARM64 backend support is implemented but was not runtime-tested.
+
+Profile-directed slot call sites and flat vector access (2026-10-28)
+
+One existing KVM image; changes hotloaded, with backend linked-list helpers
+recompiled to install the new SLOT-VALUE load-time closures. No new image or
+alternating A/B runs. Each measurement compiles each source three times,
+after an untimed warmup and full GC. Timed runs had no GC. VERSION still
+reports the boot image's ddd6eded revision and does not identify hotloads.
+
+Before these two changes, with the physical-storage redesign hotloaded:
+SOURCE analysis.lisp N 3 CPU 3527267 BYTES 482287184 GC 0.0
+SOURCE cfg.lisp      N 3 CPU 1854965 BYTES 261732768 GC 0.0
+
+Flat vector AREF and ordinary call-site closures, before removing coercion:
+SOURCE analysis.lisp N 3 CPU 2970742 BYTES 482284368 GC 0.0
+SOURCE cfg.lisp      N 3 CPU 1837180 BYTES 261734816 GC 0.0
+
+Final code, including direct %FUNCALL of the guaranteed load-time closure:
+SOURCE analysis.lisp N 3 WALL 3100000 CPU 3064601 BYTES 482287888 GC 0.0
+SOURCE cfg.lisp      N 3 WALL 1840000 CPU 1818770 BYTES 261735424 GC 0.0
+UNITS 1000000
+
+Final observed CPU reduction: analysis 13.1%, cfg 2.0%. The latter is small
+enough to regard as roughly unchanged. These are sequential same-image
+observations, not a controlled estimate of each change's independent gain.
+The intermediate analysis result also shows timing variation. Allocation
+is effectively unchanged; closures/cells are not allocated per access.
+
+Disassembly: NEXT-INSTRUCTION directly calls its ordinary closure, with no
+%COERCE-TO-CALLABLE call; its frame fell from 32 to 16 bytes after coercion
+removal. The reader closure still has a 96-byte frame. Flat boxed-vector
+AREF checks the index against the header length and loads the element
+without calls to ARRAY-RANK, ARRAY-DIMENSION, or %ROW-MAJOR-AREF.
+
+Focused guest regressions passed:
+- array-vector-access: flat boxed/specialized vectors, bounds and element
+  errors, CAS, empty vectors, displacement, fill pointers, strings and rank.
+- clos-slot-call-site: independent read/write sites, different slot offsets,
+  typed stores, logical unbound hooks, method replacement/removal and cache
+  mode changes, class redefinition, old objects and full GC.
+
+The call-site/vector refinements were guest-compiled and hotloaded; no new
+cold boot or ARM64 runtime validation was performed for this increment.

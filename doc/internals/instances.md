@@ -130,6 +130,17 @@ removal, and clearing invalidate detached cells before publishing the new
 table state; growing a table preserves its live cells. This avoids retaining
 classes strongly or allowing saved discriminators to use detached entries.
 
+For a constant slot name, compiled `SLOT-VALUE` and its setter allocate an
+ordinary closure at load time for that call site. Each closure has its own
+last-cell cache, avoiding interference between independent callers and the
+funcallable-instance trampoline. Method lookup remains shared through the
+anonymous generic function for the slot name. On a miss, the closure consults
+that generic function's current table; if the table cannot supply an accessor
+entry, it calls the generic function. Thus method changes invalidate existing
+call sites through the same weak cells, including changes to dispatch mode.
+The generated call needs no function-designator coercion: the load-time
+factory always returns a closure. Calls allocate no additional cache objects.
+
 Compiled structure access follows the same rule for mutable layouts. Sealed
 structures whose ancestry also has permanent layouts keep direct accesses;
 those allocations cannot be superseded through class redefinition. When an
