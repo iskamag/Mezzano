@@ -7,6 +7,11 @@
   (:gc :no-frame :layout #*00)
   (lap:mov64 :rbp :rsp)
   (:gc :frame)
+  ;; This outer frame survives aborts and reinvocations. Keep R15 clear of
+  ;; the two slots used for the handler's dynamic-extent argument list.
+  (lap:sub64 :rsp 32)
+  (lap:mov64 (:stack 2) :r15)
+  (:gc :frame :layout #*001)
   PHONY-RETURN-ADDRESS
   ;; Work with footholds inhibitied.
   (lap:gs)
@@ -72,7 +77,8 @@
   (lap:mov64 (:object nil #.mezzano.supervisor::+thread-stack+) :rbx)
   ;; Ordinary return, no need to invalidate anything.
   (lap:leave)
-  (:gc :frame :multiple-values 0)
+  (:gc :frame :layout #*001 :multiple-values 0)
+  (lap:mov64 :r15 (:stack 2))
   ;; Reenable footholds, back on the old stack.
   (lap:gs)
   (lap:sub64 (:object nil #.mezzano.supervisor::+thread-inhibit-footholds+)
@@ -106,6 +112,9 @@
   (:gc :frame :layout #*1)
   (lap:push :r9) ; 1, values
   (:gc :frame :layout #*11)
+  (lap:sub64 :rsp 16)
+  (lap:mov64 (:stack 2) :r15)
+  (:gc :frame :layout #*111)
   (lap:mov32 :ecx #.(ash 4 #.sys.int::+n-fixnum-bits+))
   (lap:mov32 :r8d #.(ash #.sys.int::+object-tag-delimited-continuation+
                          #.sys.int::+n-fixnum-bits+)) ; tag
@@ -159,8 +168,8 @@
   ;; before the continuation's stack is uncoupled from the thread and end up scanning
   ;; the thread's stack twice. This isn't currently a problem, but something to keep in mind.
   (lap:mov64 :rbp (:object :r9 5))
-  (:gc :frame :layout #*)
-  (lap:lea64 :rsp (:rbp -16)) ; +2 stack slots, going to construct a cons on the stack.
+  (:gc :frame :layout #*001)
+  (lap:lea64 :rsp (:rbp -32)) ; Keep saved R15 live below the cons slots.
   ;; Zap parts of the saved stack.
   ;; Clear the return address & frame pointer to delimit the end of the continuation.
   ;; Return address must be cleared first.
@@ -181,9 +190,9 @@
   ;; Now call the handler.
   ;; Construct a cons on the stack for apply. (cons continuation values)
   (lap:mov64 (:stack 1) :r8) ; continuation
-  (:gc :frame :layout #*01)
+  (:gc :frame :layout #*011)
   (lap:mov64 (:stack 0) :r10) ; values
-  (:gc :frame :layout #*11)
+  (:gc :frame :layout #*111)
   ;; Reenable footholds
   (lap:gs)
   (lap:sub64 (:object nil #.mezzano.supervisor::+thread-inhibit-footholds+)
@@ -194,24 +203,25 @@
   (lap:jne RUN-FOOTHOLDS-1)
   CALL-HANDLER
   (lap:mov64 :r8 :rbx) ; first arg, handler
-  (lap:lea64 :r9 (:rsp #.sys.int::+tag-cons+)) ; second arg, continuation + values
+  (lap:lea64 :r9 (:rbp #.(+ -16 sys.int::+tag-cons+))) ; second arg, continuation + values
   (lap:mov32 :ecx #.(ash 2 sys.int::+n-fixnum-bits+))
   (lap:call (:named-call mezzano.runtime::%apply))
-  (:gc :frame :multiple-values 0)
+  (:gc :frame :layout #*001 :multiple-values 0)
+  (lap:mov64 :r15 (:stack 2))
   (lap:leave)
   (:gc :no-frame :layout #*0 :multiple-values 0)
   (lap:ret)
   RUN-FOOTHOLDS-1
-  (:gc :frame :layout #*11)
-  ;; Save the handler
-  (lap:sub64 :rsp 16)
-  (lap:mov64 (:rsp 8) :rbx)
   (:gc :frame :layout #*111)
+  ;; Save the handler
+  (lap:sub64 :rsp 32)
+  (lap:mov64 (:stack 3) :rbx)
+  (:gc :frame :layout #*1111)
   (lap:xor32 :ecx :ecx)
   (lap:call (:named-call mezzano.supervisor::run-pending-footholds))
-  (lap:mov64 :rbx (:rsp 8))
-  (lap:add64 :rsp 16)
-  (:gc :frame :layout #*11)
+  (lap:mov64 :rbx (:stack 3))
+  (lap:add64 :rsp 32)
+  (:gc :frame :layout #*111)
   (lap:jmp CALL-HANDLER))
 
 (sys.int::define-lap-function %reinvoke-delimited-continuation ((continuation))
@@ -244,6 +254,10 @@
   (:gc :no-frame :layout #*00 :incoming-arguments :rcx)
   (lap:mov64 :rbp :rsp)
   (:gc :frame :incoming-arguments :rcx)
+  ;; Match %CALL-WITH-PROMPT's outer frame on reinvocation.
+  (lap:sub64 :rsp 32)
+  (lap:mov64 (:stack 2) :r15)
+  (:gc :frame :layout #*001 :incoming-arguments :rcx)
   ;; Must have NIL in R8 when returning 0 values.
   (lap:test64 :rcx :rcx)
   (lap:cmov64z :r8 (:constant nil))
@@ -252,26 +266,26 @@
   (lap:cmp64 :rcx #.(ash #.multiple-values-limit sys.int::+n-fixnum-bits+))
   (lap:jg TOO-MANY-VALUES)
   ;; Copy stack arguments into the MV area.
-  (lap:push :rcx) ; save value count into (:stack 0)
-  (:gc :frame :incoming-arguments 0)
+  (lap:push :rcx) ; save value count into (:stack 4)
+  (:gc :frame :layout #*001 :incoming-arguments 4)
   (lap:mov32 :eax :ecx)
   (lap:mov32 :ecx #.(ash 5 sys.int::+n-fixnum-bits+))
   (lap:xor32 :edx :edx)
-  (:gc :frame :multiple-values 0 :incoming-arguments 0)
+  (:gc :frame :layout #*001 :multiple-values 0 :incoming-arguments 4)
   MV-UNPACK-LOOP
   (lap:mov64 :r13 (:rbp 16 (:rdx 8))) ; Load value from stack.
   (lap:gs)
   (lap:mov64 (:object nil #.mezzano.supervisor::+thread-mv-slots+ :rdx) :r13)
-  (:gc :frame :multiple-values 1 :incoming-arguments 0)
+  (:gc :frame :layout #*001 :multiple-values 1 :incoming-arguments 4)
   (lap:add64 :rcx #.(ash 1 sys.int::+n-fixnum-bits+))
-  (:gc :frame :multiple-values 0 :incoming-arguments 0)
+  (:gc :frame :layout #*001 :multiple-values 0 :incoming-arguments 4)
   (lap:add64 :rdx 1)
   (lap:cmp64 :rcx :rax)
   (lap:jne MV-UNPACK-LOOP)
-  (:gc :frame :multiple-values 0)
+  (:gc :frame :layout #*001 :multiple-values 0)
   (lap:add64 :rsp 8) ; drop saved count
   ONLY-REG-ARGS
-  (:gc :frame :multiple-values 0)
+  (:gc :frame :layout #*001 :multiple-values 0)
   ;; Work with footholds inhibitied.
   (lap:gs)
   (lap:add64 (:object nil #.mezzano.supervisor::+thread-inhibit-footholds+)
@@ -292,18 +306,21 @@
   (lap:mov64 (:object :rax 6) :rdx) ; return address
   ;; Switch over to the proper stack frame.
   ;; The stack frame looks like (from rsp upwards, see %ABORT-TO-PROMPT):
-  ;; +0 unused (dirty, not live)
-  ;; +8 top ssp
-  ;; +16 fp
-  ;; +24 ra
+  ;; +0 alignment padding (not live)
+  ;; +8 saved R15
+  ;; +16 unused (dirty, not live)
+  ;; +24 top ssp
+  ;; +32 fp
+  ;; +40 ra
   (lap:mov64 :rsp (:object :rbx #.sys.int::+delimited-continuation-stack-pointer+))
-  (lap:lea64 :rbp (:rsp 16))
-  (:gc :frame :multiple-values 0)
+  (lap:lea64 :rbp (:rsp 32))
+  (:gc :frame :layout #*001 :multiple-values 0)
   ;; Link into the special stack.
   (lap:gs)
   (lap:mov64 :r13 (:object nil #.mezzano.supervisor::+thread-special-stack-pointer+))
   (lap:mov64 (:object :rax 0) :r13)
   (lap:mov64 :r13 (:stack 0)) ; saved ssp
+  (:gc :frame :layout #*101 :multiple-values 0)
   (lap:gs)
   (lap:mov64 (:object nil #.mezzano.supervisor::+thread-special-stack-pointer+) :r13)
   ;; Clear the binding cache, there may be stale entries.
@@ -328,11 +345,12 @@
   ;; FIXME: Need to run pending footholds here, but that requires saving the
   ;; multiple values. They'll get run eventually, maybe.
   ;; Now return to the function that originally aborted.
+  (lap:mov64 :r15 (:stack 2))
   (lap:leave)
   (:gc :no-frame :layout #*0 :multiple-values 0)
   (lap:ret)
   TOO-MANY-VALUES
-  (:gc :frame)
+  (:gc :frame :layout #*001)
   PHONY-RETURN-ADDRESS ; match %CALL-WITH-PROMPT's GC info
   (lap:mov64 :r8 (:constant "Resuming continuation ~S with too many values (MULTPLE-VALUES-LIMIT exceeded)"))
   (lap:mov32 :ecx #.(ash 1 sys.int::+n-fixnum-bits+))

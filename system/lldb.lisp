@@ -199,7 +199,7 @@
          (format t " rip: ~8,'0X~%"
                  (sys.int::memref-unsigned-byte-64
                   (mezzano.supervisor:thread-state-rsp thread)
-                  #+x86-64 0
+                  #+x86-64 3
                   #+arm64 1))))
   (values))
 
@@ -249,11 +249,12 @@
                      (mezzano.supervisor:thread-state-rbp thread)
                      (mezzano.supervisor:thread-state-rip thread)))
             (t
-             (values (mezzano.supervisor:thread-state-rsp thread)
+             (values #+x86-64 (+ (mezzano.supervisor:thread-state-rsp thread) 32)
+                     #-x86-64 (mezzano.supervisor:thread-state-rsp thread)
                      (mezzano.supervisor:thread-state-rbp thread)
                      (memref-signed-byte-64
                       (mezzano.supervisor:thread-state-rsp thread)
-                      0))))
+                      #+x86-64 3 #-x86-64 0))))
     (loop
        (multiple-value-bind (fn fn-offset)
            (safe-return-address-to-function return-address)

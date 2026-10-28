@@ -8,6 +8,7 @@
 (defvar *saved-multiple-values*)
 (defvar *dx-root-visibility*)
 (defvar *current-frame-layout*)
+(defvar *callee-save-loc*)
 (defvar *prepass-data*)
 (defvar *labels*)
 (defvar *literals*)
@@ -34,7 +35,10 @@
     (push i *emitted-lap*)))
 
 (defun emit-debug-info (info spill-locations)
-  (emit `(:debug ,(loop
+  (emit `(:debug ,(append
+                   (loop for (reg . slot) in *callee-save-loc*
+                         collect (list reg slot :value :hidden t))
+                   (loop
                      for (variable location repr) in info
                      collect (list* (c:lexical-variable-name variable)
                                     (if (typep location 'ir:virtual-register)
@@ -45,7 +49,7 @@
                                     (if (getf (c:lexical-variable-plist variable)
                                               'c::hide-from-debug-info)
                                         (list :hidden t)
-                                        ()))))))
+                                        ())))))))
 
 (defun emit-gc-info (&rest metadata)
   (emit `(:gc :frame :layout ,*current-frame-layout* ,@metadata)))
@@ -91,10 +95,15 @@
     (dotimes (i count)
       (vector-push-extend (if livep :value :raw) *stack-layout*))))
 
-(defun effective-address (vreg)
-  (check-type vreg ir:virtual-register)
-  `(:stack ,(or (gethash vreg *spill-locations*)
-                (error "Missing stack slot for vreg ~S" vreg))))
+(defun effective-address (reg)
+  ;; Callee-save values can remain in registers where the all-caller-save
+  ;; convention previously forced stack operands (stack arguments and MVs).
+  (if (keywordp reg)
+      reg
+      (progn
+        (check-type reg ir:virtual-register)
+        `(:stack ,(or (gethash reg *spill-locations*)
+                      (error "Missing stack slot for vreg ~S" reg))))))
 
 (defun fetch-literal (value)
   (let ((pos (or (position value *literals*)
@@ -115,13 +124,22 @@
             (*dx-root-visibility* (make-hash-table :test 'eq))
             (*prepass-data* (make-hash-table :test 'eq))
             (*current-frame-layout* nil)
-            (*labels* (make-hash-table :test 'eq)))
+            (*labels* (make-hash-table :test 'eq))
+            (uses-r15-p nil))
         (ir:do-instructions (inst-or-label backend-function)
+          ;; NLX skips intervening epilogues, so its target must preserve the
+          ;; incoming R15 even if it does not otherwise use that register.
+          (when (or (typep inst-or-label 'ir:begin-nlx-instruction)
+                    (member :r15 (ir:instruction-inputs inst-or-label))
+                    (member :r15 (ir:instruction-outputs inst-or-label)))
+            (setf uses-r15-p t))
           (cond ((typep inst-or-label 'ir:label)
                  (setf (gethash inst-or-label *labels*) (mezzano.lap:make-label)))
                 (t
                  (lap-prepass backend-function inst-or-label uses defs))))
         (let ((*emitted-lap* '())
+              (*callee-save-loc* (when uses-r15-p
+                                  (list (cons :r15 (allocate-stack-slots 1)))))
               (*current-frame-layout* (coerce (loop
                                                  for elt across *stack-layout*
                                                  collect (if (not (eql elt :value))
@@ -133,7 +151,8 @@
               (mv-flow (ir::multiple-value-flow backend-function *target*)))
           ;; Create stack frame.
           (emit 'entry-point
-                `(:debug ())
+                `(:debug ,(loop for (reg . slot) in *callee-save-loc*
+                                collect (list reg slot :value :hidden t)))
                 `(:gc :no-frame :incoming-arguments :rcx :layout #*0)
                 `(lap:push :rbp)
                 `(:gc :no-frame :incoming-arguments :rcx :layout #*00)
@@ -147,8 +166,11 @@
             (loop
                for i from 0
                for elt across *current-frame-layout*
-               do (when (not (zerop elt))
-                    (emit `(lap:mov64 (:stack ,i) :r14)))))
+               for (callee-save-reg) = (rassoc i *callee-save-loc*)
+               do (cond (callee-save-reg
+                         (emit `(lap:mov64 (:stack ,i) ,callee-save-reg)))
+                        ((not (zerop elt))
+                         (emit `(lap:mov64 (:stack ,i) :r14))))))
           (emit-gc-info :incoming-arguments :rcx)
           (ir:do-instructions (inst-or-label backend-function)
             (emit-debug-info (gethash inst-or-label debug-map '()) *spill-locations*)
@@ -235,15 +257,18 @@
     ;; callee's stack, however this could be avoided for required arguments
     ;; via the incoming-arguments gc mechanism. This does not apply to optional
     ;; arguments as they may or may not exist on the caller's stack.
-    (let ((stack-argument-index 0))
+    (let ((register-args '(:r8 :r9 :r10 :r11 :r12))
+          (stack-argument-index 0))
       ;; Stack &required args.
       (loop
          for req in (ir:argument-setup-required instruction)
-         do (when (typep req 'ir:virtual-register)
-              (when (usedp req)
-                (emit `(lap:mov64 :r13 (:rbp ,(* (+ stack-argument-index 2) 8))))
-                (emit `(lap:mov64 ,(effective-address req) :r13)))
-              (incf stack-argument-index)))
+         do (cond (register-args
+                   (assert (eql req (pop register-args))))
+                  (t
+                   (when (usedp req)
+                     (emit `(lap:mov64 :r13 (:rbp ,(* (+ stack-argument-index 2) 8)))
+                           `(lap:mov64 ,(effective-address req) :r13)))
+                   (incf stack-argument-index))))
       ;; &optional processing.
       (loop
          for i from (length (ir:argument-setup-required instruction))
@@ -251,17 +276,17 @@
          do
            (when (usedp opt)
              (emit `(lap:cmp64 :rcx ,(ash i sys.int::+n-fixnum-bits+))))
-           (cond ((typep opt 'ir:virtual-register)
-                  ;; Load from stack.
+           (cond (register-args
+                  (assert (eql opt (pop register-args)))
+                  (when (usedp opt)
+                    (emit `(lap:cmov64le ,opt :r14))))
+                 (t
+                  ;; Stack arguments can now be allocated to R15 too.
                   (when (usedp opt)
                     (emit `(lap:mov64 :r13 :r14)
                           `(lap:cmov64nle :r13 (:rbp ,(* (+ stack-argument-index 2) 8)))
                           `(lap:mov64 ,(effective-address opt) :r13)))
-                  (incf stack-argument-index))
-                 (t
-                  ;; Load into register.
-                  (when (usedp opt)
-                    (emit `(lap:cmov64le ,opt :r14)))))))
+                  (incf stack-argument-index)))))
     ;; &rest generation.
     (when (and (ir:argument-setup-rest instruction)
                (usedp (ir:argument-setup-rest instruction)))
@@ -625,7 +650,12 @@
             (t
              (emit `(lap:mov64 ,dest (:constant ,value))))))))
 
+(defun restore-callee-save-registers ()
+  (loop for (reg . slot) in *callee-save-loc*
+        do (emit `(lap:mov64 ,reg (:stack ,slot)))))
+
 (defmethod emit-lap (backend-function (instruction ir:return-instruction) uses defs)
+  (restore-callee-save-registers)
   (emit `(lap:mov32 :ecx ,(c::fixnum-to-raw 1))
         `(lap:leave)
         ;; Don't use emit-gc-info, using a custom layout.
@@ -633,6 +663,7 @@
         `(lap:ret)))
 
 (defmethod emit-lap (backend-function (instruction ir:return-multiple-instruction) uses defs)
+  (restore-callee-save-registers)
   (emit `(lap:leave)
         ;; Don't use emit-gc-info, using a custom layout.
         `(:gc :no-frame :layout #*0 :multiple-values 0)
@@ -676,8 +707,11 @@
        for arg in stack-args
        for i from 0
        do
-         (emit `(lap:mov64 :r13 ,(effective-address arg))
-               `(lap:mov64 (:rsp ,(* i 8)) :r13))
+         (cond ((keywordp arg) ; A callee-save value may stay in a register.
+                (emit `(lap:mov64 (:rsp ,(* i 8)) ,arg)))
+               (t
+                (emit `(lap:mov64 :r13 ,(effective-address arg))
+                      `(lap:mov64 (:rsp ,(* i 8)) :r13))))
          (emit-gc-info :pushed-values (1+ i)))
     (typecase n-args
       ((eql 0)
@@ -708,6 +742,7 @@
 
 (defmethod emit-lap (backend-function (instruction ir:tail-call-instruction) uses defs)
   (call-argument-setup (ir:call-arguments instruction))
+  (restore-callee-save-registers)
   (cond ((<= (length (ir:call-arguments instruction)) 5)
          (emit `(lap:leave)
                ;; Don't use emit-gc-info, using a custom layout.
@@ -723,6 +758,7 @@
 
 (defmethod emit-lap (backend-function (instruction ir:tail-funcall-instruction) uses defs)
   (call-argument-setup (ir:call-arguments instruction))
+  (restore-callee-save-registers)
   (cond ((<= (length (ir:call-arguments instruction)) 5)
          (emit `(lap:leave)
                ;; Don't use emit-gc-info, using a custom layout.
@@ -782,7 +818,9 @@
             `(lap:add64 :rdi 8)
             `(lap:add64 :rsi 8)
             `(lap:sub64 :rax 8)
-            `(lap:jae ,loop-head)
+            ;; Stop at zero: another copy would overwrite the caller's frame
+            ;; when the outgoing arguments need no alignment padding.
+            `(lap:ja ,loop-head)
             loop-exit)
       ;; All done with the MV area.
       (emit-gc-info :pushed-values -5 :pushed-values-register :rcx))

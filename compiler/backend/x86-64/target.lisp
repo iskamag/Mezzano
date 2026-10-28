@@ -21,7 +21,9 @@
   :rcx)
 
 (defmethod ra:valid-physical-registers-for-kind ((kind (eql :value)) (architecture c:x86-64-target))
-  '(:r8 :r9 :r10 :r11 :r12 :r13 :rbx))
+  (if c::*use-x86-r15*
+      '(:r8 :r9 :r10 :r11 :r12 :r13 :rbx :r15)
+      '(:r8 :r9 :r10 :r11 :r12 :r13 :rbx)))
 
 (defmethod ra:valid-physical-registers-for-kind ((kind (eql :integer)) (architecture c:x86-64-target))
   '(:rax :rcx :rdx :rsi :rdi))
@@ -49,25 +51,30 @@
            (member kind2 '(:value :integer :single-float :double-float :mmx)))))
 
 (defmethod ra:instruction-clobbers ((instruction ir::base-call-instruction) (architecture c:x86-64-target))
-  '(:rax :rcx :rdx :rsi :rdi :rbx :r8 :r9 :r10 :r11 :r12 :r13 :r14 :r15
-    :mm0 :mm1 :mm2 :mm3 :mm4 :mm5 :mm6 :mm7
-    :xmm0 :xmm1 :xmm2 :xmm3 :xmm4 :xmm5 :xmm6 :xmm7 :xmm8
-    :xmm9 :xmm10 :xmm11 :xmm12 :xmm13 :xmm14 :xmm15))
+  (let ((caller-save '(:rax :rcx :rdx :rsi :rdi :rbx :r8 :r9 :r10 :r11 :r12 :r13 :r14
+                       :mm0 :mm1 :mm2 :mm3 :mm4 :mm5 :mm6 :mm7
+                       :xmm0 :xmm1 :xmm2 :xmm3 :xmm4 :xmm5 :xmm6 :xmm7 :xmm8
+                       :xmm9 :xmm10 :xmm11 :xmm12 :xmm13 :xmm14 :xmm15)))
+    ;; An NLX skips the callee's epilogue. Values in R15 must be spilled
+    ;; around calls that can exit into this function, as on arm64.
+    (if (ir::call-involved-in-nlx instruction)
+        (cons :r15 caller-save)
+        caller-save)))
 
 (defmethod ra:instruction-clobbers ((instruction ir:argument-setup-instruction) (architecture c:x86-64-target))
-  '(:rax :rcx :rdx :rsi :rdi :rbx :r8 :r9 :r10 :r11 :r12 :r13 :r14 :r15
+  '(:rax :rcx :rdx :rsi :rdi :rbx :r8 :r9 :r10 :r11 :r12 :r13 :r14
     :mm0 :mm1 :mm2 :mm3 :mm4 :mm5 :mm6 :mm7
     :xmm0 :xmm1 :xmm2 :xmm3 :xmm4 :xmm5 :xmm6 :xmm7 :xmm8
     :xmm9 :xmm10 :xmm11 :xmm12 :xmm13 :xmm14 :xmm15))
 
 (defmethod ra:instruction-clobbers ((instruction ir:save-multiple-instruction) (architecture c:x86-64-target))
-  '(:rax :rcx :rdx :rsi :rdi :rbx :r8 :r9 :r10 :r11 :r12 :r13 :r14 :r15
+  '(:rax :rcx :rdx :rsi :rdi :rbx :r8 :r9 :r10 :r11 :r12 :r13 :r14
     :mm0 :mm1 :mm2 :mm3 :mm4 :mm5 :mm6 :mm7
     :xmm0 :xmm1 :xmm2 :xmm3 :xmm4 :xmm5 :xmm6 :xmm7 :xmm8
     :xmm9 :xmm10 :xmm11 :xmm12 :xmm13 :xmm14 :xmm15))
 
 (defmethod ra:instruction-clobbers ((instruction ir:restore-multiple-instruction) (architecture c:x86-64-target))
-  '(:rax :rcx :rdx :rsi :rdi :rbx :r8 :r9 :r10 :r11 :r12 :r13 :r14 :r15
+  '(:rax :rcx :rdx :rsi :rdi :rbx :r8 :r9 :r10 :r11 :r12 :r13 :r14
     :mm0 :mm1 :mm2 :mm3 :mm4 :mm5 :mm6 :mm7
     :xmm0 :xmm1 :xmm2 :xmm3 :xmm4 :xmm5 :xmm6 :xmm7 :xmm8
     :xmm9 :xmm10 :xmm11 :xmm12 :xmm13 :xmm14 :xmm15))
@@ -85,13 +92,13 @@
     :xmm9 :xmm10 :xmm11 :xmm12 :xmm13 :xmm14 :xmm15))
 
 (defmethod ra:instruction-clobbers ((instruction ir:values-instruction) (architecture c:x86-64-target))
-  '(:rax :rcx :rdx :rsi :rdi :rbx :r8 :r9 :r10 :r11 :r12 :r13 :r14 :r15
+  '(:rax :rcx :rdx :rsi :rdi :rbx :r8 :r9 :r10 :r11 :r12 :r13 :r14
     :mm0 :mm1 :mm2 :mm3 :mm4 :mm5 :mm6 :mm7
     :xmm0 :xmm1 :xmm2 :xmm3 :xmm4 :xmm5 :xmm6 :xmm7 :xmm8
     :xmm9 :xmm10 :xmm11 :xmm12 :xmm13 :xmm14 :xmm15))
 
 (defmethod ra:instruction-clobbers ((instruction ir:multiple-value-bind-instruction) (architecture c:x86-64-target))
-  '(:rax :rcx :rdx :rsi :rdi :rbx :r8 :r9 :r10 :r11 :r12 :r13 :r14 :r15
+  '(:rax :rcx :rdx :rsi :rdi :rbx :r8 :r9 :r10 :r11 :r12 :r13 :r14
     :mm0 :mm1 :mm2 :mm3 :mm4 :mm5 :mm6 :mm7
     :xmm0 :xmm1 :xmm2 :xmm3 :xmm4 :xmm5 :xmm6 :xmm7 :xmm8
     :xmm9 :xmm10 :xmm11 :xmm12 :xmm13 :xmm14 :xmm15))
@@ -109,7 +116,7 @@
   '(:rbx :r13 :rax))
 
 (defmethod ra:instruction-clobbers ((instruction ir:disestablish-unwind-protect-instruction) (architecture c:x86-64-target))
-  '(:rax :rcx :rdx :rsi :rdi :rbx :r8 :r9 :r10 :r11 :r12 :r13 :r14 :r15
+  '(:rax :rcx :rdx :rsi :rdi :rbx :r8 :r9 :r10 :r11 :r12 :r13 :r14
     :mm0 :mm1 :mm2 :mm3 :mm4 :mm5 :mm6 :mm7
     :xmm0 :xmm1 :xmm2 :xmm3 :xmm4 :xmm5 :xmm6 :xmm7 :xmm8
     :xmm9 :xmm10 :xmm11 :xmm12 :xmm13 :xmm14 :xmm15))

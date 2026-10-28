@@ -240,11 +240,14 @@ To be run this in the basic repl after ipl completes."
 
 (defun cal (path &key force)
   "Compile and load PATH.
-The file will only be recompiled if the source is newer than the output file, or if FORCE is true."
+Recompile if the output is missing, outdated, incompatible with this image,
+or FORCE is true."
   (let ((compiled (compile-file-pathname path)))
     (when (or force
               (not (probe-file compiled))
-              (<= (file-write-date compiled) (file-write-date path)))
+              (<= (file-write-date compiled) (file-write-date path))
+              (not (with-open-file (stream compiled :element-type '(unsigned-byte 8))
+                     (llf-header-compatible-p stream))))
       (format t "; Compiling ~S~%" path)
       (ignore-errors (delete-file compiled))
       (compile-file path))
