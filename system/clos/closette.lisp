@@ -157,30 +157,63 @@ the old or new values are expected to be unbound.")
      do (return (svref instance-slots (1+ i)))
      finally (return nil)))
 
+;;; Fast path for slot access via the reader/writer discriminators.
+;;;
+;;; FETCH-UP-TO-DATE-INSTANCE-SLOTS-AND-LAYOUT handles obsolete instances,
+;;; but that requires walking the layout on every access. In the common case
+;;; the layout has no replacement instance and is not obsolete, so the
+;;; instance is already up to date and the layout is irrelevant.
+(declaim (inline instance-up-to-date-p))
+(defun instance-up-to-date-p (instance)
+  (let ((layout (sys.int::%instance-layout instance)))
+    (and (null (sys.int::layout-new-instance layout))
+         (not (sys.int::layout-obsolete layout)))))
+
+(declaim (inline fast-slot-read-up-to-date))
+(defun fast-slot-read-up-to-date (instance location slot-definition)
+  "Read LOCATION from INSTANCE, assuming INSTANCE has an up-to-date layout."
+  (let ((val (standard-instance-access instance location)))
+    (if (eq *secret-unbound-value* val)
+        (values (slot-unbound (class-of instance)
+                              instance
+                              (if (consp location)
+                                  (car location)
+                                  (safe-slot-definition-name slot-definition))))
+        val)))
+
+(declaim (inline fast-slot-write-up-to-date))
+(defun fast-slot-write-up-to-date (new-value instance location)
+  "Write NEW-VALUE to LOCATION in INSTANCE, assuming INSTANCE has an up-to-date layout."
+  (setf (standard-instance-access instance location) new-value))
+
 ;; TODO: This and FAST-SLOT-WRITE should use the correct slot access function.
 ;; It doesn't really matter though, as instances and funcallable instances
 ;; are all compatible.
 (defun fast-slot-read (instance location slot-definition)
-  (multiple-value-bind (slots layout)
-      ;; This is required in case the instance is obsolete.
-      (fetch-up-to-date-instance-slots-and-layout instance)
-    (declare (ignore layout))
-    (let* ((val (standard-instance-access slots location)))
-      (if (eq *secret-unbound-value* val)
-          (values (slot-unbound (class-of instance)
-                                instance
-                                (if (consp location)
-                                    (car location)
-                                    (safe-slot-definition-name slot-definition))))
-          val))))
+  (if (instance-up-to-date-p instance)
+      (fast-slot-read-up-to-date instance location slot-definition)
+      (multiple-value-bind (slots layout)
+          ;; This is required in case the instance is obsolete.
+          (fetch-up-to-date-instance-slots-and-layout instance)
+        (declare (ignore layout))
+        (let* ((val (standard-instance-access slots location)))
+          (if (eq *secret-unbound-value* val)
+              (values (slot-unbound (class-of instance)
+                                    instance
+                                    (if (consp location)
+                                        (car location)
+                                        (safe-slot-definition-name slot-definition))))
+              val)))))
 
 (defun fast-slot-write (new-value instance location slot-definition)
   (declare (ignore slot-definition))
-  (multiple-value-bind (slots layout)
-      ;; This is required in case the instance is obsolete.
-      (fetch-up-to-date-instance-slots-and-layout instance)
-    (declare (ignore layout))
-    (setf (standard-instance-access slots location) new-value)))
+  (if (instance-up-to-date-p instance)
+      (fast-slot-write-up-to-date new-value instance location)
+      (multiple-value-bind (slots layout)
+          ;; This is required in case the instance is obsolete.
+          (fetch-up-to-date-instance-slots-and-layout instance)
+        (declare (ignore layout))
+        (setf (standard-instance-access slots location) new-value))))
 
 (defun fetch-up-to-date-instance-slots-and-layout (instance)
   (loop
@@ -581,6 +614,11 @@ the old or new values are expected to be unbound.")
     ((mezzano.internals.numbers.logical::small-byte-p x)
      (find-class-cached 'byte))
     ((sys.int::instance-header-p x) (find-class-cached 'sys.int::instance-header))
+    ;; A dynamic-extent root is a legitimate machine value (see the
+    ;; %TYPE-OF logic in system/type.lisp), so it must have a class rather
+    ;; than falling into the error below and taking the printer down with it.
+    ((sys.int::%value-has-tag-p x sys.int::+tag-dx-root-object+)
+     (find-class-cached 't))
     (t
      (error "Internal error, no class for value ~S" x))))
 
@@ -1939,7 +1977,9 @@ has only has class specializer."
                  (error 'type-error
                         :datum new-value
                         :expected-type (writer-discriminator-entry-type location))))
-             (fast-slot-write new-value object (writer-discriminator-entry-location location) slot-definition))
+             (fast-slot-write new-value object
+                              (writer-discriminator-entry-location location)
+                              slot-definition))
             (t
              (slow-single-dispatch-method-lookup* gf argument-offset (list new-value object) :writer))))))
 
