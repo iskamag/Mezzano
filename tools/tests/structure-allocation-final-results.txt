@@ -1,0 +1,99 @@
+Structure allocation performance: session results, 2026-10-28
+
+Benchmark source remained unchanged:
+  /home/iskam/boehm-gc.lisp, depth 20
+  SHA256 0a2af82bc5a1c0e2246d3d0709111c43a67577a51445b7ab2860abb346603153
+The drivers compile that source into separate packages to avoid invalidating
+one variant's constructors while creating another. Host: Ryzen 7 6800H;
+Mezzano: x86-64 KVM, 4 vCPUs, 4 GB, make serial-kvm.
+
+Combined comparison in the final cold-built image
+------------------------------------------------
+The baseline reconstructs the 8f25d879 allocation path: ordinary constructor
+calls, per-allocation layout-name lookup, original generic slot scan, and
+out-of-line allocation helpers. The rest of the running runtime/GC is shared.
+This is an isolated allocation-pipeline comparison, not a complete old-image
+versus new-image boot comparison. Pair order alternates. Pair 0 is warmup.
+
+Pair  Original pipeline  Optimized pipeline
+0     8.35 s             3.42 s     (discard)
+1     7.65 s             3.21 s
+2     8.12 s             3.23 s
+3     7.47 s             3.10 s
+
+Median elapsed: 7.65 -> 3.21 seconds, 2.38x throughput / 58.0% less elapsed time.
+All eight samples allocated exactly 3,355,179,104 bytes, with 1 minor and
+0 major collections. Optimized steady GC: 0.43-0.44 s; baseline: 0.42-0.50 s.
+These results supersede multiplying the separate experiments' speedups.
+The earlier 7.9-second handoff reference and ~3.0-second best follow-up
+measurements suggested ~2.6x; the controlled combined comparison is stronger.
+
+SBCL's separate host reference was ~1.05 s, with ~0.12 s GC. It uses a different
+runtime/collector and runs outside KVM. There is still a substantial gap.
+
+Changes and checks
+------------------
+- Keep the fixnum slot scan, cache the structure-class layout-slot location
+  during cold generation, and read that Lisp-value slot directly.
+- Inline small standard constructors while retaining named calls for unknown
+  or computed keyword lists. Saved constructors retain redefinition handling.
+- Resolve the class in the compiler before inlining allocation. An initial
+  attempt to inline %ALLOCATE-STRUCT directly bypassed this rewrite and
+  reintroduced FIND-CLASS on every allocation (~29 s); it was rejected.
+- Inline the known-class allocation helper and %ALLOCATE-INSTANCE, preserving
+  the general checked entry point. The helper reads the current layout, so
+  a compiled allocator still follows subsequent structure redefinition.
+- Preserve imported uninterned literal identity across compiled files. Tokens
+  from existing constructor definitions cannot be copied into another LLF;
+  such imported expansions retain named calls. Current-file definitions still
+  inline. Parallel compiler workers share the same per-file definition set.
+
+The latest helper change alone measured 3.57 -> 3.00 s median in its controlled
+comparison; that is incremental to prior allocator and constructor changes.
+
+Fresh cold build, cold startup (48.39 s, 2.44 s GC), snapshot, and reboot passed.
+Fresh-image tests passed: allocation cache (including a precompiled allocator
+used after redefinition and invalid inputs at high safety), compatible layouts,
+reparenting, constructor inlining, and imported/same-file literal identity in
+both serial and forced-parallel compilation. The layout suite also passed two
+successive compile/load/run cycles after the literal-identity fix.
+No structure layout changed; no make clean was used.
+
+Profiler/GDB analysis for next session
+--------------------------------------
+Final direct samples (272 total): MAKE-TREE 34.9%, POPULATE 34.6%, low-level bump
+allocator 21.0%, allocation wrapper 3.3%. Inlined allocation instructions are
+attributed to MAKE-TREE/POPULATE, so these percentages do not imply all of that
+time is tree traversal. GDB confirms direct layout/size/area reads followed by
+%ALLOCATE-OBJECT, without FIND-CLASS or the former allocation helper chain.
+It also shows a generic integer shift/conversion for LOCATION-OFFSET-T remains
+on the hot path, including %%MAKE-SIGNED-BYTE-64-RAX. Caching the word offset
+instead of repeatedly decoding the encoded location is a candidate to measure.
+Other candidates: allocator metering/wrapper cost and recursive-call overhead.
+No further optimization was attempted after the user's session-wrap request.
+
+GC is ~13-14% of final elapsed time. Eliminating it entirely would give only
+~1.15x further speedup, so most of the remaining SBCL gap is outside GC.
+
+Evidence and continuation
+-------------------------
+Reproduce the combined comparison by loading structure-allocation-benchmark.lisp
+and structure-allocation-pipeline-benchmark.lisp, then calling
+(compare-allocation-pipeline #P"REMOTE:/path/to/boehm-gc.lisp").
+For the latest helper change alone use structure-allocation-helper-benchmark.lisp
+and compare-allocation-helpers with the same benchmark pathname.
+
+/tmp/mezzano-perf-known-build.log
+/tmp/mezzano-perf-known-cold-boot.log
+/tmp/mezzano-perf-final-gdb.txt
+/tmp/mezzano-perf-pipeline-profile.txt
+/tmp/mezzano-perf-pipeline-disassembly.txt
+home/.mezzano-agent/1bcedf68b9d54f7aba253404fb379d74/output.txt (fresh tests)
+home/.mezzano-agent/40d222791cea456bbdeeef9c1e77e274/output.txt (final timing)
+home/.mezzano-agent/3b6e5f7ca9d4430692e646da2336c80e/output.txt (repeated suite)
+home/.mezzano-agent/ffaf012249d44e21b2fc676253708d10/output.txt (helper timing)
+
+Live VM: /tmp/mezzano-perf-known-cold.image
+Serial socket: /tmp/mezzano-perf-vm/serial.sock; serial.log in that directory.
+GDB: 127.0.0.1:1234. Benchmark jobs have finished; runtime definitions restored.
+The VM is left running for inspection. All source changes are in Mezzano.
