@@ -248,10 +248,24 @@ If MANDATORY-P is non-NIL, it should be a string describing the allocation."
 (sys.int::defglobal *physical-page-exists-hint* 0
   "Most recently matching boot memory map entry; checked again on every lookup.")
 
+;; Note: BOOTLOADER-ENTRY-POINT reaches PHYSICAL-PAGE-EXISTS (via
+;; RELEASE-PHYSICAL-PAGES from the virtio teardown path) before INITIALIZE-LISP
+;; has run the toplevel DEFGLOBAL initializer, so this symbol is still unbound
+;; on the first call. Read it only when it is bound.
+(defun physical-page-exists-hint ()
+  (if (boundp '*physical-page-exists-hint*)
+      *physical-page-exists-hint*
+      0))
+
+(defun (setf physical-page-exists-hint) (value)
+  (setf *physical-page-exists-hint* value))
+
+(declaim (inline physical-page-exists-hint))
+
 (defun physical-page-exists (page-number)
   (let ((page (* page-number +4k-page-size+))
         (count (n-memory-map-entries))
-        (hint *physical-page-exists-hint*))
+        (hint (physical-page-exists-hint)))
     ;; The hint is a single atomic value. Validate the range on every lookup,
     ;; so another CPU changing the hint cannot change the answer.
     (when (and (< hint count)
@@ -261,7 +275,7 @@ If MANDATORY-P is non-NIL, it should be a string describing the allocation."
     (dotimes (i count nil)
       (when (and (<= (memory-map-entry-start i) page)
                  (< page (memory-map-entry-end i)))
-        (setf *physical-page-exists-hint* i)
+        (setf (physical-page-exists-hint) i)
         (return t)))))
 
 (defun release-physical-pages-1 (page-number n-pages buddy-allocator-address max-order)
