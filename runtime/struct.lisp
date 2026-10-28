@@ -266,10 +266,9 @@
   (setf (svref (sys.int::layout-compatible layout) 0) layout)
   layout)
 
-(defun sys.int::%allocate-struct (structure-class)
-  (when (symbolp structure-class)
-    (setf structure-class (find-class structure-class)))
-  (assert (structure-class-p structure-class))
+(declaim (inline %allocate-struct-known-class))
+(defun %allocate-struct-known-class (structure-class)
+  ;; The compiler and the checked entry point below establish the class type.
   ;; Cache the location, not the layout: redefining a structure replaces its
   ;; slot-storage-layout, but structure-class itself cannot be reinitialized.
   ;; SLOT-STORAGE-LAYOUT is a Lisp-value slot. Its representation, like its
@@ -278,6 +277,12 @@
                  structure-class
                  (location-offset-t (the fixnum *structure-class-slot-storage-layout-location*)))))
     (sys.int::%allocate-instance layout)))
+
+(defun sys.int::%allocate-struct (structure-class)
+  (when (symbolp structure-class)
+    (setf structure-class (find-class structure-class)))
+  (assert (structure-class-p structure-class))
+  (%allocate-struct-known-class structure-class))
 
 (defun %copy-structure-slow (structure class new)
   ;; Copy STRUCTURE slot-by-slot.

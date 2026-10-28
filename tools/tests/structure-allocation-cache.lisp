@@ -10,6 +10,10 @@
   (eval '(defstruct node left right dummy1 dummy2))
   (let* ((class (find-class 'node))
          (layout (mezzano.clos:class-layout class))
+         (compiled-allocator
+           (compile nil '(lambda ()
+                           (declare (optimize (speed 3) (safety 0)))
+                           (mezzano.internals::%allocate-struct 'node))))
          (node (funcall (symbol-function 'make-node)
                         :left 1 :right 2 :dummy1 3 :dummy2 4)))
     (assert (equal (mapcar (lambda (slot)
@@ -26,6 +30,9 @@
     (eval '(defstruct node left right dummy1 dummy2 extra))
     (let ((new-layout (mezzano.clos:class-layout class)))
       (assert (not (eq layout new-layout)))
+      ;; A compiler-resolved class must still fetch its current layout.
+      (assert (eq (mezzano.internals::%instance-layout (funcall compiled-allocator))
+                  new-layout))
       ;; Both public entry forms must fetch the replacement layout.
       (dolist (designator (list class 'node))
         (assert (eq (mezzano.internals::%instance-layout
@@ -34,5 +41,14 @@
       (assert (= (funcall (symbol-function 'node-extra)
                          (funcall (symbol-function 'make-node) :extra 42))
                  42))))
+  ;; The general entry points retain their checked behavior at high safety.
+  (let ((bad-class (compile nil '(lambda (class)
+                                  (declare (optimize (safety 3)))
+                                  (mezzano.internals::%allocate-struct class))))
+        (bad-layout (compile nil '(lambda (layout)
+                                   (declare (optimize (safety 3)))
+                                   (mezzano.internals::%allocate-instance layout)))))
+    (assert (handler-case (progn (funcall bad-class 42) nil) (error () t)))
+    (assert (handler-case (progn (funcall bad-layout 42) nil) (type-error () t))))
   (format t "~&STRUCTURE-ALLOCATION-CACHE-PASSED~%"))
 (run)
