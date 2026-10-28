@@ -1038,6 +1038,40 @@ footholds will be reenabled, otherwise footholds will stay inhibited."
        (%call-on-wired-stack-without-interrupts #'%resume-the-world nil)
        (broadcast-wakeup-ipi)))))
 
+(defun call-with-world-stopped-or-panic (thunk)
+  "Stop and quiesce the world, then call THUNK with footholds inhibited.
+Resume only after THUNK returns normally. Any nonlocal exit before the complete
+release and wakeup panics; it cannot return to a caller. Failure before release
+retains the stop. Failure after release has begun is a machine fail-stop.
+THUNK must include all fallible completion work for its destructive operation.
+The usual world-stop exclusion, residency and service restrictions still apply."
+  (without-footholds
+    (let ((self (current-thread)))
+      (when (eql *world-stopper* self)
+        (panic "Nested world stop!"))
+      (when *pseudo-atomic*
+        (panic "Stopping world while pseudo-atomic!"))
+      (ensure-interrupts-enabled)
+      (inhibit-thread-pool-blocking-hijack
+       (let ((released nil))
+         ;; Establish the failure boundary before acquisition: even a failed
+         ;; acquisition must never unwind into arbitrary allocating code.
+         (unwind-protect
+              (multiple-value-prog1
+                  (progn
+                    (%call-on-wired-stack-without-interrupts #'%stop-the-world nil)
+                    (quiesce-cpus-for-world-stop)
+                    (funcall thunk))
+                (unless (and (eql self (current-thread)) (eql *world-stopper* self))
+                  (panic "World-stop ownership changed before release!"))
+                ;; Preserve the native queued-stopper handoff. A successful
+                ;; release need not make *WORLD-STOPPER* NIL.
+                (%call-on-wired-stack-without-interrupts #'%resume-the-world nil)
+                (broadcast-wakeup-ipi)
+                (setf released t))
+           (unless released
+             (panic "World-stopped operation did not complete!"))))))))
+
 (defmacro with-world-stopped (&body body)
   `(call-with-world-stopped (dx-lambda () ,@body)))
 

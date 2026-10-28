@@ -419,6 +419,7 @@
            #:with-device-access
            #:without-interrupts
            #:with-world-stopped
+           #:call-with-world-stopped-or-panic
            #:make-thread
            #:thread
            #:threadp
