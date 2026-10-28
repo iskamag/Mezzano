@@ -1,0 +1,49 @@
+Structure allocation cache validation, 2026-10-28
+
+Base: slop 8f25d879 plus ceb58134 (fixnum slot loop).
+Host: Ryzen 7 6800H. Guest: x86-64 KVM, 4 vCPUs, 4 GB, make serial-kvm.
+Fresh cold image built successfully; cold startup and snapshot completed.
+GDB confirmed the cache cell was initialized and %ALLOCATE-STRUCT calls
+INSTANCE-ACCESS directly. No slot-name lookup remains in this allocation path.
+
+Passed in the freshly booted image, without manually initializing the cache:
+- tools/tests/structure-allocation-cache.lisp (including warm redefinition)
+- mezzano.structure-layout-test:run
+- mezzano.structure-reparent-test:run
+
+Unmodified /home/iskam/boehm-gc.lisp, depth 20. Both implementations measured
+in the same image, replacing only %ALLOCATE-STRUCT's function definition.
+Baseline helper explicitly uses the cold compiler's default optimization
+policy. A full collection precedes each timed sample; pair order alternates.
+
+Pair  Baseline seconds  Cached seconds
+0     6.58              5.05      (warmup; discard)
+1     5.82              4.95
+2     5.82              4.94
+3     5.89              4.97
+
+Every sample: 3,355,179,104 allocated bytes, 1 minor GC, 0 major GCs;
+timed GC 0.40-0.43 s. Median elapsed falls from 5.82 to 4.95 s (15.0%).
+
+Cached profile (458 direct samples): MAKE-NODE 30.3%, %ALLOCATE-INSTANCE
+21.8%, INSTANCE-ACCESS 12.0%, %DO-ALLOCATE-FROM-GENERAL-AREA 10.5%,
+%ALLOCATE-STRUCT 7.0%. Generic slot representation dispatch still costs time;
+constructor and allocator call chains are the next targets.
+
+Raw evidence in this workspace:
+/tmp/mezzano-perf-build.log
+/tmp/mezzano-perf-gdb.txt
+/tmp/mezzano-perf-cold-serial.log (successful cold startup and snapshot)
+/tmp/mezzano-perf-before-profile.txt
+/tmp/mezzano-perf-after-profile.txt
+home/.mezzano-agent/cef87e6a38174c53bbdf775bae7cf6ee/output.txt (regressions)
+home/.mezzano-agent/539b3f3de73e4346a928c311568d663a/output.txt (measurements)
+
+Runtime remains live at /tmp/mezzano-perf-vm/serial.sock, with serial.log in
+the same directory. Use agent.py --serial /tmp/mezzano-perf-vm/serial.sock.
+Image: /tmp/mezzano-perf-cold.image; GDB: 127.0.0.1:1234.
+
+An older unrelated image could not provide a valid baseline. Its version-36
+LLFs also caused a documented version mismatch on this version-37 build.
+229 stale LLFs were moved aside to /tmp/mezzano-perf-stale-llf36 (not deleted).
+No make clean was used; no structure layout changed.
