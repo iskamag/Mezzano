@@ -189,10 +189,6 @@ This is required to make the GC interrupt safe."
            (when (not (eq ,orig ,(car stores)))
              ,setter)))))
 
-(defun scavenge-many (address n cycle-kind)
-  (dotimes (i n)
-    (scavengef (memref-t address i) cycle-kind)))
-
 ;;; This only scavenges the stack/registers. Scavenging the actual
 ;;; thread object is done by scan-thread.
 (defun scavenge-current-thread ()
@@ -211,8 +207,11 @@ This is required to make the GC interrupt safe."
 (defun object-base-address (object)
   (logand (lisp-object-address object) (lognot #xF)))
 
+(declaim (maybe-inline scavenge-object))
 (defun scavenge-object (object cycle-kind)
   "Scavenge one object, returning an updated pointer."
+  ;; Keep the instance-header recursion out of inlined callers.
+  (declare (notinline scavenge-object))
   (when (immediatep object)
     ;; Don't care about immediate objects, return them unchanged.
     (return-from scavenge-object object))
@@ -261,6 +260,20 @@ This is required to make the GC interrupt safe."
       (#.+address-tag-stack+
        ;; Don't scavenge DX objects, handled by scavenge-regular-stack-frame.
        object))))
+
+(defun scavenge-many (address n cycle-kind)
+  ;; Heap/stack addresses and word counts fit in fixnums on both targets.
+  (declare (type fixnum address n)
+           (inline scavenge-object)
+           (optimize (speed 3) (safety 0)))
+  (dotimes (i n)
+    (declare (type fixnum i))
+    (let ((original (memref-t address i)))
+      ;; NIL is an explicit major root; the remembered set covers it in minors.
+      (unless (or (null original) (immediatep original))
+        (let ((updated (scavenge-object original cycle-kind)))
+          (unless (eq original updated)
+            (setf (memref-t address i) updated)))))))
 
 (defun scan-error (object)
   (mezzano.supervisor:panic "Unscannable object " object))
@@ -1184,6 +1197,8 @@ a pointer to the new object. Leaves a forwarding pointer in place."
 
 (defun allocate-for-transport (object address length)
   "Allocate memory in the appropriate area for this object."
+  (declare (type fixnum length *cons-area-old-gen-bump* *general-area-old-gen-bump*)
+           (optimize (speed 3) (safety 0)))
   (cond ((consp object)
          ;; Object staying in or moving to old generation.
          (prog1
@@ -1211,21 +1226,25 @@ a pointer to the new object. Leaves a forwarding pointer in place."
     (incf (svref *gc-transport-cycles* bin) cycles)))
 
 (defun transport-object-start-update (object new-address length)
+  (declare (type fixnum new-address length)
+           (optimize (speed 3) (safety 0)))
   ;; Conses are exempt as the cons area has a uniform layout.
   (when (not (consp object))
     (loop
-       for card from (align-up new-address +card-size+) below (+ new-address (* length 8)) by +card-size+
-       for delta = (- new-address card)
+       for card of-type fixnum from (align-up new-address +card-size+) below (+ new-address (* length 8)) by +card-size+
+       for delta of-type fixnum = (- new-address card)
        do (setf (card-table-offset card)
                 (if (<= delta (- (* (1- (ash 1 (byte-size +card-table-entry-offset+))) 16)))
                     nil
                     delta)))))
 
 (defun really-transport-object (object cycle-kind)
+  (declare (optimize (speed 3) (safety 0)))
   (let* ((address (object-base-address object))
          (start-time (when *gc-enable-transport-metering* (tsc)))
-         (length (object-size object))
-         (new-address nil))
+         (length (the fixnum (object-size object)))
+         (new-address 0))
+    (declare (type fixnum address length new-address))
     ;; Update meters.
     (incf *objects-copied*)
     (incf *words-copied* length)
@@ -1419,6 +1438,9 @@ a pointer to the new object. Leaves a forwarding pointer in place."
            (scan-object object :major)))))
 
 (defun scavenge-dynamic (cycle-kind)
+  (declare (type fixnum *scavenge-general-old-finger* *scavenge-cons-old-finger*
+                        *general-area-old-gen-bump* *cons-area-old-gen-bump*)
+           (optimize (speed 3) (safety 0)))
   (loop
      (gc-log
       "Old general. " cycle-kind " Limit: " *general-area-old-gen-limit*
@@ -1442,7 +1464,7 @@ a pointer to the new object. Leaves a forwarding pointer in place."
                                                  *old-gen-newspace-bit*
                                                  +address-old-generation+)
                                          +tag-object+))
-               (size (object-size object)))
+               (size (the fixnum (object-size object))))
           (when (oddp size)
             (incf size))
           (scan-object object cycle-kind)
