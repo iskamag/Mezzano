@@ -174,6 +174,7 @@
   (nth-value 1 (parse-format-control-substring control-string 0 nil)))
 
 (defparameter *format-interpreters* '())
+(defvar *format-argument-origin* nil)
 
 (defun format-interpreter (character)
   (check-type character character)
@@ -259,6 +260,55 @@
           (when (and at-sign (not (minusp n)))
             (write-char #\+ stream))
           (write n :stream stream :escape nil :radix nil :base base :readably nil)))))
+
+(defun format-monetary (stream object params at-sign colon)
+  "Print a monetary value with the requested precision, sign and padding."
+  (let ((digits (or (first params) 2))
+        (minimum-integer-digits (or (second params) 1))
+        (width (or (third params) 0))
+        (padchar (or (fourth params) #\Space))
+        (*print-escape* nil)
+        (*print-readably* nil))
+    (check-type digits (integer 0))
+    (check-type minimum-integer-digits (integer 0))
+    (check-type width (integer 0))
+    (check-type padchar character)
+    (unless (realp object)
+      (return-from format-monetary
+        (format-integer stream object 10 (list width) nil nil)))
+    ;; Infinity and NaN have implementation-specific printed representations.
+    (when (and (floatp object)
+               (or (mezzano.internals::float-nan-p object)
+                   (mezzano.internals::float-infinity-p object)))
+      (return-from format-monetary (mezzano.internals::write-float object stream)))
+    (let* ((negative (if (floatp object)
+                         (minusp (float-sign object))
+                         (minusp object)))
+           (sign (cond (negative #\-) (at-sign #\+)))
+           (scale (expt 10 digits))
+           ;; Rational arithmetic avoids overflow and loss of precision when
+           ;; scaling a float before rounding.
+           (scaled (multiple-value-bind (whole remainder)
+                       (floor (* (abs (rational object)) scale))
+                     (if (>= (* 2 remainder) 1) (1+ whole) whole)))
+           (integer-part (truncate scaled scale))
+           (fraction-part (rem scaled scale))
+           (integer-string (if (and (zerop integer-part) (zerop minimum-integer-digits))
+                               ""
+                               (write-to-string integer-part :base 10 :radix nil)))
+           (fraction-string (write-to-string fraction-part :base 10 :radix nil))
+           (zeroes (max 0 (- minimum-integer-digits (length integer-string))))
+           (padding (max 0 (- width (+ (if sign 1 0) zeroes
+                                       (length integer-string) 1 digits)))))
+      (when (and colon sign) (write-char sign stream))
+      (dotimes (i padding) (write-char padchar stream))
+      (when (and (not colon) sign) (write-char sign stream))
+      (dotimes (i zeroes) (write-char #\0 stream))
+      (write-string integer-string stream)
+      (write-char #\. stream)
+      (when (plusp digits)
+        (dotimes (i (- digits (length fraction-string))) (write-char #\0 stream))
+        (write-string fraction-string stream)))))
 
 (defvar *cardinal-names-1*
   '("zero" "one" "two" "three" "four" "five" "six" "seven" "eight" "nine"
@@ -410,24 +460,44 @@
 ;;; TODO: F, E, G, $
 
 (define-format-interpreter #\$ (at-sign colon &optional (d 2) (n 1) (w 0) (padchar #\Space))
-  (let ((arg (consume-argument)))
-    (when (realp arg)
-      (setf arg (float 0.0f0)))
-    (format t "~D" arg)))
+  (format-monetary *standard-output* (consume-argument) (list d n w padchar) at-sign colon))
 
 ;;;; 22.3.4 FORMAT Printer Operations.
 
-(define-format-interpreter #\A (nil colon &optional mincol colinc minpad padchar)
-  (let ((arg (consume-argument)))
-    (if (and (null arg) colon)
-        (write-string "()")
-        (write arg :escape nil :readably nil))))
+(defun print-format-padded-object (object stream)
+  (write object :stream stream))
 
-(define-format-interpreter #\S (nil colon &optional mincol colinc minpad padchar)
-  (let ((arg (consume-argument)))
-    (if (and (null arg) colon)
-        (write-string "()")
-        (write arg :escape t))))
+(defvar *format-padded-object-printer* 'print-format-padded-object)
+
+(defun format-padded-object (stream object mincol colinc minpad padchar at-sign colon)
+  (setf mincol (or mincol 0) colinc (or colinc 1)
+        minpad (or minpad 0) padchar (or padchar #\Space))
+  (check-type mincol (integer 0))
+  (check-type colinc (integer 1))
+  (check-type minpad (integer 0))
+  (check-type padchar character)
+  ;; FORMAT is used before string streams have been initialized.
+  (when (and (zerop mincol) (zerop minpad))
+    (return-from format-padded-object
+      (if (and colon (null object))
+          (write-string "()" stream)
+          (write object :stream stream))))
+  (let* ((text (if (and colon (null object))
+                   "()"
+                   (with-output-to-string (buffer)
+                     (funcall *format-padded-object-printer* object buffer))))
+         (padding (+ minpad (* colinc (ceiling (max 0 (- mincol (length text) minpad)) colinc)))))
+    (when at-sign (dotimes (i padding) (write-char padchar stream)))
+    (write-string text stream)
+    (unless at-sign (dotimes (i padding) (write-char padchar stream)))))
+
+(define-format-interpreter #\A (at-sign colon &optional mincol colinc minpad padchar)
+  (let ((*print-escape* nil) (*print-readably* nil))
+    (format-padded-object *standard-output* (consume-argument) mincol colinc minpad padchar at-sign colon)))
+
+(define-format-interpreter #\S (at-sign colon &optional mincol colinc minpad padchar)
+  (let ((*print-escape* t))
+    (format-padded-object *standard-output* (consume-argument) mincol colinc minpad padchar at-sign colon)))
 
 (define-format-interpreter #\W (at-sign colon)
   (cond
@@ -453,7 +523,7 @@
 
 ;;; TODO
 (defun format-justification (args inner at-sign colon end-at-sign params)
-  (interpret-format-control inner args))
+  (interpret-format-control inner args *format-argument-origin*))
 
 (define-format-interpreter #\I (nil colon &optional count)
   (check-type count (or integer null))
@@ -498,7 +568,7 @@
 
 ;;; TODO!
 (defun format-logical-block (args inner at-sign colon end-at-sign params)
-  (interpret-format-control inner args))
+  (interpret-format-control inner args *format-argument-origin*))
 
 ;;;; 22.3.7 FORMAT Control-Flow Operations.
 
@@ -515,7 +585,9 @@
                      args)
                     (t (when (endp args)
                          (error "No more format arguments."))
-                       (pop args)))))
+                         (pop args))))
+        (origin (if at-sign *format-argument-origin* nil)))
+    (unless at-sign (setf origin list))
     (check-type n (or null integer))
     (catch 'escape-upwards
       (loop
@@ -525,7 +597,7 @@
              (interpret-format-control inner
                                        (pop list))
              (setf list (interpret-format-control inner
-                                                  list)))))
+                                                  list origin)))))
     (if at-sign
         list
         args)))
@@ -571,7 +643,7 @@
              (error "No more format arguments."))
            (cond ((first args)
                   (interpret-format-control (first clauses)
-                                            args))
+                                            args *format-argument-origin*))
                  (t (pop args) args)))
           (colon ; Select first clause if argument is false, second if true.
            (when params (error "~~:[ expects no parameters."))
@@ -584,7 +656,7 @@
            (interpret-format-control (if (pop args)
                                          (second clauses)
                                          (first clauses))
-                                     args))
+                                     args *format-argument-origin*))
            (t (when (rest params)
                 (error "~~[ expects at most one parameter."))
               (when (and (null (first params)) (endp args))
@@ -595,15 +667,15 @@
                            (>= arg (length clauses)))
                        (if defaultp
                            (interpret-format-control default
-                                                     args)
+                                                     args *format-argument-origin*)
                            args))
                       (t (interpret-format-control (nth arg clauses)
-                                                   args))))))))
+                                                   args *format-argument-origin*))))))))
 
 (define-format-interpreter #\? (at-sign nil)
   (let ((control (parse-format-control (consume-argument))))
     (cond (at-sign
-           (return (interpret-format-control control (remaining-arguments))))
+           (return (interpret-format-control control (remaining-arguments) *format-argument-origin*)))
           (t (interpret-format-control control (consume-argument))))))
 
 ;;;; 22.3.8 FORMAT Miscellaneous Operations.
@@ -621,15 +693,16 @@
                                   (at-sign
                                    :sentencecase)
                                   (t :downcase)))))
-    (interpret-format-control inner args)))
+    (interpret-format-control inner args *format-argument-origin*)))
 
 (define-format-interpreter #\P (at-sign colon)
   (let ((arg (if colon
-                 ;; FIXME: Should back up by one.
-                 (first (remaining-arguments))
+                 (loop for tail on *format-argument-origin*
+                       when (eq (cdr tail) (remaining-arguments))
+                         return (car tail)
+                       finally (error "No previous format argument for ~~:P."))
                  (consume-argument))))
-    (if (and (numberp arg)
-             (= arg 1))
+    (if (eql arg 1)
         (if at-sign
             (write-string "y"))
         (if at-sign
@@ -655,42 +728,45 @@
       (format-logical-block args inner at-sign colon end-at-sign params)
       (format-justification args inner at-sign colon end-at-sign params)))
 
-(defun interpret-format-control (control args)
-  (flet ((compute-parameters (params)
-           (mapcar (lambda (p)
-                     (cond ((eql p :v)
-                            (when (endp args)
-                              (error "No more arguments for V parameter."))
-                            (pop args))
-                           ((eql p :sharp-sign)
-                            (length args))
-                           (t p)))
-                   params)))
-    (dolist (element control)
-      (etypecase element
-        (string (write-string element))
-        (block-directive
-         (setf args (funcall (ecase (block-directive-character element)
-                               (#\( #'format-case-correcting)
-                               (#\[ #'format-conditional)
-                               (#\< #'format-justification-or-logical-block)
-                               (#\{ #'format-iteration))
-                             args
-                             (block-directive-inner element)
-                             (block-directive-start-at-sign element)
-                             (block-directive-start-colon element)
-                             (block-directive-end-at-sign element)
-                             (block-directive-end-colon element)
-                             (compute-parameters (block-directive-parameters element)))))
-        (directive
-         (let ((fn (format-interpreter (directive-character element))))
-           (when (not fn)
-             (error "Unknown format directive ~S!" (directive-character element)))
-           (setf args (apply fn args
-                             (directive-at-sign element)
-                             (directive-colon element)
-                             (compute-parameters (directive-parameters element)))))))))
-  args)
+(defun interpret-format-control (control args &optional (origin args))
+  (let ((*format-argument-origin* origin))
+    (flet ((compute-parameters (params)
+             (mapcar (lambda (p)
+                       (cond ((eql p :v)
+                              (when (endp args)
+                                (error "No more arguments for V parameter."))
+                              (pop args))
+                             ((eql p :sharp-sign)
+                              (length args))
+                             (t p)))
+                     params)))
+      (dolist (element control)
+        (etypecase element
+          (string (write-string element))
+          (block-directive
+           (let ((params (compute-parameters (block-directive-parameters element))))
+             (setf args (funcall (ecase (block-directive-character element)
+                                   (#\( #'format-case-correcting)
+                                   (#\[ #'format-conditional)
+                                   (#\< #'format-justification-or-logical-block)
+                                   (#\{ #'format-iteration))
+                                 args
+                                 (block-directive-inner element)
+                                 (block-directive-start-at-sign element)
+                                 (block-directive-start-colon element)
+                                 (block-directive-end-at-sign element)
+                                 (block-directive-end-colon element)
+                                 params))))
+          (directive
+           (let ((fn (format-interpreter (directive-character element))))
+             (when (not fn)
+               (error "Unknown format directive ~S!" (directive-character element)))
+             (let ((params (compute-parameters (directive-parameters element))))
+               (setf args (apply fn args
+                                 (directive-at-sign element)
+                                 (directive-colon element)
+                                 params))))))))
+    args))
 
 (defun format (destination control-string &rest arguments)
   (flet ((do-format (stream)

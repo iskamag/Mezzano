@@ -1,0 +1,23 @@
+(in-package :mezzano.internals)
+
+;;;; Load in a running Mezzano image.
+(let ((cases '(("~$" 3.14159 "3.14")
+               ("~$" 42 "42.00")
+               ("~$" 1/8 "0.13")
+               ("~0$" 2.75 "3.")
+               ("~6$" 1/8 "0.125000")
+               ("~2,3,10,'*:$" -4.5 "-***004.50")
+               ("~2,3,10,'*@$" 4.5 "***+004.50")
+               ("~$" -0.0 "-0.00"))))
+  (dolist (case cases)
+    (destructuring-bind (control value expected) case
+      (let ((actual (format nil control value)))
+        (unless (string= actual expected)
+          (error "~S with ~S: expected ~S, got ~S" control value expected actual)))))
+  (let ((result (with-output-to-string (stream)
+                  (write-string "prefix " stream)
+                  (format stream "~$" 1.5))))
+    (assert (string= result "prefix 1.50")))
+  (format t "Monetary format regressions: ~D checks passed.~%" (1+ (length cases))))
+
+(mezzano.supervisor:debug-print-line "MONETARY-FORMAT-GUEST-PASSED")

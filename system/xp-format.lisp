@@ -346,22 +346,22 @@
             `(let ,(mapcar #'list vars params)
                (funcall (symbol-function ',fn) xp ,(get-arg) ,colon ,atsign ,@ vars)))))))
 
-;; TODO: Process mincol,colinc,minpad,padchar.
 (defun impl-A/S (start end escape-value readably-is-nil)
   (declare (ignore end))
   (multiple-value-bind (colon atsign params)
       (parse-params start '(0 1 0 #\Space))
-    (declare (ignore atsign))
-    `(let ((*print-escape* ,escape-value)
-           ,@(when readably-is-nil
-               `((*print-readably* nil))))
-       ,@params
-       ,(if colon
-            `(let ((arg ,(get-arg)))
-               (if arg
-                   (write+ arg XP)
-                   (write-string++ "()" XP 0 2)))
-            `(write+ ,(get-arg) XP)))))
+    `(let* ((mincol ,(first params))
+            (colinc ,(second params))
+            (minpad ,(third params))
+            (padchar ,(fourth params))
+            (arg ,(get-arg))
+            (*print-escape* ,escape-value)
+            ,@(when readably-is-nil `((*print-readably* nil))))
+       (if (and (eql mincol 0) (eql minpad 0) (eql colinc 1) (eql padchar #\Space))
+           ,(if colon
+                `(if arg (write+ arg XP) (write-string++ "()" XP 0 2))
+                `(write+ arg XP))
+           (mezzano.format::format-padded-object XP arg mincol colinc minpad padchar ',atsign ',colon)))))
 
 (def-format-handler #\A (start end)
   (impl-A/S start end nil t))
@@ -485,19 +485,7 @@
        (format-general-float XP ,(get-arg) the-params ',atsign ',colon))))
 
 (defun format-monetary (stream object params atsign colon)
-  (declare (ignore atsign colon))
-  (let ((d (or (first params) 2))
-        (e (or (second params) 1))
-        (w (or (third params) 0))
-        (padchar (or (fourth params) #\Space)))
-    ;; TODO.
-    (declare (ignore d e padchar))
-    (let ((*print-escape* nil)
-          (*print-readably* nil))
-      (if (realp object)
-          (mezzano.internals::write-float (float object) stream)
-          ;; Format as if by ~wD
-          (mezzano.format::format-integer stream object 10 (list w) nil nil)))))
+  (mezzano.format::format-monetary stream object params atsign colon))
 
 (def-format-handler #\$ (start end)
   (declare (ignore end))
@@ -833,6 +821,22 @@
         (if (null white) (return (nreverse result)))))))
 
  ) ;end of eval when for all (formatter "...") stuff.
+
+(defun print-format-circle-list (stream list)
+  ;; Use XP's cycle-aware list traversal without inserting pretty newlines.
+  (pprint-logical-block (stream list :prefix "(" :suffix ")")
+    (pprint-exit-if-list-exhausted)
+    (loop (write+ (pprint-pop) stream)
+          (pprint-exit-if-list-exhausted)
+          (write-char++ #\Space stream))))
+
+(defun print-format-padded-object (object stream)
+  ;; The regular non-pretty list printer does not detect circular tails.
+  ;; Keep the caller's *PRINT-PRETTY* binding while XP tracks those tails.
+  (let ((*format-circle-printing* t))
+    (maybe-initiate-xp-printing (lambda (xp value) (write+ value xp)) stream object)))
+
+(setf mezzano.format::*format-padded-object-printer* #'print-format-padded-object)
 
 
 ;Any format string that is converted to a function is always printed
