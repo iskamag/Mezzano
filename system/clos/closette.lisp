@@ -254,9 +254,17 @@ the old or new values are expected to be unbound.")
         (setf (gethash slot-name *fast-slot-value-readers*) gf)))
     gf))
 
+(defun make-slot-value-reader (slot-name)
+  ;; Share method lookup and invalidation, but keep receiver locality at the
+  ;; compiled call site instead of sharing one last-cell across all users of
+  ;; a slot name. The result is an ordinary closure, not a funcallable instance.
+  (compute-reader-discriminator (fast-slot-value-reader slot-name) nil 0 nil t))
+
 (define-compiler-macro slot-value (&whole whole object slot-name)
   (cond ((typep slot-name '(cons (eql quote) (cons symbol null)))
-         `(funcall (load-time-value (fast-slot-value-reader ,slot-name))
+         ;; The factory always returns a closure; no function-designator
+         ;; coercion is needed each time this call site executes.
+         `(mezzano.runtime::%funcall (load-time-value (make-slot-value-reader ,slot-name))
                    ,object))
         (t
          whole)))
@@ -325,9 +333,12 @@ the old or new values are expected to be unbound.")
         (setf (gethash slot-name *fast-slot-value-writers*) gf)))
     gf))
 
+(defun make-slot-value-writer (slot-name)
+  (compute-writer-discriminator (fast-slot-value-writer slot-name) nil 1 nil t))
+
 (define-compiler-macro (setf slot-value) (&whole whole value object slot-name)
   (cond ((typep slot-name '(cons (eql quote) (cons symbol null)))
-         `(funcall (load-time-value (fast-slot-value-writer ,slot-name))
+         `(mezzano.runtime::%funcall (load-time-value (make-slot-value-writer ,slot-name))
                    ,value
                    ,object))
         (t
@@ -1908,6 +1919,14 @@ has only has class specializer."
    (single-dispatch-emf-table-table emf-table)
    (sys.int::layout-class layout) (sys.int::layout-hash layout)))
 
+(defun slot-value-cache-cell (gf layout)
+  ;; Finalizing a shared GF invalidates its old cells and replaces its table.
+  ;; Consult the current table on a call-site miss; tracing or changed methods
+  ;; may have switched it to another cache representation.
+  (let ((table (classes-to-emf-table gf)))
+    (when (single-dispatch-emf-table-p table)
+      (accessor-cache-cell table layout))))
+
 (defstruct (reader-discriminator-entry :sealed)
   (layout nil :read-only t)
   (location nil :read-only t)
@@ -1931,7 +1950,8 @@ has only has class specializer."
       (read-cached-slot object storage entry)
       (slot-value object (reader-discriminator-entry-slot-name entry))))
 
-(defun compute-reader-discriminator (gf emf-table argument-offset slot-definition)
+(defun compute-reader-discriminator (gf emf-table argument-offset slot-definition
+                                     &optional call-site-p)
   (declare (ignore slot-definition))
   (let ((last-cell nil))
     (lambda (object)
@@ -1949,14 +1969,18 @@ has only has class specializer."
                          (eq layout (reader-discriminator-entry-layout
                                        (the reader-discriminator-entry entry))))
                 (return (read-cached-slot object storage entry)))
-              (setf cell (accessor-cache-cell emf-table layout)
+              (setf cell (if call-site-p
+                            (slot-value-cache-cell gf layout)
+                            (accessor-cache-cell emf-table layout))
                     last-cell cell
                     entry (and cell
                                (sys.int::%weak-pointer-value
                                 (the mezzano.extensions:weak-pointer cell))))
               (when (reader-discriminator-entry-p entry)
                 (return (read-accessor-entry object storage layout entry))))))
-        (slow-single-dispatch-method-lookup* gf argument-offset (list object) :reader)))))
+        (if call-site-p
+            (funcall gf object)
+            (slow-single-dispatch-method-lookup* gf argument-offset (list object) :reader))))))
 
 (defstruct (writer-discriminator-entry :sealed)
   (location nil :read-only t)
@@ -1987,7 +2011,8 @@ has only has class specializer."
       (setf (slot-value object (writer-discriminator-entry-slot-name entry))
             new-value)))
 
-(defun compute-writer-discriminator (gf emf-table argument-offset slot-definition)
+(defun compute-writer-discriminator (gf emf-table argument-offset slot-definition
+                                     &optional call-site-p)
   (declare (ignore slot-definition))
   (let ((last-cell nil))
     (lambda (new-value object)
@@ -2002,14 +2027,18 @@ has only has class specializer."
                          (eq layout (writer-discriminator-entry-layout
                                        (the writer-discriminator-entry entry))))
                 (return (write-cached-slot new-value storage entry)))
-              (setf cell (accessor-cache-cell emf-table layout)
+              (setf cell (if call-site-p
+                            (slot-value-cache-cell gf layout)
+                            (accessor-cache-cell emf-table layout))
                     last-cell cell
                     entry (and cell
                                (sys.int::%weak-pointer-value
                                 (the mezzano.extensions:weak-pointer cell))))
               (when (writer-discriminator-entry-p entry)
                 (return (write-accessor-entry new-value object storage layout entry))))))
-        (slow-single-dispatch-method-lookup* gf argument-offset (list new-value object) :writer)))))
+        (if call-site-p
+            (funcall gf new-value object)
+            (slow-single-dispatch-method-lookup* gf argument-offset (list new-value object) :writer))))))
 
 (defun compute-1-effective-discriminator (gf emf-table argument-offset)
   ;; TODO: This table should be a weak-alist, but that's not thread-safe.
