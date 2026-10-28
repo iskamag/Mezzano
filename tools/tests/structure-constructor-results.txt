@@ -1,0 +1,58 @@
+Small structure constructor inlining, 2026-10-28
+
+Base: a06ac410, with the cached structure layout slot read already installed.
+Small standard keyword constructors now default to INLINE. Calls with known
+keywords avoid temporary argument-list construction and repeated scanning.
+Local NOTINLINE still forces an ordinary call. Large constructors and BOA
+constructors keep their previous policy.
+
+Compiler inlining now retains the named call when its arguments cannot match
+the known lambda list. Previously it embedded a copy of the old function even
+when lambda lifting declined the call. The structure-layout regression exposed
+this with a call using :ADDED, compiled before redefinition introduced that
+slot. Retaining the named call lets it reach the rebuilt constructor.
+
+Validation:
+- Fresh cold build succeeded, no layout change and no make clean.
+- Cold startup completed in 45.88 s (2.45 s GC), with no panic; snapshot saved.
+- Fresh reboot passed allocation-cache, compatible-layout, reparenting, and
+  new constructor-inline regressions. New tests cover default evaluation order,
+  duplicate keywords, explicit NIL, NOTINLINE, defaults after redefinition,
+  changed storage, future keywords, and computed keywords.
+- Profile and disassembly confirm ordinary MAKE-NODE calls have disappeared
+  from the fast path; obsolete-constructor slow paths remain.
+
+Unmodified /home/iskam/boehm-gc.lisp compiled in separate packages for ordinary
+and inline variants, same guest, depth 20, alternating order. KVM x86-64,
+4 vCPUs, 4 GB RAM, Ryzen 7 6800H host. Discard pair 0 for warmup.
+
+Pair  Ordinary seconds  Inline seconds
+1     5.07              3.74
+2     4.74              3.83
+3     4.40              3.78
+
+Median elapsed reduction: 4.74 to 3.78 s (20.3%). Median paired reduction:
+19.2%. Each sample: 3,355,179,104 bytes, 1 minor GC, 0 major GCs.
+GC ranged 0.40-0.47 s. Earlier experiment also showed a consistent ~18% win.
+These are incremental comparisons against the optimized allocator, not against
+SBCL. SBCL's separate host reference remains approximately 1.05 s.
+
+Final profile (317 direct samples): %ALLOCATE-INSTANCE 31.2%, POPULATE 16.7%,
+%DO-ALLOCATE-FROM-GENERAL-AREA 14.5%, MAKE-TREE 13.9%, %ALLOCATE-STRUCT 9.5%,
+STRUCTURE-CLASS-P 8.8%. The remaining allocation helper chain is the next target.
+
+Reproduction: load tools/tests/structure-allocation-benchmark.lisp and
+structure-constructor-benchmark.lisp, then call
+(compare-structure-constructors #P"REMOTE:/path/to/boehm-gc.lisp").
+
+Evidence in this workspace:
+/tmp/mezzano-perf-inline-build.log
+/tmp/mezzano-perf-inline-cold-boot.log
+/tmp/mezzano-perf-inline-profile.txt
+/tmp/mezzano-perf-inlined-disassembly.txt
+home/.mezzano-agent/965b914712854d97a0ac6efb9d52cc1e/output.txt (regressions)
+home/.mezzano-agent/22e54d95d7ab46dea58840e1e94b6b37/output.txt (timings)
+
+Current guest: /tmp/mezzano-perf-inline-cold.image, launched with make serial-kvm
+through the temporary QEMU wrapper. Serial: /tmp/mezzano-perf-vm/serial.sock,
+log: /tmp/mezzano-perf-vm/serial.log, GDB port: 127.0.0.1:1234.
