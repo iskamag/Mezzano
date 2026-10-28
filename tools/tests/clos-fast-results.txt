@@ -107,3 +107,50 @@ Focused guest regressions passed:
 
 The call-site/vector refinements were guest-compiled and hotloaded; no new
 cold boot or ARM64 runtime validation was performed for this increment.
+
+Rebuilt slop validation and metadata lookup correction (2026-10-28)
+
+Booted the user's rebuilt e365ff4d image with make serial-kvm. Confirmed
+revision and ABI 38. Before implementation hotloads, all CLOS/GC/vector
+regressions passed, including 2,921,992 concurrent access/GC iterations.
+Initial rebuilt-image timing, three compiles per source:
+SOURCE analysis.lisp N 3 WALL 3140000 CPU 3099452 BYTES 482283376 GC 0.0
+SOURCE cfg.lisp      N 3 WALL 1640000 CPU 1623583 BYTES 261729920 GC 0.0
+
+This does NOT establish a 13% overall gain against the original Lisp helpers.
+Their early measurements were analysis 2.99-3.13s and cfg 1.78-1.80s for three
+compiles. The earlier 13% claim compared an intermediate refactored state.
+
+A fresh analysis compilation profile exposed 13/302 direct samples in
+SLOT-LOCATION-USING-LAYOUT: polymorphic slot call sites repeatedly fetched
+the current GF cache through STD-SLOT-VALUE. CLASS-TYPEP and metadata access
+were another substantial cost. The correction gives CLASSES-TO-EMF-TABLE
+an exact-layout known-offset path and makes SAFE-CLASS-PRECEDENCE-LIST pair
+its layout guard with the same physical storage used for the read. Custom,
+obsolete and superseded layouts keep their fallback paths. Call sites still
+read the GF's current table; no detached table is retained across calls.
+
+After hotloading these getters (same rebuilt image):
+SOURCE analysis.lisp N 3 WALL 2660000 CPU 2639839 BYTES 482286288 GC 0.0
+SOURCE cfg.lisp      N 3 WALL 1530000 CPU 1520724 BYTES 261730656 GC 0.0
+
+Control: temporarily restored only the original two getters from e365ff4d,
+keeping the same image and compiled callers. Patched getters restored in
+UNWIND-PROTECT afterward:
+SOURCE analysis.lisp N 3 WALL 2980000 CPU 2960581 BYTES 482284784 GC 0.0
+SOURCE cfg.lisp      N 3 WALL 1660000 CPU 1639513 BYTES 261732576 GC 0.0
+UNITS 1000000
+
+Observed reduction against this same-image control: analysis 10.8%, cfg 7.2%.
+This is one pair of three-compile batches, not a confidence interval.
+Allocation remains effectively unchanged. No profiler/GDB during timing.
+
+Metadata regression passed: standard/custom GF lookup, distinct cache tables,
+supersession through same/different layouts, full GC, CPL across standard,
+built-in, funcallable and structure metaclasses, and invalid-input fallback.
+Full CLOS/GC/vector suites passed with the getters installed, including
+4,237,775 concurrent access/GC iterations. Disassembly confirms the common
+metadata paths have direct guarded reads instead of slot-name searches or
+separate class-predicate calls. The updated INITIALIZE-CLOS guest-compiles,
+and its primordial slot lookup agrees with the hotloaded offset. Its new
+bootstrap initialization has not been exercised by another cold build/boot.

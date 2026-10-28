@@ -134,6 +134,13 @@ call sites through the same weak cells, including changes to dispatch mode.
 The generated call needs no function-designator coercion: the load-time
 factory always returns a closure. Calls allocate no additional cache objects.
 
+Reading the current table of an exact standard generic function uses a
+bootstrap slot offset guarded by the captured physical storage's layout.
+Class precedence-list reads use the same protocol for standard and built-in
+class metaobjects. Obsolete, superseded, and custom layouts retain their
+ordinary lookup/MOP paths. This avoids repeated metadata slot-name searches
+without caching a detached dispatch table across calls.
+
 Compiled structure access follows the same rule for mutable layouts. Sealed
 structures whose ancestry also has permanent layouts keep direct accesses;
 those allocations cannot be superseded through class redefinition. When an
