@@ -661,30 +661,25 @@ the GC must be deferred during FILL-WORDS."
   ;; Attempt to quickly allocate a cons.
   ;; Returns (values car cdr t) on failure, just the cons on success.
   ;; R8 = car; R9 = cdr
-  ;; Fetch symbol value cells.
-  (sys.lap-x86:mov64 :r13 (:symbol-global-cell sys.int::*cons-area-young-gen-bump*))
-  (sys.lap-x86:mov64 :r12 (:symbol-global-cell sys.int::*young-gen-newspace-bit-raw*))
-  (sys.lap-x86:mov64 :r11 (:symbol-global-cell sys.int::*cons-area-young-gen-limit*))
-  ;; R13 = bump. R12 = newspace-bit. R11 = limit.
+  ;; The buffer already contains absolute addresses for this semispace.
   (:gc :no-frame :layout #*0 :restart t)
-  ;; Fetch and increment the current bump pointer.
-  (sys.lap-x86:mov64 :rbx #.(ash 16 #.sys.int::+n-fixnum-bits+)) ; 16, size of cons
-  (sys.lap-x86:lock)
-  (sys.lap-x86:xadd64 (:object :r13 #.sys.int::+symbol-value-cell-value+) :rbx)
+  (sys.lap-x86:gs)
+  (sys.lap-x86:mov64 :r11 (:object nil #.mezzano.supervisor::+thread-cons-tlab-limit+))
+  ;; Only this thread owns the buffer. No atomic RMW is needed.
+  (sys.lap-x86:gs)
+  (sys.lap-x86:mov64 :rbx (:object nil #.mezzano.supervisor::+thread-cons-tlab-bump+))
   ;; RBX is old bump pointer, the address of the cons.
   ;; Find the new bump pointer.
-  (sys.lap-x86:lea64 :rsi (:rbx #.(ash 16 #.sys.int::+n-fixnum-bits+)))
+  (sys.lap-x86:lea64 :rsi (:rbx 16))
   ;; Test against limit.
-  (sys.lap-x86:cmp64 :rsi (:object :r11 #.sys.int::+symbol-value-cell-value+))
+  (sys.lap-x86:cmp64 :rsi :r11)
   (sys.lap-x86:ja SLOW-PATH)
-  ;; Generate the cons object.
-  ;; Unfixnumize address. This still looks like a fixnum due to alignment.
-  (sys.lap-x86:shr64 :rbx #.sys.int::+n-fixnum-bits+)
-  ;; Set address bits, tag bits, and the mark bit.
-  (sys.lap-x86:mov64 :rax #.(logior (ash sys.int::+address-tag-cons+ sys.int::+address-tag-shift+)
-                                    sys.int::+tag-cons+))
-  (sys.lap-x86:or64 :rax (:object :r12 #.sys.int::+symbol-value-cell-value+))
-  (sys.lap-x86:or64 :rbx :rax)
+  (sys.lap-x86:gs)
+  (sys.lap-x86:mov64 (:object nil #.mezzano.supervisor::+thread-cons-tlab-bump+) :rsi)
+  (sys.lap-x86:prefetchnta (:rsi))
+  ;; Aligned raw addresses look like fixnums until tagging, so GC can scan
+  ;; an exhausted buffer's bump without mistaking it for a live cons.
+  (sys.lap-x86:or64 :rbx #.sys.int::+tag-cons+)
   ;; RBX now holds a valid cons, with the CAR and CDR set to zero.
   ;; It is safe to leave the restart region.
   (:gc :no-frame :layout #*0)
@@ -725,10 +720,34 @@ the GC must be deferred during FILL-WORDS."
   (sys.lap-x86:mov64 :rbx (:symbol-global-cell sys.int::*gc-in-progress*))
   (sys.lap-x86:cmp64 (:object :rbx #.sys.int::+symbol-value-cell-value+) nil)
   (sys.lap-x86:jne SLOW-PATH)
-  ;; Try the real fast allocator.
-  (sys.lap-x86:call (:named-call do-cons))
-  (sys.lap-x86:cmp64 :rcx #.(ash 1 #.sys.int::+n-fixnum-bits+))
-  (sys.lap-x86:jne SLOW-PATH)
+  ;; Allocate inline: a cons TLAB hit needs no helper call or atomic RMW.
+  ;; Keep the restart region in step with DO-CONS, used by the slow path.
+  ;; The buffer already contains absolute addresses for this semispace.
+  (:gc :no-frame :layout #*0 :restart t)
+  (sys.lap-x86:gs)
+  (sys.lap-x86:mov64 :r11 (:object nil #.mezzano.supervisor::+thread-cons-tlab-limit+))
+  ;; Only this thread owns the buffer. No atomic RMW is needed.
+  (sys.lap-x86:gs)
+  (sys.lap-x86:mov64 :rbx (:object nil #.mezzano.supervisor::+thread-cons-tlab-bump+))
+  ;; RBX is old bump pointer, the address of the cons.
+  ;; Find the new bump pointer.
+  (sys.lap-x86:lea64 :rsi (:rbx 16))
+  ;; Test against limit.
+  (sys.lap-x86:cmp64 :rsi :r11)
+  (sys.lap-x86:ja SLOW-PATH)
+  (sys.lap-x86:gs)
+  (sys.lap-x86:mov64 (:object nil #.mezzano.supervisor::+thread-cons-tlab-bump+) :rsi)
+  (sys.lap-x86:prefetchnta (:rsi))
+  ;; Aligned raw addresses look like fixnums until tagging, so GC can scan
+  ;; an exhausted buffer's bump without mistaking it for a live cons.
+  (sys.lap-x86:or64 :rbx #.sys.int::+tag-cons+)
+  ;; RBX now holds a valid cons, with the CAR and CDR set to zero.
+  ;; It is safe to leave the restart region.
+  (:gc :no-frame :layout #*0)
+  ;; Initialize the CAR & CDR outside the restart region to minimise the potential restarts.
+  (sys.lap-x86:mov64 (:car :rbx) :r8)
+  (sys.lap-x86:mov64 (:cdr :rbx) :r9)
+  (sys.lap-x86:mov64 :r8 :rbx)
   ;; Done. Return everything.
   (sys.lap-x86:fs)
   (sys.lap-x86:add64 (:object-location nil #.mezzano.supervisor::+x86-64-cpu-cons-fast-path-hits+) #.(ash 1 sys.int::+n-fixnum-bits+))

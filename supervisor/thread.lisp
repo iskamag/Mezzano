@@ -137,6 +137,9 @@ can be reprotected.")
   ;; TLAB (Thread-Local Allocation Buffer) bump pointer and limit.
   (tlab-bump 0)
   (tlab-limit 0)
+  ;; Untagged, aligned virtual addresses. These are not GC roots.
+  (cons-tlab-bump 0 :type (unsigned-byte 64))
+  (cons-tlab-limit 0 :type (unsigned-byte 64))
   ;; Per-thread allocation meter.
   (bytes-consed 0)
   ;; Slots used as part of the multiple-value return convention.
@@ -811,6 +814,32 @@ not and WAIT-P is false."
      #'dx-lambda))
 
 ;;; Foothold management.
+
+(defun restart-cons-allocation (thread)
+  ;; Rewind wired allocation restart regions before injecting a foothold.
+  ;; Locate the function from its saved PC, rather than its current binding:
+  ;; runtime recompilation can leave an older allocator version in flight.
+  ;; Restrict this to wired code so the pager never faults reading metadata.
+  (let ((pc (thread-state-rip thread)))
+    (when (<= sys.int::*wired-function-area-limit* pc
+              (1- sys.int::*function-area-base*))
+      (let ((function (sys.int::return-address-to-function pc)))
+        (when (sys.int::%object-of-type-p function sys.int::+object-tag-function+)
+          (let* ((base (logand (sys.int::lisp-object-address function) -16))
+                 (offset (- pc base))
+                 (restart-offset nil))
+            (flet ((entry (start framep interruptp pushed-values pushed-values-register
+                           layout-address layout-length multiple-values incoming-arguments
+                           block-or-tagbody-thunk extra-registers restart)
+                     (declare (ignore framep interruptp pushed-values pushed-values-register
+                                      layout-address layout-length multiple-values incoming-arguments
+                                      block-or-tagbody-thunk extra-registers))
+                     (when (<= start offset)
+                       (setf restart-offset (and restart start)))))
+              (declare (dynamic-extent #'entry))
+              (sys.int::map-function-gc-metadata #'entry function))
+            (when restart-offset
+              (setf (thread-state-rip thread) (+ base restart-offset)))))))))
 
 (defmacro without-footholds (&body body)
   (let ((thread (gensym))

@@ -578,36 +578,22 @@
   (:gc :no-frame :layout #*)
   ;; Attempt to quickly allocate a cons.
   ;; Returns (values car cdr t) on failure, just the cons on success.
-  ;; R8 = car; R9 = cdr
-  ;; Fetch symbol value cells.
-  (mezzano.lap.arm64:ldr :x7 (:symbol-global-cell sys.int::*cons-area-young-gen-bump*))
-  (mezzano.lap.arm64:ldr :x4 (:symbol-global-cell sys.int::*young-gen-newspace-bit-raw*))
-  (mezzano.lap.arm64:ldr :x3 (:symbol-global-cell sys.int::*cons-area-young-gen-limit*))
-  ;; R13 = bump. R11 = limit. R12 = mark.
+  ;; X0 = car; X1 = cdr
+  ;; The buffer already contains absolute addresses for this semispace.
   (:gc :no-frame :layout #* :restart t)
-  ;; Fetch and increment the current bump pointer.
-  ;; Address generation.
-  ;; Linked GC mode is not needed as this will be repeated due to the restart region.
-  (mezzano.lap.arm64:add :x9 :x7 #.(+ (- sys.int::+tag-object+) 8 (* sys.int::+symbol-value-cell-value+ 8)))
-  ;; Release atomic add to increment the bump pointer
-  (mezzano.lap.arm64:movz :x10 #.(ash 16 #.sys.int::+n-fixnum-bits+)) ; 16, size of cons
-  (mezzano.lap.arm64:ldaddl :x10 :x6 (:x9))
-  (mezzano.lap.arm64:add :x11 :x6 :x10)
-  ;; RBX is old bump pointer, the address of the cons.
+  (mezzano.lap.arm64:ldr :x3 (:object :x28 #.mezzano.supervisor::+thread-cons-tlab-limit+))
+  ;; Only this thread owns the buffer. No atomic RMW is needed.
+  (mezzano.lap.arm64:ldr :x6 (:object :x28 #.mezzano.supervisor::+thread-cons-tlab-bump+))
+  (mezzano.lap.arm64:add :x11 :x6 16)
+  ;; X6 is old bump pointer, the address of the cons.
   ;; X11 is the new bump pointer.
   ;; Test against limit.
-  (mezzano.lap.arm64:ldr :x10 (:object :x3 #.sys.int::+symbol-value-cell-value+))
-  (mezzano.lap.arm64:subs :xzr :x11 :x10)
+  (mezzano.lap.arm64:subs :xzr :x11 :x3)
   (mezzano.lap.arm64:b.hi SLOW-PATH)
-  ;; Generate the cons object.
-  ;; Unfixnumize address. This still looks like a fixnum due to alignment.
-  (mezzano.lap.arm64:add :x6 :xzr :x6 :lsr #.sys.int::+n-fixnum-bits+)
-  ;; Set address bits, tag bits, and the mark bit.
-  (mezzano.lap.arm64:ldr :x9 (:pc CONS-ADDRESS-CONS-TAG))
-  (mezzano.lap.arm64:orr :x6 :x6 :x9)
-  (mezzano.lap.arm64:ldr :x9 (:object :x4 #.sys.int::+symbol-value-cell-value+))
-  (mezzano.lap.arm64:orr :x6 :x6 :x9)
-  ;; RBX now holds a valid cons, with the CAR and CDR set to zero.
+  (mezzano.lap.arm64:str :x11 (:object :x28 #.mezzano.supervisor::+thread-cons-tlab-bump+))
+  ;; Aligned raw addresses look like fixnums until tagging.
+  (mezzano.lap.arm64:orr :x6 :x6 #.sys.int::+tag-cons+)
+  ;; X6 now holds a valid cons, with the CAR and CDR set to zero.
   ;; It is safe to leave the restart region.
   (:gc :no-frame :layout #*)
   ;; Initialize the CAR & CDR outside the restart region to minimise the potential restarts.
@@ -620,11 +606,7 @@
   SLOW-PATH
   (mezzano.lap.arm64:ldr :x2 (:constant t))
   (mezzano.lap.arm64:movz :x5 #.(ash 3 #.sys.int::+n-fixnum-bits+))
-  (mezzano.lap.arm64:ret)
-  (:align 16)
-  CONS-ADDRESS-CONS-TAG
-  (:d64/le #.(logior (ash sys.int::+address-tag-cons+ sys.int::+address-tag-shift+)
-                     sys.int::+tag-cons+)))
+  (mezzano.lap.arm64:ret))
 
 (sys.int::define-lap-function cons ((car cdr))
   (:gc :no-frame :layout #* :incoming-arguments :rcx)
@@ -660,10 +642,28 @@
   (mezzano.lap.arm64:ldr :x6 (:object :x6 #.sys.int::+symbol-value-cell-value+))
   (mezzano.lap.arm64:subs :xzr :x6 :x26)
   (mezzano.lap.arm64:b.ne SLOW-PATH)
-  ;; Try the real fast allocator.
-  (mezzano.lap.arm64:named-call do-cons)
-  (mezzano.lap.arm64:subs :xzr :x5 #.(ash 1 #.sys.int::+n-fixnum-bits+))
-  (mezzano.lap.arm64:b.ne SLOW-PATH)
+  ;; Allocate inline; keep this restart region in step with DO-CONS.
+  ;; The buffer already contains absolute addresses for this semispace.
+  (:gc :no-frame :layout #*00 :restart t)
+  (mezzano.lap.arm64:ldr :x3 (:object :x28 #.mezzano.supervisor::+thread-cons-tlab-limit+))
+  ;; Only this thread owns the buffer. No atomic RMW is needed.
+  (mezzano.lap.arm64:ldr :x6 (:object :x28 #.mezzano.supervisor::+thread-cons-tlab-bump+))
+  (mezzano.lap.arm64:add :x11 :x6 16)
+  ;; X6 is old bump pointer, the address of the cons.
+  ;; X11 is the new bump pointer.
+  ;; Test against limit.
+  (mezzano.lap.arm64:subs :xzr :x11 :x3)
+  (mezzano.lap.arm64:b.hi SLOW-PATH)
+  (mezzano.lap.arm64:str :x11 (:object :x28 #.mezzano.supervisor::+thread-cons-tlab-bump+))
+  ;; Aligned raw addresses look like fixnums until tagging.
+  (mezzano.lap.arm64:orr :x6 :x6 #.sys.int::+tag-cons+)
+  ;; X6 now holds a valid cons, with the CAR and CDR set to zero.
+  ;; It is safe to leave the restart region.
+  (:gc :no-frame :layout #*00)
+  ;; Initialize the CAR & CDR outside the restart region to minimise the potential restarts.
+  (mezzano.lap.arm64:str :x0 (:car :x6))
+  (mezzano.lap.arm64:str :x1 (:cdr :x6))
+  (mezzano.lap.arm64:orr :x0 :xzr :x6)
   ;; Done. Return everything.
   (mezzano.lap.arm64:ldr :x10 (:x27)) ; load cpu object
   (mezzano.lap.arm64:ldr :x9 (:object-location :x10 #.mezzano.supervisor::+arm64-cpu-cons-fast-path-hits+))

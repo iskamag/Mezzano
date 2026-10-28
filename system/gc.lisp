@@ -2480,4 +2480,6 @@ No type information will be provided."
                (mezzano.supervisor::thread-global-next thread)))
       ((null thread))
     (setf (mezzano.supervisor::thread-tlab-limit thread) 0
-          (mezzano.supervisor::thread-tlab-bump thread) 0)))
+          (mezzano.supervisor::thread-tlab-bump thread) 0
+          (mezzano.supervisor::thread-cons-tlab-limit thread) 0
+          (mezzano.supervisor::thread-cons-tlab-bump thread) 0)))

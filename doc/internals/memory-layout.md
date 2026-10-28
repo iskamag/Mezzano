@@ -55,3 +55,83 @@ Mark bits
 ----------
 Every two words of memory has a mark bit assigned to it so that objects
 do not need to have a mark bit in their header.
+
+Thread-local allocation buffers
+----------
+General objects and conses use separate per-thread bump/limit pairs. General
+buffers contain byte offsets into the young generation, represented as fixnums.
+Cons buffers contain absolute, untagged virtual addresses in unboxed 64-bit
+slots, excluded from the thread's GC pointer layout. Both pairs initially
+contain zero.
+
+Cons buffers reserve 64 KiB (4096 conses) at a time. The slow path reserves a
+buffer from the global cons bump pointer under the allocator mutex, with
+footholds inhibited and pseudo-atomic execution covering both reservation and
+publication. Failed reservations leave the global bump pointer unchanged.
+The per-cons fast path is emitted directly in CONS on both architectures and
+uses ordinary loads, arithmetic, and stores, without atomic read/modify/write
+instructions. DO-CONS supplies the same operation to the slow path. Their GC
+restart regions include loading the limit, reserving a slot, and constructing
+a valid cons pointer. Until the bounds check succeeds, the bump stays an
+aligned raw address which looks like a fixnum to the register walker, including
+when it points just past an exhausted buffer. Only an in-bounds address receives
+the cons tag. The current semispace is already part of the buffer address. The backing memory is zero-filled, so the cons is valid
+before its CAR and CDR are initialized outside the restart region.
+The x86-64 fast paths issue `PREFETCHNTA` at the next bump address, as the
+general-object allocator does.
+
+Before converting a full thread save to an interrupt frame for a foothold or
+pager call, the supervisor also rewinds wired restart regions, locating
+the function from its saved PC so older versions left in flight by runtime
+recompilation are handled as well. This lets an injected function allocate conses without the interrupted
+allocator later publishing a stale bump pointer. Ordinary thread preemption
+needs no special action, since another thread cannot use this thread's buffer.
+
+After every collection, while the world is still stopped, the collector
+clears both general and cons buffer pairs on every live thread. Unused tails
+are discarded rather than traced as roots. A resumed allocator reloads the
+cleared limit and refills from the current young semispace. Conses explicitly
+allocated in pinned or wired space continue to use the freelist allocator.
+
+`tools/tests/cons-tlab-guest.lisp` checks exact exhaustion, refill values and
+allocation accounting, concurrent allocating threads, parked-thread buffer
+invalidation, allocating footholds, and live lists across minor and major collections. To build a
+private test image, run from the Mezzano directory:
+
+```
+sbcl --non-interactive --load tools/tests/cons-tlab-image.lisp
+timeout 120 qemu-system-x86_64 -enable-kvm -machine q35 -m 3G -smp 4 \
+  -drive file=/tmp/mezzano-cons-tlab-test/native.image,format=raw -snapshot \
+  -serial stdio -monitor none -display none -vga std -net none -no-reboot
+```
+
+Successful execution prints `CONS-TLAB-TEST-PASSED`; QEMU must then be stopped
+by the timeout. Rebuild the normal cold image with `make cold-image` and run
+the usual bounded `make kvm` check as well. Changes to the thread structure
+require `make clean` before building.
+
+For a single-thread comparison in a running guest, compile and load
+`tools/tests/cons-tlab-shared-baseline.lisp` and
+`tools/tests/cons-tlab-benchmark.lisp`, then call
+`(mezzano.cons-tlab-benchmark:run)`. The baseline preserves the shared allocator
+from `68b7e85c` under separate names. Both allocators coexist safely because
+cons buffer refills reserve their global range with CAS. The CAS is confined
+to the refill path.
+
+The benchmark alternates shared/TLAB order for 11 pairs of 500000 `(cons nil nil)`
+calls on one guest CPU, with 16 calls per loop iteration in both modes.
+It prepares and touches the young cons area before timing;
+normal CONS metering, buffer refills, and their mutex operations are included.
+Each sample checks the returned cons, exact per-thread allocation bytes,
+and absence of GC during timing. Compilation, explicit collection, page
+preparation, warmup, and result validation are outside the timed interval.
+It reports elapsed TSC ticks and the median paired speedup.
+
+Allocator code can be recompiled in that same guest with `compile-file` and
+loaded wired using `(with-open-file (in llf :element-type '(unsigned-byte 8))
+(mezzano.internals::load-llf in t))`. Compile and load the runtime assembly
+first, then `runtime/allocate.lisp`, `system/gc.lisp`, and the benchmark callers,
+so callers incorporate the updated definitions and slot representations.
+Changes to the thread layout still need
+a fresh cold image. For an isolated early serial listener, build the private
+image with `MEZZANO_CONS_REPL=1`; subsequent code changes use the live compiler.

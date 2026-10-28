@@ -71,6 +71,8 @@
 
 (defconstant sys.int::+tlab-size+ (* 256 1024))
 (defconstant sys.int::+tlab-object-size-limit+ (* 64 1024))
+;; Bytes, or 4096 conses. Keep unused reservations modest for short-lived threads.
+(defconstant sys.int::+cons-tlab-size+ (* 64 1024))
 
 (defvar *maximum-allocation-attempts* 5
   "GC this many times before giving up on an allocation.")
@@ -572,18 +574,35 @@
 
 #-(or x86-64 arm64)
 (defun do-cons (car cdr)
-  (cond ((> (+ sys.int::*cons-area-young-gen-bump* 16) sys.int::*cons-area-young-gen-limit*)
-         (values car cdr t))
-        (t
-         ;; Enough size, allocate here.
-         (let* ((addr (logior (ash sys.int::+address-tag-cons+ sys.int::+address-tag-shift+)
-                              sys.int::*young-gen-newspace-bit*
-                              sys.int::*cons-area-young-gen-bump*))
-                (val (sys.int::%%assemble-value addr sys.int::+tag-cons+)))
-           (incf sys.int::*cons-area-young-gen-bump* 16)
-           (setf (car val) car
-                 (cdr val) cdr)
-           val))))
+  (let* ((thread (mezzano.supervisor:current-thread))
+         (bump (mezzano.supervisor::thread-cons-tlab-bump thread)))
+    (cond ((> (+ bump 16) (mezzano.supervisor::thread-cons-tlab-limit thread))
+           (values car cdr t))
+          (t
+           (let ((val (sys.int::%%assemble-value bump sys.int::+tag-cons+)))
+             (incf (mezzano.supervisor::thread-cons-tlab-bump thread) 16)
+             (setf (car val) car
+                   (cdr val) cdr)
+             val)))))
+
+(defun %get-new-cons-tlab ()
+  ;; Called with *ALLOCATOR-LOCK* held, footholds inhibited, and pseudo-atomic.
+  ;; Reservation and publication must not straddle a GC or a reentrant CONS.
+  ;; CAS also permits old shared-allocation code to remain in flight across
+  ;; runtime recompilation. It is paid once per buffer, never per cons.
+  (loop
+    for bump = sys.int::*cons-area-young-gen-bump*
+    for limit = (+ bump sys.int::+cons-tlab-size+)
+    do (when (> limit sys.int::*cons-area-young-gen-limit*) (return nil))
+       (when (eql (sys.int::cas (sys.int::symbol-global-value 'sys.int::*cons-area-young-gen-bump*)
+                               bump limit)
+                  bump)
+         (let* ((thread (mezzano.supervisor:current-thread))
+                (base (logior (ash sys.int::+address-tag-cons+ sys.int::+address-tag-shift+)
+                              sys.int::*young-gen-newspace-bit*)))
+           (setf (mezzano.supervisor::thread-cons-tlab-bump thread) (+ base bump)
+                 (mezzano.supervisor::thread-cons-tlab-limit thread) (+ base limit)))
+         (return t))))
 
 (defun slow-cons (car cdr)
   (when sys.int::*gc-in-progress*
@@ -606,10 +625,12 @@
                     (when (not failurep)
                       (update-allocation-time start-time)
                       (return-from slow-cons result)))
+                  (when (%get-new-cons-tlab)
+                    (go INNER-LOOP))
                   ;; No memory. If there's memory available, then expand the area, otherwise run the GC.
                   ;; Running the GC cannot be done when pseudo-atomic.
                   (cond ((expand-allocation-area :cons
-                                                 16
+                                                 sys.int::+cons-tlab-size+
                                                  '*cons-area-expansion-granularity*
                                                  'sys.int::*cons-area-young-gen-limit*
                                                  sys.int::+address-tag-cons+)

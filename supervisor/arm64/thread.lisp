@@ -236,6 +236,7 @@
 
 (defun convert-thread-to-partial-save (thread)
   (when (thread-full-save-p thread)
+    (restart-cons-allocation thread)
     ;; Push the current full save state on the stack and create an interrupt frame.
     (let ((sp (thread-state-rsp thread)))
       (decf sp (+ (* +thread-mv-slots-size+ 8)
