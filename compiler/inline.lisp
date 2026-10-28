@@ -2,6 +2,28 @@
 
 (in-package :mezzano.compiler)
 
+(defvar *file-local-inline-forms* :not-compiling-file)
+
+(defun inline-form-has-uninterned-literals-p (form)
+  ;; LLFs recreate uninterned symbols. Importing such a literal from another
+  ;; file's inline definition loses its identity (notably constructor tokens).
+  (let ((seen (make-hash-table :test 'eq)))
+    (labels ((literal (value)
+               (cond ((symbolp value) (null (symbol-package value)))
+                     ((gethash value seen) nil)
+                     ((consp value)
+                      (setf (gethash value seen) t)
+                      (or (literal (car value)) (literal (cdr value))))
+                     ((typep value 'simple-vector)
+                      (setf (gethash value seen) t)
+                      (some #'literal value))))
+             (walk (value)
+               (when (consp value)
+                 (if (eq (car value) 'quote)
+                     (literal (second value))
+                     (or (walk (car value)) (walk (cdr value)))))))
+      (walk form))))
+
 (defun inline-functions (lambda architecture)
   (il-form lambda architecture))
 
@@ -112,7 +134,10 @@
             (multiple-value-bind (candidate closurep)
                 (function-lambda-expression (fdefinition name))
               (unless closurep (setf expansion candidate)))))
-        (when expansion
+        (when (and expansion
+                   (or (eq *file-local-inline-forms* :not-compiling-file)
+                       (gethash expansion *file-local-inline-forms*)
+                       (not (inline-form-has-uninterned-literals-p expansion))))
           (let ((lambda (pass1-lambda expansion (make-inline-environment))))
             ;; If lifting cannot match this call, keep the named call. An
             ;; embedded copy of the old function would still do argument-list

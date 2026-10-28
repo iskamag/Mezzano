@@ -310,7 +310,10 @@
     (when (and info
                (or (function-info-inline-mode info)
                    (function-info-inline-form info)))
-      (setf (function-info-inline-form info) source-lambda)))
+      (setf (function-info-inline-form info) source-lambda)
+      (when (and (boundp 'mezzano.compiler::*file-local-inline-forms*)
+                 (hash-table-p mezzano.compiler::*file-local-inline-forms*))
+        (setf (gethash source-lambda mezzano.compiler::*file-local-inline-forms*) t))))
   nil)
 
 (defun %defun (name lambda &optional documentation)
