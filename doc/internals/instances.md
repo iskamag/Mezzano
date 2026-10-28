@@ -49,6 +49,9 @@ marked obsolete, and their slot metadata is kept until old instances have been
 collected. Migration copies fixed-vector elements as well as scalar slots.
 Constructors carry a version token so saved or inlined constructors can use a
 slow path after their class changes; current constructors keep a fast check.
+Small standard keyword constructors are declared inline by default so known
+keyword calls can avoid building and scanning an argument list. A local
+`NOTINLINE` declaration still requests an ordinary call.
 A sealed structure that includes an unsealed parent can still acquire a new
 layout when that parent changes, so its compiled accesses must check for an
 obsolete layout.

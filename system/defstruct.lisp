@@ -346,13 +346,19 @@
   ;; can't use the &key mechanism for initargs. This is temporary and should be
   ;; removed when the compiler is improved.
   (cond ((< (length (structure-definition-slots struct-type)) *defstruct-constructor-slot-threshold*)
-         (if token
-             (generate-standard-defstruct-constructor struct-name struct-type name area token)
-             (generate-defstruct-constructor struct-name struct-type name
-                                             (list* '&key (mapcar (lambda (slot)
-                                                                    (list (structure-slot-definition-name slot) (structure-slot-definition-initform slot)))
-                                                                  (structure-definition-slots struct-type)))
-                                             area)))
+         (let ((definition
+                 (if token
+                     (generate-standard-defstruct-constructor struct-name struct-type name area token)
+                     (generate-defstruct-constructor struct-name struct-type name
+                                                     (list* '&key (mapcar (lambda (slot)
+                                                                            (list (structure-slot-definition-name slot) (structure-slot-definition-initform slot)))
+                                                                          (structure-definition-slots struct-type)))
+                                                     area))))
+           ;; Known keyword calls can then eliminate argument-list construction
+           ;; and scanning. The version token still guards inlined constructors
+           ;; across redefinition; local NOTINLINE declarations remain honored.
+           (setf (second definition) `(declaim (inline ,name)))
+           definition))
         (t
          (let ((initargs (gensym "INITARGS"))
                (tmp (gensym "INSTANCE")))

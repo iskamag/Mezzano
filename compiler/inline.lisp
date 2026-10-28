@@ -107,19 +107,20 @@
                                 (inline ,@(loop for (name mode) in (ast-inline-declarations form)
                                              when (eql mode 'inline)
                                              collect name))))))
-        (cond (expansion
-               (ast `(call mezzano.runtime::%funcall
-                           ,(pass1-lambda expansion (make-inline-environment))
-                           ,@arg-list)
-                    form))
-              ((fboundp name)
-               (multiple-value-bind (expansion closurep)
-                   (function-lambda-expression (fdefinition name))
-                 (when (and expansion (not closurep))
-                   (ast `(call mezzano.runtime::%funcall
-                               ,(pass1-lambda expansion (make-inline-environment))
-                               ,@arg-list)
-                        form)))))))))
+        (unless expansion
+          (when (fboundp name)
+            (multiple-value-bind (candidate closurep)
+                (function-lambda-expression (fdefinition name))
+              (unless closurep (setf expansion candidate)))))
+        (when expansion
+          (let ((lambda (pass1-lambda expansion (make-inline-environment))))
+            ;; If lifting cannot match this call, keep the named call. An
+            ;; embedded copy of the old function would still do argument-list
+            ;; processing and would miss later redefinitions (including new
+            ;; keyword slots in a structure constructor).
+            (when (arguments-match-lambda-list lambda arg-list)
+              (ast `(call mezzano.runtime::%funcall ,lambda ,@arg-list)
+                   form))))))))
 
 (defmethod il-form ((form ast-call) architecture)
   (il-implicit-progn (arguments form) architecture)
