@@ -154,6 +154,9 @@
         *the-class-standard-writer-method* (find-class 'standard-reader-method)
         *the-class-t* (find-class 't))
   ;; Locations of important slots in metaobjects.
+  (setf mezzano.runtime::*structure-class-slot-storage-layout-location*
+        (primordial-slot-location-in-layout mezzano.runtime::*structure-class-layout*
+                                             'slot-storage-layout))
   (let ((s-c-layout (primordial-slot-value (find-class 'standard-class) 'slot-storage-layout)))
     (setf *the-layout-standard-class* s-c-layout)
     (setf *standard-class-effective-slots-location* (primordial-slot-location-in-layout s-c-layout 'effective-slots)
