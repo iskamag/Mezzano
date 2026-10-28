@@ -48,8 +48,13 @@
 (clos-extract-definitions "SYS:SOURCE;SYSTEM;GC.LISP" "REMOTE:/tmp/clos-cost/weak-hotload.lisp" :mezzano.internals '(mezzano.internals::examine-weak-pointer-key) t)
 (clos-extract-definitions "SYS:SOURCE;SYSTEM;CLOS;FAST-CLASS-HASH-TABLE.LISP" "REMOTE:/tmp/clos-cost/cache-hotload.lisp" :mezzano.clos t)
 (clos-extract-definitions "SYS:SOURCE;SYSTEM;CLOS;SINGLE-DISPATCH-EMF-TABLE.LISP" "REMOTE:/tmp/clos-cost/dispatch-hotload.lisp" :mezzano.clos t)
+(mezzano.internals::defglobal mezzano.clos::*standard-generic-function-emf-table-location*)
+(setf mezzano.clos::*standard-generic-function-emf-table-location*
+      (mezzano.clos::slot-location-using-layout
+       'mezzano.clos::classes-to-emf-table mezzano.clos::*the-layout-standard-generic-function*))
 (clos-extract-definitions "SYS:SOURCE;SYSTEM;CLOS;CLOSETTE.LISP" "REMOTE:/tmp/clos-cost/clos-hotload.lisp" :mezzano.clos
  '(mezzano.clos::standard-instance-access mezzano.clos::with-current-instance-storage
+   mezzano.clos::classes-to-emf-table mezzano.clos::safe-class-precedence-list
    class-of mezzano.clos::accessor-cache-cell mezzano.clos::write-cached-slot mezzano.clos::read-cached-slot
    mezzano.clos::make-slot-value-reader mezzano.clos::make-slot-value-writer
    mezzano.clos::slot-value-cache-cell
