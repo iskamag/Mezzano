@@ -174,11 +174,18 @@
            (error "DCAS is not supported on discontigious locations ~S and ~S" loc-1 loc-2)))))
 
 (defun slot-location-in-layout (layout slot-name)
+  ;; This runs once per allocation on the structure-constructor path, so it
+  ;; must stay a bounded fixnum loop. Declaring the index keeps the generic
+  ;; >= (and its bignum path) out of the loop the compiler emits.
+  (declare (optimize (speed 3) (safety 0) (debug 0)))
   (let ((instance-slots (sys.int::layout-instance-slots layout)))
     (loop
-       for i below (sys.int::%object-header-data instance-slots) by 2 ; avoid calling length on the slot vector, it's a simple-vector.
+       ;; Avoid calling length on the slot vector, it's a simple-vector.
+       for i of-type fixnum from 0
+         below (the fixnum (sys.int::%object-header-data instance-slots))
+         by 2
        when (eq slot-name (sys.int::%object-ref-t instance-slots i))
-       do (return (sys.int::%object-ref-t instance-slots (1+ i)))
+       do (return (sys.int::%object-ref-t instance-slots (the fixnum (1+ i))))
        finally (error "Instance slot ~S missing from layout ~S" slot-name layout))))
 
 (defun instance-slot-location (object slot-name)
