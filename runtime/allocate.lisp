@@ -833,6 +833,8 @@
           (setf (sys.int::%object-ref-unsigned-byte-8 object (+ gc-info-offset i)) (aref gc-info i))))
       object)))
 
+;; Expose layout reads to the caller's type and optimization information.
+(declaim (inline sys.int::%allocate-instance))
 (defun sys.int::%allocate-instance (layout)
   (%allocate-object sys.int::+object-tag-instance+
                     (sys.int::lisp-object-address layout)

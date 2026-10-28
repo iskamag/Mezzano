@@ -1911,7 +1911,9 @@ least one value."
           (= (length (arguments form)) 6)
           (find-struct-slot (fourth (arguments form)) (fifth (arguments form))))
      (simplify-cas-struct-vector-slot form))
-    ;; (%allocate-struct 'name) => (%allocate-struct 'struct)
+    ;; Resolve the class before inlining allocation, avoiding FIND-CLASS in
+    ;; each constructor call. The known-class helper still reads the current
+    ;; layout, so structure redefinition remains visible.
     ((and (eql (name form) 'sys.int::%allocate-struct)
           (local-inlining-permitted-p form)
           (= (length (arguments form)) 1)
@@ -1919,7 +1921,7 @@ least one value."
           (symbolp (ast-value (first (arguments form))))
           (sys.int::get-structure-type (ast-value (first (arguments form))) nil))
      (change-made)
-     (ast `(call sys.int::%allocate-struct ',(sys.int::get-structure-type (ast-value (first (arguments form)))))
+     (ast `(call mezzano.runtime::%allocate-struct-known-class ',(sys.int::get-structure-type (ast-value (first (arguments form)))))
           form))
     ((and (eql (name form) 'mezzano.runtime::%fixnum-<)
           (local-inlining-permitted-p form)
