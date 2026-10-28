@@ -1,0 +1,225 @@
+#+TITLE: CLOS cost while compiling the Boehm benchmark
+#+DATE: 2026-10-28
+
+Subsequent implementation and measured gains: [[file:clos-fast-paths.org]].
+This document records the initial investigation before those changes.
+
+* Finding
+
+The warmed compiler spends roughly 28–29% of observed execution in CLOS
+runtime and generated dispatch/access/constructor code. Including the direct
+cost of CLASS-TYPEP raises the statistical estimate to 32%. This is an
+attribution of execution, not a claim that all of that work can be removed.
+
+The main issue is the frequency and machinery of successful slot access and
+single dispatch. It is not method-cache misses or a bad collision distribution.
+Changing optimization policies on two hot helpers did not improve compilation
+reliably. No production runtime changes were made; temporary replacements were
+restored with UNWIND-PROTECT.
+
+* Workload and measurement
+
+Image: c61b8cb2976c15fceb93ddb85811d7044b309468, x86-64, 4 KVM vCPUs,
+4 GiB RAM. Started through make serial-kvm with temporary command overrides
+for a headless virtio GPU and GDB on 127.0.0.1:1234. The Makefile was not edited.
+
+Workload: compile the unchanged REMOTE:/home/iskam/boehm-gc.lisp, with
+COMPILE-FILE :PARALLEL NIL :VERBOSE NIL :PRINT NIL, in a dedicated package.
+This measures compilation, including reading source and emitting LLF, not
+running the GC benchmark. Warmup precedes measurements. No GDB or profiler
+was active during timing. Remote file-stream access is part of this workload.
+
+Five initial trials:
+
+| trial | wall seconds | thread CPU seconds | allocated bytes |
+|-------+--------------+--------------------+-----------------|
+|     0 |         0.35 |           0.338070 |        64876224 |
+|     1 |         0.33 |           0.327473 |        64876256 |
+|     2 |         0.34 |           0.336136 |        64876256 |
+|     3 |         0.34 |           0.341257 |        64875936 |
+|     4 |         0.33 |           0.328976 |        64876352 |
+
+No GC occurred in these five trials. Wall clock resolution is 10 ms.
+
+* Statistical profile and independent GDB samples
+
+30 compilations, fresh profiling buffer each repetition; :THREAD T,
+:IGNORE-FUNCTIONS NIL. Retaining dispatch frames is essential: the profiler's
+default ignore list removes many CLOS wrappers.
+
+The report contains 1,029 active thread observations, of which 996 have decoded
+stacks, and 23 observations of a waiting thread. The following percentages use
+the 996 decoded active stacks and count each sample's innermost function once.
+Do not use the profiler report's cumulative "total %" column as CPU percentage:
+its denominator sums counts over all stack frames, including repeated frames.
+
+| direct execution category                       | samples | percent |
+|-------------------------------------------------+---------+---------|
+| Reader discriminator, FAST-SLOT-READ, instance access |  95 |     9.5 |
+| Single-dispatch entry and fast class hash lookup |      72 |     7.2 |
+| CLASS-OF, class references and class metadata helpers | 63 |     6.3 |
+| Writer discriminator and write/access helpers    |      18 |     1.8 |
+| Other CLOS dispatch/constructor/runtime code     |      45 |     4.5 |
+| CLOS total                                      |     293 |    29.4 |
+| CLASS-TYPEP itself, additional                   |      30 |     3.0 |
+
+Some STANDARD-INSTANCE-ACCESS samples are class-metadata reads, not user-slot
+reads; the categories describe the executing helpers. 293 / 1,029 = 28.5% if
+active observations without decoded stacks remain in the denominator. These
+are approximate sampled shares, not precise cycle accounting. Profiling a
+specific thread excludes samples during GC.
+
+GDB used randomized 10–30 ms intervals, 400 stops, all vCPUs, bounded frame
+walking, and retained stacks containing CLOS-COMPILE:COMPILE-WORKLOAD. It found
+340 compilation CPU samples; 94 (27.6%) had a CLOS/class-of/trampoline leaf.
+Raw PCs, stacks, and four instructions at each PC were saved independently.
+
+EMF-CACHE-LOOKUP occurred on only 24 of the statistical report's 1,019 decoded
+stacks (including waiting observations), about 2.4%. The isolated two-argument
+dispatch microbenchmark was therefore not a useful primary diagnosis of this
+compiler workload.
+
+* Counts from one warmed compilation
+
+Counted separately from timings, with temporary wrappers around the runtime
+helpers. Counting was dynamically enabled only in the compiling thread and
+disabled during the counter bookkeeping itself. Wrapper overhead is not part
+of the reported baseline timings.
+
+| operation                          | calls   |
+|------------------------------------+---------|
+| SINGLE-DISPATCH-EMF-ENTRY-BY-OBJECT  | 3278293 |
+| FAST-CLASS-HASH-TABLE-ENTRY-KNOWN-HASH | 3299998 |
+| FAST-SLOT-READ                      | 2139481 |
+| FAST-SLOT-WRITE                     |  379604 |
+| EMF-CACHE-LOOKUP                    |    9989 |
+
+No calls were recorded to SLOW-SINGLE-DISPATCH-METHOD-LOOKUP,
+SLOW-SINGLE-DISPATCH-METHOD-LOOKUP*, or SLOW-METHOD-LOOKUP during the counted
+compilation. The warmup occurs before enabling the counters.
+
+1,035,547 lookups used the single weak-pointer representation, and 2,264,451
+used full vector tables. Of the vector lookups, 26,504 (1.17%) collided.
+Their total probe count was 2,291,351, averaging 1.0119 per lookup; maximum 16.
+Table capacities were 16, 32, 64 and 128. Making the hash distribution better
+is unlikely to recover much: nearly every lookup already hits its first slot.
+
+Frequently read classes include AST-CALL (406,568 reads), LIVE-RANGE (145,179),
+LEXICAL-VARIABLE (115,796), LABEL (99,569), MOVE-INSTRUCTION (99,482), and
+CONSTANT-INSTRUCTION (97,013). Two remote stream classes account for 239,463
+reads, so not every access belongs to the compiler's AST/IR.
+
+* Assembly and callers
+
+A successful generated reader normally passes through:
+
+  funcallable-instance trampoline
+    -> reader discriminator
+       -> SINGLE-DISPATCH-EMF-ENTRY-BY-OBJECT
+          -> FAST-CLASS-HASH-TABLE-ENTRY-KNOWN-HASH
+       -> FAST-SLOT-READ
+          -> STANDARD-INSTANCE-ACCESS
+
+The single-dispatch helper loads the layout, class and hash. The table helper
+selects its storage representation, computes the table offset, loads a weak
+entry, compares its class key, and returns the cached location. The reader
+then checks instance currency and unboundness and decodes the location to
+perform the final data load. These are successful cached operations, yet
+several function calls and dependent loads surround the actual slot load.
+
+Concrete live-image evidence:
+
+- At 0x8000341ab4 GDB stopped at the class-key comparison in a hash hit:
+  cmp %r13,%r12; jne collision; mov 0xf(%r9),%r8.
+  Stack: hash lookup <- single dispatch <- reader discriminator <-
+  LOWER-ENV-FORM specialized on AST-TAGBODY.
+- At 0x800035a871 GDB stopped in FAST-SLOT-READ's bound-value branch.
+  Stack: FAST-SLOT-READ <- reader discriminator <- INSTRUCTION-OUTPUTS
+  specialized on CONSTANT-INSTRUCTION <- REMOVE-UNUSED-INSTRUCTIONS-1.
+- At 0x800035973c it stopped in STANDARD-INSTANCE-ACCESS's stack setup.
+  Stack: instance access <- SAFE-CLASS-PRECEDENCE-LIST <- CLASS-TYPEP <-
+  SSA-CONVERT-ONE-LOCAL-LOCATE-BINDING-STORING-BASIC-BLOCKS.
+
+FAST-SLOT-READ's baseline code reserves 80 stack bytes, initializes eight value
+slots, saves R15, and calls STANDARD-INSTANCE-ACCESS on the normal path. That
+helper has another frame and a location fixnum/generic-shift branch. These
+extra stores are real, but the policy experiment below did not establish them
+as the main recoverable cost.
+
+The hash-table helper still emits an array-length reload and bounds comparison
+at 0x8000341a6a–0x8000341a7c, despite its existing SPEED/SAFETY declarations.
+It also tests fixnum representation while masking the supplied hash. These are
+specific code-generation targets, not grounds for assuming that another
+OPTIMIZE declaration will fix the path.
+
+NEXT-INSTRUCTION was the nearest compiler caller in 20 samples whose leaf was
+one of the hot read/cache helpers. Its definition in compiler/backend/backend.lisp
+is simply SLOT-VALUE of %NEXT-INSTRUCTION. Repeated IR-list traversal therefore
+repeatedly enters the slot-location dispatch machinery. Frontend AST traversals,
+liveness/use-def work, and register allocation also pay these costs.
+
+* Negative optimization-policy experiment
+
+Only FAST-SLOT-READ and STANDARD-INSTANCE-ACCESS were temporarily replaced
+with freshly compiled copies of their source bodies. Four alternating-order
+blocks per variant, five whole-program compilations per block, excluding a
+warmup. Original function objects were restored afterward.
+
+| variant                       | median thread CPU seconds / compilation |
+|-------------------------------+-----------------------------------------|
+| original                      |                                  0.3383 |
+| speed 3 / safety 3 / debug 0   |                                  0.3578 |
+| speed 3 / safety 1 / debug 0   |                                  0.3459 |
+
+No demonstrated speedup. Some blocks had GC, which strongly distorted wall
+time; CPU times and individual block results are retained. Generated helper
+code was smaller (FAST-SLOT-READ: 166 to 136 static instructions, 43 to 17
+stack-operand instructions), but that did not translate into a reliable gain
+for this workload. Instruction totals include cold/error branches.
+
+* Where to go next
+
+1. Avoid repeated full class-to-location lookup on hot slot accesses. Investigate
+   guarded layout/location caches or specialized access for the compiler's
+   instruction links and AST fields. Preserve obsolete-instance handling,
+   class redefinition, shared slots, SLOT-UNBOUND, and custom MOP behavior.
+   A monomorphic cache alone may miss often: most current lookups use tables
+   shared across several classes, so measure the actual locality first.
+2. Fuse the successful reader path and its final slot load, reducing dependent
+   loads and helper calls rather than relying on optimization policies. Measure
+   on this whole compilation before claiming improvement.
+3. Treat class membership checks as a separate target: CLASS-TYPEP calls
+   CLASS-OF and walks the class precedence list via SAFE-CLASS-PRECEDENCE-LIST.
+   This has measurable cost in SSA/control-flow work.
+4. Multi-dispatch locking/allocation is a secondary target for this workload.
+   Its isolated cost does not justify making it the first compiler optimization.
+
+These are measured priorities and proposed experiments, not implemented fixes.
+
+* Reproduction and artifacts
+
+See tools/tests/clos-compile.lisp, clos-compile-count.lisp,
+clos-compile-experiment.lisp and clos-compile-gdb.py. Create /tmp/clos-cost on
+the file-server host. In the guest:
+
+#+begin_src lisp
+(load "SYS:SOURCE;TOOLS;TESTS;CLOS-COMPILE.LISP")
+(clos-compile:run 5)
+(clos-compile:profile-run 30)
+(load "SYS:SOURCE;TOOLS;TESTS;CLOS-COMPILE-COUNT.LISP")
+(load "SYS:SOURCE;TOOLS;GENERATE-BOCHS-MAP-FILE.LISP")
+(mezzano.internals::generate-bochs-map-file "REMOTE:/tmp/clos-cost/live.map")
+;; In a separate run, start this and then the GDB script documented in its header:
+(clos-compile:compile-workload 150)
+#+end_src
+
+Host artifacts under /tmp/clos-cost:
+- compile-profile.txt: full statistical report and stacks
+- compile-flame.txt: folded stacks
+- compile-asm.txt: native disassembly of the hot helpers
+- gdb-samples.json and gdb.log: independent samples, native instructions and summary
+- variants-asm.txt: disassembly of the temporary policy variants
+- baseline.txt, operation-counts.txt, policy-experiment.txt: original captured output
+
+The older image encountered before the user's rebuilt image was available was
+not used for these measurements. The live image version above was verified.
