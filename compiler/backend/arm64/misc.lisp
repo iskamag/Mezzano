@@ -108,11 +108,18 @@
                                 :arguments (list second-arg global-cell)))))))
 
 (define-builtin sys.int::%instance-layout ((object) result)
-  (let ((temp1 (make-instance 'ir:virtual-register)))
+  (let ((storage (make-instance 'ir:virtual-register))
+        (temp1 (make-instance 'ir:virtual-register)))
+    (emit (make-instance 'arm64-instruction
+                         :opcode 'lap:orr
+                         :operands (list storage object
+                                         (logxor sys.int::+tag-object+
+                                                 sys.int::+tag-instance-storage+))
+                         :inputs (list object) :outputs (list storage)))
     (emit (make-instance 'arm64-instruction
                          :opcode 'lap:ldr
-                         :operands (list temp1 `(:object ,object -1))
-                         :inputs (list object)
+                         :operands (list temp1 `(,storage ,(- sys.int::+tag-instance-storage+)))
+                         :inputs (list storage)
                          :outputs (list temp1)))
     (emit (make-instance 'arm64-instruction
                          :opcode 'lap:add
@@ -124,7 +131,7 @@
     ;; the structure definition live there is a possibility that it and the
     ;; structure definition could be end up being GC'd between the load & shift.
     ;; Then the shift would resurrect a dead object, leading to trouble.
-    (emit (make-instance 'ir:spice-instruction :value object))))
+    (emit (make-instance 'ir:spice-instruction :value storage))))
 
 (define-builtin sys.int::%fast-instance-layout-eq-p ((object instance-header) :eq)
   (let ((temp1 (make-instance 'ir:virtual-register :kind :integer))

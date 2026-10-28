@@ -322,11 +322,16 @@
                        :source value)))
 
 (define-builtin sys.int::%instance-layout ((object) result)
-  (let ((temp1 (make-instance 'ir:virtual-register)))
+  (let ((storage (make-instance 'ir:virtual-register))
+        (temp1 (make-instance 'ir:virtual-register)))
+    (emit (make-instance 'x86-fake-three-operand-instruction
+                         :opcode 'lap:or64 :result storage :lhs object
+                         :rhs (logxor sys.int::+tag-object+
+                                      sys.int::+tag-instance-storage+)))
     (emit (make-instance 'x86-instruction
                          :opcode 'lap:mov64
-                         :operands (list temp1 `(:object ,object -1))
-                         :inputs (list object)
+                         :operands (list temp1 `(,storage ,(- sys.int::+tag-instance-storage+)))
+                         :inputs (list storage)
                          :outputs (list temp1)))
     (emit (make-instance 'x86-fake-three-operand-instruction
                          :opcode 'lap:shr64
@@ -338,7 +343,7 @@
     ;; the structure definition live there is a possibility that it and the
     ;; structure definition could be end up being GC'd between the load & shift.
     ;; Then the shift would resurrect a dead object, leading to trouble.
-    (emit (make-instance 'ir:spice-instruction :value object))))
+    (emit (make-instance 'ir:spice-instruction :value storage))))
 
 (define-builtin sys.int::%fast-instance-layout-eq-p ((object instance-header) :e)
   (let ((temp1 (make-instance 'ir:virtual-register :kind :integer))
@@ -364,7 +369,7 @@
                          :inputs (list temp2 instance-header)
                          :outputs '()))))
 
-(defmacro define-object-ref-integer-accessor (name read-op write-op reg scale box-op unbox-op)
+(defmacro define-object-ref-integer-accessor (name read-op write-op reg scale box-op unbox-op &optional storagep)
   `(progn
      (define-builtin ,name ((object index) result)
        (let ((temp (make-instance 'ir:virtual-register :kind :integer)))
@@ -372,7 +377,7 @@
          ;; to replace vregs with non-64-bit gprs.
          ;; Using a temporary & a move before the box allows the box to safely
          ;; eliminated.
-         (with-builtin-object-access (ea ea-inputs object index ,scale)
+         (,(if storagep 'with-builtin-storage-access 'with-builtin-object-access) (ea ea-inputs object index ,scale)
            (emit (make-instance 'x86-instruction
                                 :opcode ',read-op
                                 :operands (list ,(if (eql read-op 'lap:mov32) reg 'temp) ea)
@@ -399,7 +404,7 @@
              `((emit (make-instance 'ir:move-instruction
                                     :source temp
                                     :destination :rax))))
-         (with-builtin-object-access (ea ea-inputs object index ,scale)
+         (,(if storagep 'with-builtin-storage-access 'with-builtin-object-access) (ea ea-inputs object index ,scale)
            (emit (make-instance 'x86-instruction
                                 :opcode ',write-op
                                 :operands (list ea ,(or reg 'temp))
@@ -424,7 +429,7 @@
          (emit (make-instance 'ir:move-instruction
                               :source new-unboxed
                               :destination :rdx))
-         (with-builtin-object-access (ea ea-inputs object index ,scale)
+         (,(if storagep 'with-builtin-storage-access 'with-builtin-object-access) (ea ea-inputs object index ,scale)
            (emit (make-instance 'x86-instruction
                                 :opcode 'lap:cmpxchg
                                 :prefix '(lap:lock)
@@ -605,3 +610,204 @@
                        :result-1 result-1
                        :result-2 result-2
                        :prefix '(lap:lock))))
+
+;;; Internal physical instance storage. All base operands retain their storage
+;;; value tag, including across boxing and atomic GC metadata regions.
+
+(defmacro with-builtin-storage-access ((ea ea-inputs object index scale) &body body)
+  `(with-builtin-object-access (,ea ,ea-inputs ,object ,index ,scale)
+     (setf ,ea
+           (ecase (first ,ea)
+             (:object-unscaled
+              (list (second ,ea)
+                    (+ (- 8 sys.int::+tag-instance-storage+) (third ,ea))))
+             (:object
+              (list (second ,ea)
+                    (+ (- 8 sys.int::+tag-instance-storage+) (* (third ,ea) 8))
+                    (list (fourth ,ea) (fifth ,ea))))))
+     ,@body))
+
+(define-builtin sys.int::%instance-storage ((object) result)
+  (emit (make-instance 'x86-fake-three-operand-instruction
+                       :opcode 'lap:or64 :result result :lhs object
+                       :rhs (logxor sys.int::+tag-object+
+                                    sys.int::+tag-instance-storage+))))
+
+(define-builtin sys.int::%storage-ref-t ((object index) result)
+  (with-builtin-storage-access (ea ea-inputs object index 8)
+    (emit (make-instance 'x86-instruction
+                         :opcode 'lap:mov64
+                         :operands (list result ea)
+                         :inputs ea-inputs
+                         :outputs (list result)))))
+
+(define-builtin (setf sys.int::%storage-ref-t) ((value object index) result)
+  (with-builtin-storage-access (ea ea-inputs object index 8)
+    (emit (make-instance 'x86-instruction
+                         :opcode 'lap:mov64
+                         :operands (list ea value)
+                         :inputs (list* value ea-inputs)
+                         :outputs (list))))
+  (emit (make-instance 'ir:move-instruction
+                       :source value
+                       :destination result)))
+
+(define-builtin sys.int::%storage-layout ((object) result)
+  (let ((temp1 (make-instance 'ir:virtual-register)))
+    (emit (make-instance 'x86-instruction
+                         :opcode 'lap:mov64
+                         :operands (list temp1 `(,object ,(- sys.int::+tag-instance-storage+)))
+                         :inputs (list object)
+                         :outputs (list temp1)))
+    (emit (make-instance 'x86-fake-three-operand-instruction
+                         :opcode 'lap:shr64
+                         :result result
+                         :lhs temp1
+                         :rhs sys.int::+object-data-shift+))
+    ;; The object must be kept live over the shift, as the header will
+    ;; initially be read as a fixnum. If the object is the only thing keeping
+    ;; the structure definition live there is a possibility that it and the
+    ;; structure definition could be end up being GC'd between the load & shift.
+    ;; Then the shift would resurrect a dead object, leading to trouble.
+    (emit (make-instance 'ir:spice-instruction :value object))))
+
+(define-builtin sys.int::%fast-storage-layout-eq-p ((object instance-header) :e)
+  (let ((temp1 (make-instance 'ir:virtual-register :kind :integer))
+        (temp2 (make-instance 'ir:virtual-register :kind :integer)))
+    ;; Read the object header.
+    (emit (make-instance 'x86-instruction
+                         :opcode 'lap:mov64
+                         :operands (list temp1 `(,object ,(- sys.int::+tag-instance-storage+)))
+                         :inputs (list object)
+                         :outputs (list temp1)))
+    ;; Set the two low bits to potentially convert the header to a
+    ;; structure-header. This must be performed in an integer register
+    ;; as this will construct some random bad value if the object isn't a
+    ;; structure-object.
+    (emit (make-instance 'x86-fake-three-operand-instruction
+                         :opcode 'lap:or64
+                         :result temp2
+                         :lhs temp1
+                         :rhs 3))
+    (emit (make-instance 'x86-instruction
+                         :opcode 'lap:cmp64
+                         :operands (list temp2 instance-header)
+                         :inputs (list temp2 instance-header)
+                         :outputs '()))))
+
+(define-object-ref-integer-accessor sys.int::%%storage-ref-unsigned-byte-8  lap:movzx8  lap:mov8  :al  1 ir:box-fixnum-instruction ir:unbox-fixnum-instruction t)
+(define-object-ref-integer-accessor sys.int::%%storage-ref-unsigned-byte-16 lap:movzx16 lap:mov16 :ax  2 ir:box-fixnum-instruction ir:unbox-fixnum-instruction t)
+(define-object-ref-integer-accessor sys.int::%%storage-ref-unsigned-byte-32 lap:mov32   lap:mov32 :eax 4 ir:box-fixnum-instruction ir:unbox-fixnum-instruction t)
+(define-object-ref-integer-accessor sys.int::%%storage-ref-unsigned-byte-64 lap:mov64   lap:mov64 nil  8 ir:box-unsigned-byte-64-instruction ir:unbox-unsigned-byte-64-instruction t)
+(define-object-ref-integer-accessor sys.int::%%storage-ref-signed-byte-8    lap:movsx8  lap:mov8  :al  1 ir:box-fixnum-instruction ir:unbox-fixnum-instruction t)
+(define-object-ref-integer-accessor sys.int::%%storage-ref-signed-byte-16   lap:movsx16 lap:mov16 :ax  2 ir:box-fixnum-instruction ir:unbox-fixnum-instruction t)
+(define-object-ref-integer-accessor sys.int::%%storage-ref-signed-byte-32   lap:movsx32 lap:mov32 :eax 4 ir:box-fixnum-instruction ir:unbox-fixnum-instruction t)
+(define-object-ref-integer-accessor sys.int::%%storage-ref-signed-byte-64   lap:mov64   lap:mov64 nil  8 ir:box-signed-byte-64-instruction ir:unbox-signed-byte-64-instruction t)
+(define-object-ref-integer-accessor sys.int::%%storage-ref-unsigned-byte-8-unscaled  lap:movzx8  lap:mov8  :al  1 ir:box-fixnum-instruction ir:unbox-fixnum-instruction t)
+(define-object-ref-integer-accessor sys.int::%%storage-ref-unsigned-byte-16-unscaled lap:movzx16 lap:mov16 :ax  1 ir:box-fixnum-instruction ir:unbox-fixnum-instruction t)
+(define-object-ref-integer-accessor sys.int::%%storage-ref-unsigned-byte-32-unscaled lap:mov32   lap:mov32 :eax 1 ir:box-fixnum-instruction ir:unbox-fixnum-instruction t)
+(define-object-ref-integer-accessor sys.int::%%storage-ref-unsigned-byte-64-unscaled lap:mov64   lap:mov64 nil  1 ir:box-unsigned-byte-64-instruction ir:unbox-unsigned-byte-64-instruction t)
+(define-object-ref-integer-accessor sys.int::%%storage-ref-signed-byte-8-unscaled    lap:movsx8  lap:mov8  :al  1 ir:box-fixnum-instruction ir:unbox-fixnum-instruction t)
+(define-object-ref-integer-accessor sys.int::%%storage-ref-signed-byte-16-unscaled   lap:movsx16 lap:mov16 :ax  1 ir:box-fixnum-instruction ir:unbox-fixnum-instruction t)
+(define-object-ref-integer-accessor sys.int::%%storage-ref-signed-byte-32-unscaled   lap:movsx32 lap:mov32 :eax 1 ir:box-fixnum-instruction ir:unbox-fixnum-instruction t)
+(define-object-ref-integer-accessor sys.int::%%storage-ref-signed-byte-64-unscaled   lap:mov64   lap:mov64 nil  1 ir:box-signed-byte-64-instruction ir:unbox-signed-byte-64-instruction t)
+
+(define-builtin sys.int::%atomic-fixnum-add-storage ((object offset delta) result)
+  (emit (make-instance 'x86-atomic-instruction
+                       :opcode 'lap:xadd64
+                       :object object
+                       :displacement (- 8 sys.int::+tag-instance-storage+)
+                       :index (if (constant-value-p offset '(signed-byte 29))
+                                  (fetch-constant-value offset)
+                                  offset)
+                       :rhs delta
+                       :result result
+                       :prefix '(lap:lock))))
+
+(define-builtin sys.int::%atomic-fixnum-logand-storage ((object offset value) ())
+  (emit (make-instance 'x86-atomic-instruction
+                       :opcode 'lap:and64
+                       :object object
+                       :displacement (- 8 sys.int::+tag-instance-storage+)
+                       :index (if (constant-value-p offset '(signed-byte 29))
+                                  (fetch-constant-value offset)
+                                  offset)
+                       :rhs value
+                       :result nil
+                       :prefix '(lap:lock))))
+
+(define-builtin sys.int::%atomic-fixnum-logior-storage ((object offset value) ())
+  (emit (make-instance 'x86-atomic-instruction
+                       :opcode 'lap:or64
+                       :object object
+                       :displacement (- 8 sys.int::+tag-instance-storage+)
+                       :index (if (constant-value-p offset '(signed-byte 29))
+                                  (fetch-constant-value offset)
+                                  offset)
+                       :rhs value
+                       :result nil
+                       :prefix '(lap:lock))))
+
+(define-builtin sys.int::%atomic-fixnum-logxor-storage ((object offset value) ())
+  (emit (make-instance 'x86-atomic-instruction
+                       :opcode 'lap:xor64
+                       :object object
+                       :displacement (- 8 sys.int::+tag-instance-storage+)
+                       :index (if (constant-value-p offset '(signed-byte 29))
+                                  (fetch-constant-value offset)
+                                  offset)
+                       :rhs value
+                       :result nil
+                       :prefix '(lap:lock))))
+
+(define-builtin sys.int::%xchg-storage ((object offset new) result)
+  (emit (make-instance 'x86-atomic-instruction
+                       :opcode 'lap:xchg64
+                       :object object
+                       :displacement (- 8 sys.int::+tag-instance-storage+)
+                       :index (if (constant-value-p offset '(signed-byte 29))
+                                  (fetch-constant-value offset)
+                                  offset)
+                       :rhs new
+                       :result result)))
+
+(define-builtin sys.int::%cas-storage ((object offset old new) (:z result))
+  (emit (make-instance 'x86-cmpxchg-instruction
+                       :object object
+                       :displacement (- 8 sys.int::+tag-instance-storage+)
+                       :index (if (constant-value-p offset '(signed-byte 29))
+                                  (fetch-constant-value offset)
+                                  offset)
+                       :old old
+                       :new new
+                       :result result
+                       :prefix '(lap:lock))))
+
+(define-builtin sys.int::%dcas-storage ((object offset old-1 old-2 new-1 new-2) (:z result-1 result-2))
+  (emit (make-instance 'x86-cmpxchg16b-instruction
+                       :object object
+                       :displacement (- 8 sys.int::+tag-instance-storage+)
+                       :index (if (constant-value-p offset '(signed-byte 29))
+                                  (fetch-constant-value offset)
+                                  offset)
+                       :old-1 old-1
+                       :old-2 old-2
+                       :new-1 new-1
+                       :new-2 new-2
+                       :result-1 result-1
+                       :result-2 result-2
+                       :prefix '(lap:lock))))
+
+(define-builtin sys.int::%cas-storage-header ((storage expected replacement) :z)
+  (let ((old-raw (make-instance 'ir:virtual-register :kind :integer))
+        (new-raw (make-instance 'ir:virtual-register :kind :integer))
+        (actual (make-instance 'ir:virtual-register :kind :integer)))
+    (emit (make-instance 'ir:unbox-unsigned-byte-64-instruction
+                         :source expected :destination old-raw))
+    (emit (make-instance 'ir:unbox-unsigned-byte-64-instruction
+                         :source replacement :destination new-raw))
+    (emit (make-instance 'x86-cmpxchg-instruction
+                         :object storage :index -1
+                         :displacement (- 8 sys.int::+tag-instance-storage+)
+                         :old old-raw :new new-raw :result actual
+                         :prefix '(lap:lock)))))

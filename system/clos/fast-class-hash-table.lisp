@@ -15,7 +15,7 @@
 
 (defstruct (fast-class-hash-table
              (:constructor make-fast-class-hash-table ())
-             :slot-locations)
+             :sealed)
   ;; Table can use one of three possible representation:
   ;; NIL - There are no entries.
   ;; A weak-pointer - There is a single entry. The key is the class and the value is the value.
@@ -23,7 +23,8 @@
   (table nil)
   (count 0))
 
-(defun fast-class-hash-table-entry-known-hash (table class hash)
+(declaim (inline fast-class-hash-table-cell-known-hash))
+(defun fast-class-hash-table-cell-known-hash (table class hash)
   (declare (optimize speed (safety 0) (debug 1))
            (type fast-class-hash-table table)
            (type fixnum hash))
@@ -32,7 +33,7 @@
            ;; Single entry.
            ;; TODO: Replace with WEAK-POINTER-PAIR when optimizations are implemented
            (if (eq class (sys.int::%weak-pointer-key (the mezzano.extensions:weak-pointer storage)))
-               (sys.int::%weak-pointer-value (the mezzano.extensions:weak-pointer storage))
+               storage
                nil))
           ((not storage)
            ;; No entries.
@@ -41,7 +42,7 @@
            (locally
                (declare (type simple-vector storage))
              ;; Full hash table.
-             (do* ((size (length storage))
+             (do* ((size (the fixnum (sys.int::%object-header-data storage)))
                    (mask (1- size))
                    ;; This hash implementation is inspired by the Python dict implementation.
                    (slot (logand hash #xFFFFFFFF)
@@ -56,14 +57,32 @@
                   (nil)
                (declare (type fixnum hash size mask slot perturb))
                (let* ((offset (logand slot mask))
-                      (slot (aref storage offset)))
+                      ;; The power-of-two table size and masked offset establish bounds.
+                      (slot (sys.int::%object-ref-t storage offset)))
                  (declare (type fixnum offset))
                  (when (eq slot nil)
                    ;; Unbound value marks the end of this run.
                    (return nil))
                  (when (and (not (eq slot t))
                             (eq class (sys.int::%weak-pointer-key (the mezzano.extensions:weak-pointer slot))))
-                   (return (sys.int::%weak-pointer-value (the mezzano.extensions:weak-pointer slot)))))))))))
+                   (return slot)))))))))
+
+(declaim (inline fast-class-hash-table-entry-known-hash))
+(defun fast-class-hash-table-entry-known-hash (table class hash)
+  (declare (type fast-class-hash-table table)
+           (type fixnum hash))
+  (let ((cell (fast-class-hash-table-cell-known-hash table class hash)))
+    (when cell
+      (sys.int::%weak-pointer-value (the mezzano.extensions:weak-pointer cell)))))
+
+(declaim (inline invalidate-fast-class-hash-table-cell))
+(defun invalidate-fast-class-hash-table-cell (cell)
+  ;; Readers may retain cells outside the backing table. Invalidate a detached
+  ;; cell BEFORE publishing its replacement/removal, and reread its value on
+  ;; every hit. This also releases its old value without retaining the key.
+  ;; Rehashing transfers the same live cells and must not invalidate them.
+  (declare (type mezzano.extensions:weak-pointer cell))
+  (setf (sys.int::%object-ref-t cell sys.int::+weak-pointer-value+) nil))
 
 (defun fast-class-hash-table-entry (table class)
   (fast-class-hash-table-entry-known-hash table class (safe-class-hash class)))
@@ -100,6 +119,7 @@
            (cond ((or (eql existing-class class)
                       (not existing-class))
                   ;; Same class or the existing entry was actually dead, replace the pointer.
+                  (invalidate-fast-class-hash-table-cell (fast-class-hash-table-table table))
                   (cond (value
                          (setf (fast-class-hash-table-table table)
                                (mezzano.extensions:make-weak-pointer class :value value)))
@@ -126,11 +146,13 @@
              ((eql value nil)
               ;; Removing a value.
               (when existing-slot
+                (invalidate-fast-class-hash-table-cell existing-slot)
                 (decf (fast-class-hash-table-count table))
                 ;; Replace with a tombstone marker
                 (setf (svref (fast-class-hash-table-table table) slot-offset) t)))
              (existing-slot
               ;; Updating an existing slot.
+              (invalidate-fast-class-hash-table-cell existing-slot)
               (setf (svref (fast-class-hash-table-table table) slot-offset) (mezzano.extensions:make-weak-pointer class :value value)))
              ((eql (1+ (fast-class-hash-table-count table))
                    (length (fast-class-hash-table-table table)))
@@ -178,5 +200,15 @@
                      (funcall fn class value))))))))))
 
 (defun clear-fast-class-hash-table (table)
+  ;; A discriminator can still hold a cell from this table after the table is
+  ;; cleared, so dropping the backing storage alone does not invalidate it.
+  (let ((storage (fast-class-hash-table-table table)))
+    (cond ((mezzano.extensions:weak-pointer-p storage)
+           (invalidate-fast-class-hash-table-cell storage))
+          (storage
+           (dotimes (i (length storage))
+             (let ((cell (svref storage i)))
+               (when (mezzano.extensions:weak-pointer-p cell)
+                 (invalidate-fast-class-hash-table-cell cell)))))))
   (setf (fast-class-hash-table-table table) nil
         (fast-class-hash-table-count table) 0))

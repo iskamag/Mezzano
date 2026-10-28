@@ -37,6 +37,11 @@ from value allocation. This supports comparing recompiled call graphs in one
 live image. The callee-save calling convention, including preservation by NLX
 targets, remains in effect; existing compiled functions are unchanged.
 
+LLF version 38 adds the internal `+TAG-INSTANCE-STORAGE+` reference tag.
+Layout-dependent accesses retain this physical reference before selecting an
+offset; ordinary instance references can be snapped to replacements by GC.
+Earlier compiled accesses are incompatible. Recompile all LLFs.
+
 The direction flag (`RFLAGS.DF`) must be set to zero (forward) on function
 entry and return. Other flags are caller-save.
 
