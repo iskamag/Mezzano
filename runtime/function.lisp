@@ -290,15 +290,24 @@ Arguments to FUNCTION:
     (#.+object-tag-delimited-continuation+
      nil)))
 
-(defun funcallable-instance-function (funcallable-instance)
+(defun funcallable-instance-current-storage (funcallable-instance)
   (%type-check funcallable-instance +object-tag-funcallable-instance+ 'funcallable-instance)
-  (%object-ref-t funcallable-instance +funcallable-instance-function+))
+  (loop for storage = (%instance-storage funcallable-instance)
+        for next = (layout-new-instance (%storage-layout storage))
+        when (null next) do (return storage)
+        do (setf funcallable-instance next)))
+
+(defun funcallable-instance-function (funcallable-instance)
+  (%storage-ref-t (funcallable-instance-current-storage funcallable-instance)
+                  +funcallable-instance-function+))
 (defun (setf funcallable-instance-function) (value funcallable-instance)
   (check-type value function)
-  (%type-check funcallable-instance +object-tag-funcallable-instance+ 'funcallable-instance)
   ;; TODO: If the function is an +OBJECT-TAG-FUNCTION+, then the entry point could point directly at it.
   ;; Same as in ALLOCATE-FUNCALLABLE-INSTANCE.
-  (setf (%object-ref-t funcallable-instance +funcallable-instance-function+) value))
+  (setf (%storage-ref-t
+         (funcallable-instance-current-storage funcallable-instance)
+         +funcallable-instance-function+)
+        value))
 
 (defun compiled-function-p (object)
   (when (functionp object)

@@ -1,4 +1,4 @@
-;;;; Regression checks for the CLOS dispatch/boxed-slot x86-64 fast paths.
+;;;; Regression checks for Lisp CLOS caches and compiled boxed-slot accesses.
 (defpackage :clos-fast-test (:use :cl) (:export :run))
 (in-package :clos-fast-test)
 (defclass box ()
@@ -19,14 +19,32 @@
 (defmethod identify ((object child)) :child)
 (defmethod identify ((object callable)) :callable)
 
+;; One GF intentionally names different physical slots in unrelated classes.
+(defclass named-reader-left ()
+  ((left :initarg :value :type fixnum :accessor named-reader)))
+(defclass named-reader-right ()
+  ((right :initarg :value :type fixnum :accessor named-reader)))
+(defmethod slot-unbound ((class standard-class) (object named-reader-left) name)
+  (declare (ignore class))
+  (assert (eq name 'left))
+  (assert (mezzano.internals::%value-has-tag-p
+           object mezzano.internals::+tag-object+))
+  :left-unbound)
+(defmethod slot-unbound ((class standard-class) (object named-reader-right) name)
+  (declare (ignore class))
+  (assert (eq name 'right))
+  (assert (mezzano.internals::%value-has-tag-p
+           object mezzano.internals::+tag-object+))
+  :right-unbound)
+
 (defun signals (type thunk)
   (handler-case (progn (funcall thunk) nil)
     (error (condition) (typep condition type))))
 
 (defun compare-lookup (table object expected)
   (assert (eql expected (mezzano.clos::single-dispatch-emf-entry-by-object table object)))
-  #+x86-64
-  (assert (eql expected (mezzano.clos::single-dispatch-emf-entry-by-object-slow table object))))
+  (when (fboundp 'mezzano.clos::single-dispatch-emf-entry-by-object-slow)
+    (assert (eql expected (mezzano.clos::single-dispatch-emf-entry-by-object-slow table object)))))
 
 (defun check-tables ()
   (let* ((object (make-instance 'box))
@@ -111,6 +129,120 @@
     (assert (= (box-x object) 44))
     (assert (eq (identify object) :box))))
 
+(defun check-accessor-cache-modes ()
+  (let* ((left (make-instance 'named-reader-left :value 101))
+         (right (make-instance 'named-reader-right :value 103))
+         (left-class (find-class 'named-reader-left))
+         (reader-method (find-method #'named-reader nil (list left-class)))
+         (writer-method (find-method #'(setf named-reader) nil
+                                     (list (find-class 't) left-class))))
+    (dotimes (i 3)
+      (assert (= (named-reader left) 101))
+      (assert (= (named-reader right) 103))
+      (assert (eq (named-reader (make-instance 'named-reader-left)) :left-unbound))
+      (assert (eq (named-reader (make-instance 'named-reader-right)) :right-unbound)))
+    ;; Exercise reader -> general EMF -> reader transitions on one GF, and
+    ;; invoke an already selected discriminator after its cache changes mode.
+    (let ((old-reader (mezzano.internals::funcallable-instance-function #'named-reader)))
+      (unwind-protect
+           (progn
+             (eval '(defmethod named-reader ((object named-reader-left))
+                      (declare (ignore object)) :custom-read))
+             (dotimes (i 3)
+               (assert (eq (named-reader left) :custom-read))
+               (assert (= (named-reader right) 103)))
+             (assert (eq (funcall old-reader left) :custom-read))
+             (assert (= (funcall old-reader right) 103)))
+        (remove-method #'named-reader (find-method #'named-reader nil (list left-class)))
+        (add-method #'named-reader reader-method)))
+    (assert (= (named-reader left) 101))
+    (assert (eq (named-reader (make-instance 'named-reader-left)) :left-unbound))
+    (setf (named-reader left) 101)
+    (setf (named-reader right) 103)
+    (let ((old-writer (mezzano.internals::funcallable-instance-function #'(setf named-reader))))
+      (unwind-protect
+           (progn
+             (eval '(defmethod (setf named-reader) (value (object named-reader-left))
+                      (declare (ignore object)) (list :custom-write value)))
+             (dotimes (i 3)
+               (assert (equal (funcall #'(setf named-reader) 107 left)
+                              '(:custom-write 107)))
+               (assert (= (funcall #'(setf named-reader) 103 right) 103)))
+             (assert (equal (funcall old-writer 109 left) '(:custom-write 109))))
+        (remove-method #'(setf named-reader)
+                       (find-method #'(setf named-reader) nil
+                                    (list (find-class 't) left-class)))
+        (add-method #'(setf named-reader) writer-method)))
+    ;; A physical layout change must invalidate the location stored in entries.
+    (eval '(defclass named-reader-left ()
+             ((prefix :initform :guard)
+              (left :initarg :value :type fixnum :accessor named-reader))))
+    (assert (= (named-reader left) 101))
+    (mezzano.internals::gc :full t)
+    (assert (= (named-reader left) 101))
+    (setf (named-reader left) 111)
+    (assert (= (named-reader left) 111))
+    (assert (eq (slot-value left 'prefix) :guard))
+    (assert (= (named-reader right) 103))
+    (assert (eq (named-reader (make-instance 'named-reader-left)) :left-unbound))))
+
+(defun check-retained-accessor-cells ()
+  (dolist (writerp '(nil t))
+    (let* ((object (make-instance 'box :x 101))
+           (class (class-of object))
+           (layout (mezzano.internals::%instance-layout object))
+           (hash (mezzano.internals::layout-hash layout))
+           (gf (if writerp #'(setf box-x) #'box-x))
+           (table (mezzano.clos::make-single-dispatch-emf-table gf))
+           (backing (mezzano.clos::single-dispatch-emf-table-table table))
+           (saved (if writerp
+                      (mezzano.clos::compute-writer-discriminator gf table 1 nil)
+                      (mezzano.clos::compute-reader-discriminator gf table 0 nil))))
+      (setf (box-y object) 103)
+      (labels ((entry (name)
+                 (let ((location (mezzano.clos::slot-location-using-layout name layout)))
+                   (if writerp
+                       (mezzano.clos::make-writer-discriminator-entry
+                        :layout layout :location location :slot-name name)
+                       (mezzano.clos::make-reader-discriminator-entry
+                        :layout layout :location location :slot-name name))))
+               (check (slot)
+                 (if writerp
+                     (progn
+                       (setf (slot-value object slot) 107)
+                       (assert (= (funcall saved 109 object) 109))
+                       (assert (= (slot-value object slot) 109)))
+                     (assert (= (funcall saved object) (slot-value object slot))))))
+        (setf (mezzano.clos::single-dispatch-emf-entry table class) (entry 'x))
+        (check 'x)
+        ;; A saved discriminator must reject a detached singleton cell.
+        (setf (mezzano.clos::single-dispatch-emf-entry table class) (entry 'y))
+        (check 'y)
+        ;; Promotion/growth reuse live weak cells, preserving cached hits.
+        (let ((cell (mezzano.clos::fast-class-hash-table-cell-known-hash backing class hash)))
+          (dolist (name '(t symbol integer cons string vector array fixnum bignum
+                         ratio complex float single-float double-float null
+                         character hash-table package function stream standard-class
+                         structure-object))
+            (let ((other (find-class name nil)))
+              (when other
+                (setf (mezzano.clos::single-dispatch-emf-entry table other) :other))))
+          (assert (> (length (mezzano.clos::fast-class-hash-table-table backing)) 16))
+          (assert (eq cell (mezzano.clos::fast-class-hash-table-cell-known-hash backing class hash)))
+          (assert (mezzano.internals::%weak-pointer-value cell))
+          (check 'y))
+        ;; Updating an existing bucket must invalidate the prior cell too.
+        (setf (mezzano.clos::single-dispatch-emf-entry table class) (entry 'x))
+        (check 'x)
+        (setf (mezzano.clos::single-dispatch-emf-entry table class) (entry 'y))
+        (check 'y)
+        (setf (mezzano.clos::single-dispatch-emf-entry table class) nil)
+        (check 'x)
+        (setf (mezzano.clos::single-dispatch-emf-entry table class) (entry 'y))
+        (check 'y)
+        (mezzano.clos::clear-single-dispatch-emf-table table)
+        (check 'x)))))
+
 (defun check-during-gc ()
   (let* ((object (make-instance 'box :x 42))
          (stop nil) (done nil) (failure nil) (iterations 0)
@@ -136,9 +268,28 @@
     (assert (plusp iterations))
     (format t "Concurrent access/GC: ~D iterations.~%" iterations)))
 
+(defun check-fixnum-right-shift ()
+  ;; Exercise both immediate and variable backend counts, including saturation.
+  (let ((variable (compile nil '(lambda (value count)
+                                 (declare (type fixnum value)
+                                          (type (and fixnum (integer 0)) count))
+                                 (mezzano.runtime::right-shift value count)))))
+    (dolist (count '(0 61 63 64 1000))
+      (let ((constant (compile nil `(lambda (value)
+                                     (declare (type fixnum value))
+                                     (mezzano.runtime::right-shift value ,count)))))
+        (dolist (value (list most-negative-fixnum -1 0 1 most-positive-fixnum))
+          (let ((expected (floor value (expt 2 count))))
+            (dolist (actual (list (funcall variable value count)
+                                 (funcall constant value)))
+              (assert (and (typep actual 'fixnum) (= actual expected))))))))))
+
 (defun run ()
+  (check-fixnum-right-shift)
   (check-tables)
   (check-slots-and-redefinition)
+  (check-accessor-cache-modes)
+  (check-retained-accessor-cells)
   (check-during-gc)
   (format t "CLOS FAST PATH TESTS PASSED~%"))
 (run)

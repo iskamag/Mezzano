@@ -118,23 +118,25 @@ the old or new values are expected to be unbound.")
 (sys.int::defglobal *built-in-class-precedence-list-location*)
 (sys.int::defglobal *built-in-class-hash-location*)
 
+(declaim (inline standard-instance-access (setf standard-instance-access)
+                 (sys.int::cas standard-instance-access)))
 (defun standard-instance-access (instance location)
   (if (consp location)
       (cdr location)
       ;; Bypass INSTANCE-ACCESS because we know all locations in
       ;; standard instances have type T
-      (sys.int::%object-ref-t instance (mezzano.runtime::location-offset-t location))))
+      (sys.int::%storage-ref-t (sys.int::%instance-storage instance) (mezzano.runtime::location-offset-t (the fixnum location)))))
 
 (defun (setf standard-instance-access) (new-value instance location)
   (if (consp location)
       (setf (cdr location) new-value)
-      (setf (sys.int::%object-ref-t instance (mezzano.runtime::location-offset-t location))
+      (setf (sys.int::%storage-ref-t (sys.int::%instance-storage instance) (mezzano.runtime::location-offset-t (the fixnum location)))
             new-value)))
 
 (defun (sys.int::cas standard-instance-access) (old new instance location)
   (if (consp location)
       (sys.int::cas (cdr location) old new)
-      (sys.int::cas (sys.int::%object-ref-t instance (mezzano.runtime::location-offset-t location))
+      (sys.int::cas (sys.int::%storage-ref-t (sys.int::%instance-storage instance) (mezzano.runtime::location-offset-t (the fixnum location)))
                     old new)))
 
 ;; Instance and funcallable instances are accessed in the same way,
@@ -157,105 +159,19 @@ the old or new values are expected to be unbound.")
      do (return (svref instance-slots (1+ i)))
      finally (return nil)))
 
-;; TODO: This and FAST-SLOT-WRITE should use the correct slot access function.
-;; It doesn't really matter though, as instances and funcallable instances
-;; are all compatible.
-(defun #+x86-64 fast-slot-read-slow #-x86-64 fast-slot-read
-    (instance location slot-definition)
-  (multiple-value-bind (slots layout)
-      ;; This is required in case the instance is obsolete.
-      (fetch-up-to-date-instance-slots-and-layout instance)
-    (declare (ignore layout))
-    (let* ((val (standard-instance-access slots location)))
-      (if (eq *secret-unbound-value* val)
-          (values (slot-unbound (class-of instance)
-                                instance
-                                (if (consp location)
-                                    (car location)
-                                    (safe-slot-definition-name slot-definition))))
-          val))))
-
-(defun #+x86-64 fast-slot-write-slow #-x86-64 fast-slot-write
-    (new-value instance location slot-definition)
-  (declare (ignore slot-definition))
-  (multiple-value-bind (slots layout)
-      ;; This is required in case the instance is obsolete.
-      (fetch-up-to-date-instance-slots-and-layout instance)
-    (declare (ignore layout))
-    (setf (standard-instance-access slots location) new-value)))
-
-;; Keep the common boxed instance-slot path frameless. Shared slots, obsolete
-;; or superseded instances, and unbound reads retain the Lisp implementation.
-;; R8/R9/R10 (and R11 for writes) are preserved on every slow-path branch.
-;; Only raw offsets live in integer registers; object references stay in value
-;; registers. GC preserves each instance's physical layout, including after
-;; supersession, so it cannot invalidate an offset selected before collection.
-#+x86-64
-(sys.int::define-lap-function fast-slot-read ((instance location slot-definition))
-  (:gc :no-frame :incoming-arguments :rcx :layout #*0)
-  (mezzano.lap.x86:cmp64 :rcx 6)
-  (mezzano.lap.x86:jne slow)
-  (mezzano.lap.x86:test64 :r9 1)
-  (mezzano.lap.x86:jnz slow)
-  (mezzano.lap.x86:mov64 :r11 (:object :r8 -1))
-  (mezzano.lap.x86:shr64 :r11 #.sys.int::+object-data-shift+)
-  (mezzano.lap.x86:cmp64 (:object-location :r11 #.sys.int::+layout-new-instance+) nil)
-  (mezzano.lap.x86:jne slow)
-  (mezzano.lap.x86:cmp64 (:object-location :r11 #.sys.int::+layout-obsolete+) nil)
-  (mezzano.lap.x86:jne slow)
-  (mezzano.lap.x86:mov64 :rax :r9)
-  (mezzano.lap.x86:sar64 :rax #.(+ 7 sys.int::+n-fixnum-bits+))
-  (mezzano.lap.x86:mov64 :r11 (:r8 (:rax 8) -1))
-  (mezzano.lap.x86:mov64 :rbx (:symbol-global-cell *secret-unbound-value*))
-  (mezzano.lap.x86:cmp64 :r11 (:object :rbx #.sys.int::+symbol-value-cell-value+))
-  (mezzano.lap.x86:je slow)
-  (mezzano.lap.x86:mov64 :r8 :r11)
-  (mezzano.lap.x86:mov32 :ecx 2)
-  (mezzano.lap.x86:ret)
-  slow
-  (mezzano.lap.x86:jmp (:named-call fast-slot-read-slow)))
-
-#+x86-64
-(sys.int::define-lap-function fast-slot-write ((value instance location slot-definition))
-  (:gc :no-frame :incoming-arguments :rcx :layout #*0)
-  (mezzano.lap.x86:cmp64 :rcx 8)
-  (mezzano.lap.x86:jne slow)
-  (mezzano.lap.x86:test64 :r10 1)
-  (mezzano.lap.x86:jnz slow)
-  (mezzano.lap.x86:mov64 :r12 (:object :r9 -1))
-  (mezzano.lap.x86:shr64 :r12 #.sys.int::+object-data-shift+)
-  (mezzano.lap.x86:cmp64 (:object-location :r12 #.sys.int::+layout-new-instance+) nil)
-  (mezzano.lap.x86:jne slow)
-  (mezzano.lap.x86:cmp64 (:object-location :r12 #.sys.int::+layout-obsolete+) nil)
-  (mezzano.lap.x86:jne slow)
-  (mezzano.lap.x86:mov64 :rax :r10)
-  (mezzano.lap.x86:sar64 :rax #.(+ 7 sys.int::+n-fixnum-bits+))
-  (mezzano.lap.x86:mov64 (:r9 (:rax 8) -1) :r8)
-  (mezzano.lap.x86:mov32 :ecx 2)
-  (mezzano.lap.x86:ret)
-  slow
-  (mezzano.lap.x86:jmp (:named-call fast-slot-write-slow)))
-
 (defun fetch-up-to-date-instance-slots-and-layout (instance)
-  (loop
-    (let* ((layout (sys.int::%instance-layout instance))
-           (new-instance (sys.int::layout-new-instance layout)))
-       (cond ((null new-instance)
-              (cond ((sys.int::layout-obsolete layout)
-                     (update-instance-for-new-layout instance))
-                    (t
-                     (return (values instance layout)))))
-             (t
-              ;; Obsolete instance.
-              ;; There should never be nested layers of obsolete instances.
-              (let* ((real-layout (sys.int::%instance-layout new-instance)))
-                ;; But it's possible that the layout of the new instance is obsolete
-                ;; FIXME: This needs to use NEW-INSTANCE to populate the new instance,
-                ;; but the old instance must be what gets superseded.
-                (cond ((sys.int::layout-obsolete real-layout)
-                       (update-instance-for-new-layout instance))
-                      (t
-                       (return (values new-instance real-layout))))))))))
+  ;; INSTANCE is a logical identity. STORAGE is a physical GC root, captured
+  ;; before its layout is read; a caller may safely retain it with an offset.
+  ;; Replacement links are immutable and may form chains until GC collapses
+  ;; logical aliases. Never return a physical reference to a user/MOP hook.
+  (loop with current = instance
+        for storage = (sys.int::%instance-storage current)
+        for layout = (sys.int::%storage-layout storage)
+        for replacement = (sys.int::layout-new-instance layout)
+        do (cond (replacement (setf current replacement))
+                 ((sys.int::layout-obsolete layout)
+                  (update-instance-for-new-layout current))
+                 (t (return (values storage layout))))))
 
 (defun find-effective-slot (object slot-name)
   (find slot-name (safe-class-slots (class-of object))
@@ -496,7 +412,8 @@ the old or new values are expected to be unbound.")
 (defun class-of (x)
   (cond ((sys.int::instance-or-funcallable-instance-p x)
          (let* ((layout (sys.int::%instance-layout x))
-                (new-instance (sys.int::layout-new-instance layout)))
+                (new-instance (sys.int::layout-new-instance (the sys.int::layout layout))))
+           (declare (type sys.int::layout layout))
            (cond ((null new-instance)
                   (sys.int::layout-class layout))
                  (t
@@ -1971,31 +1888,128 @@ has only has class specializer."
 
 ;;; compute-discriminating-function
 
-(defun compute-reader-discriminator (gf emf-table argument-offset slot-definition)
-  (lambda (object)
-    (let* ((location (single-dispatch-emf-entry-by-object emf-table object)))
-      (if location
-          (fast-slot-read object location slot-definition)
-          (slow-single-dispatch-method-lookup* gf argument-offset (list object) :reader)))))
+(defmacro with-current-instance-storage ((storage layout object) &body body)
+  `(let* ((,storage (sys.int::%instance-storage ,object))
+          (,layout (the sys.int::layout (sys.int::%storage-layout ,storage))))
+     (declare (type sys.int::layout ,layout))
+     (when (or (sys.int::layout-new-instance ,layout)
+               (sys.int::layout-obsolete ,layout))
+       (multiple-value-setq (,storage ,layout)
+         (fetch-up-to-date-instance-slots-and-layout ,object)))
+     ,@body))
 
-(defstruct (writer-discriminator-entry
-             :sealed)
-  location
-  typecheck
-  type)
+;; Keep the probe out of the discriminator: its loop and cold error paths
+;; otherwise enlarge the frame and register spills even on last-cell hits.
+(declaim (notinline accessor-cache-cell))
+(defun accessor-cache-cell (emf-table layout)
+  (declare (type single-dispatch-emf-table emf-table)
+           (type sys.int::layout layout))
+  (fast-class-hash-table-cell-known-hash
+   (single-dispatch-emf-table-table emf-table)
+   (sys.int::layout-class layout) (sys.int::layout-hash layout)))
+
+(defstruct (reader-discriminator-entry :sealed)
+  (layout nil :read-only t)
+  (location nil :read-only t)
+  (slot-name nil :read-only t))
+
+(declaim (inline read-cached-slot))
+(defun read-cached-slot (object storage entry)
+  (declare (type reader-discriminator-entry entry))
+  (let ((value (standard-instance-access storage (reader-discriminator-entry-location entry))))
+    (if (eq value *secret-unbound-value*)
+        (values (slot-unbound (class-of object) object
+                             (reader-discriminator-entry-slot-name entry)))
+        value)))
+
+(declaim (inline read-accessor-entry))
+(defun read-accessor-entry (object storage layout entry)
+  (declare (type reader-discriminator-entry entry)
+           (type sys.int::layout layout))
+  (if (and (eq layout (reader-discriminator-entry-layout entry))
+           (not (sys.int::layout-obsolete layout)))
+      (read-cached-slot object storage entry)
+      (slot-value object (reader-discriminator-entry-slot-name entry))))
+
+(defun compute-reader-discriminator (gf emf-table argument-offset slot-definition)
+  (declare (ignore slot-definition))
+  (let ((last-cell nil))
+    (lambda (object)
+      (block nil
+        (when (sys.int::instance-or-funcallable-instance-p object)
+          (with-current-instance-storage (storage layout object)
+            ;; Snapshot the shared pointer once. A hit retains only a weak
+            ;; cell between calls, and its immutable entry establishes the
+            ;; class through the exact current layout without a key lookup.
+            (let* ((cell last-cell)
+                   (entry (and cell
+                               (sys.int::%weak-pointer-value
+                                (the mezzano.extensions:weak-pointer cell)))))
+              (when (and (reader-discriminator-entry-p entry)
+                         (eq layout (reader-discriminator-entry-layout
+                                       (the reader-discriminator-entry entry))))
+                (return (read-cached-slot object storage entry)))
+              (setf cell (accessor-cache-cell emf-table layout)
+                    last-cell cell
+                    entry (and cell
+                               (sys.int::%weak-pointer-value
+                                (the mezzano.extensions:weak-pointer cell))))
+              (when (reader-discriminator-entry-p entry)
+                (return (read-accessor-entry object storage layout entry))))))
+        (slow-single-dispatch-method-lookup* gf argument-offset (list object) :reader)))))
+
+(defstruct (writer-discriminator-entry :sealed)
+  (location nil :read-only t)
+  (typecheck nil :read-only t)
+  (type nil :read-only t)
+  (layout nil :read-only t)
+  (slot-name nil :read-only t))
+
+(declaim (inline write-cached-slot))
+(defun write-cached-slot (new-value storage entry)
+  (declare (type writer-discriminator-entry entry))
+  ;; STORAGE remains a physical GC root across an arbitrary typecheck.
+  (let ((typecheck (writer-discriminator-entry-typecheck entry)))
+    (when (and typecheck (not (funcall typecheck new-value)))
+      (error 'type-error :datum new-value
+             :expected-type (writer-discriminator-entry-type entry))))
+  (setf (standard-instance-access storage
+                                  (writer-discriminator-entry-location entry))
+        new-value))
+
+(declaim (inline write-accessor-entry))
+(defun write-accessor-entry (new-value object storage layout entry)
+  (declare (type writer-discriminator-entry entry)
+           (type sys.int::layout layout))
+  (if (and (eq layout (writer-discriminator-entry-layout entry))
+           (not (sys.int::layout-obsolete layout)))
+      (write-cached-slot new-value storage entry)
+      (setf (slot-value object (writer-discriminator-entry-slot-name entry))
+            new-value)))
 
 (defun compute-writer-discriminator (gf emf-table argument-offset slot-definition)
-  (lambda (new-value object)
-    (let* ((location (single-dispatch-emf-entry-by-object emf-table object)))
-      (cond (location
-             (let ((typecheck (writer-discriminator-entry-typecheck location)))
-               (when (and typecheck (not (funcall typecheck new-value)))
-                 (error 'type-error
-                        :datum new-value
-                        :expected-type (writer-discriminator-entry-type location))))
-             (fast-slot-write new-value object (writer-discriminator-entry-location location) slot-definition))
-            (t
-             (slow-single-dispatch-method-lookup* gf argument-offset (list new-value object) :writer))))))
+  (declare (ignore slot-definition))
+  (let ((last-cell nil))
+    (lambda (new-value object)
+      (block nil
+        (when (sys.int::instance-or-funcallable-instance-p object)
+          (with-current-instance-storage (storage layout object)
+            (let* ((cell last-cell)
+                   (entry (and cell
+                               (sys.int::%weak-pointer-value
+                                (the mezzano.extensions:weak-pointer cell)))))
+              (when (and (writer-discriminator-entry-p entry)
+                         (eq layout (writer-discriminator-entry-layout
+                                       (the writer-discriminator-entry entry))))
+                (return (write-cached-slot new-value storage entry)))
+              (setf cell (accessor-cache-cell emf-table layout)
+                    last-cell cell
+                    entry (and cell
+                               (sys.int::%weak-pointer-value
+                                (the mezzano.extensions:weak-pointer cell))))
+              (when (writer-discriminator-entry-p entry)
+                (return (write-accessor-entry new-value object storage layout entry))))))
+        (slow-single-dispatch-method-lookup* gf argument-offset (list new-value object) :writer)))))
 
 (defun compute-1-effective-discriminator (gf emf-table argument-offset)
   ;; TODO: This table should be a weak-alist, but that's not thread-safe.
@@ -2139,9 +2153,14 @@ has only has class specializer."
                        (slot-name (slot-definition-name slot-def))
                        (effective-slot (find-effective-slot instance slot-name)))
                   (cond (effective-slot
-                         (let ((location (safe-slot-definition-location effective-slot)))
-                           (setf (single-dispatch-emf-entry emf-table class) location)
-                           (fast-slot-read (first args) location slot-def)))
+                         (multiple-value-bind (storage layout)
+                             (fetch-up-to-date-instance-slots-and-layout instance)
+                           (let* ((location (or (slot-location-using-layout slot-name layout)
+                                                (safe-slot-definition-location effective-slot)))
+                                  (entry (make-reader-discriminator-entry
+                                          :layout layout :location location :slot-name slot-name)))
+                             (setf (single-dispatch-emf-entry emf-table class) entry)
+                             (read-accessor-entry instance storage layout entry))))
                         (t
                          ;; Slot not present, fall back on SLOT-VALUE.
                          (slot-value instance slot-name)))))
@@ -2165,19 +2184,18 @@ has only has class specializer."
                        (new-value (first args)))
                   (register-redefinition-flusher gf class)
                   (cond (effective-slot
-                         (let* ((location (safe-slot-definition-location effective-slot))
+                         (multiple-value-bind (storage layout)
+                             (fetch-up-to-date-instance-slots-and-layout instance)
+                           (let* ((location (or (slot-location-using-layout slot-name layout)
+                                                (safe-slot-definition-location effective-slot)))
                                 (typecheck (safe-slot-definition-typecheck effective-slot))
                                 (type (safe-slot-definition-type effective-slot))
                                 (entry (make-writer-discriminator-entry
                                         :location location
                                         :typecheck typecheck
-                                        :type type)))
+                                        :type type :layout layout :slot-name slot-name)))
                            (setf (single-dispatch-emf-entry emf-table class) entry)
-                           (when (and typecheck (not (funcall typecheck new-value)))
-                             (error 'type-error
-                                    :datum new-value
-                                    :expected-type type))
-                           (fast-slot-write new-value instance location slot-def)))
+                           (write-accessor-entry new-value instance storage layout entry))))
                         (t
                          ;; Slot not present, fall back on SLOT-VALUE.
                          (setf (slot-value instance slot-name) new-value)))))
@@ -2328,10 +2346,18 @@ always match."
                                  (slot-name (slot-definition-name slot-def))
                                  (effective-slot (find-effective-slot instance slot-name)))
                             (cond (effective-slot
-                                   (let ((location (safe-slot-definition-location effective-slot)))
-                                     (lambda (object)
-                                       (declare (sys.int::lambda-name fast-slot-reader))
-                                       (fast-slot-read object location slot-def))))
+                                   (multiple-value-bind (storage layout)
+                                       (fetch-up-to-date-instance-slots-and-layout instance)
+                                     (declare (ignore storage))
+                                     (let ((entry (make-reader-discriminator-entry
+                                                   :layout layout
+                                                   :location (or (slot-location-using-layout slot-name layout)
+                                                                 (safe-slot-definition-location effective-slot))
+                                                   :slot-name slot-name)))
+                                       (lambda (object)
+                                         (declare (sys.int::lambda-name cached-slot-reader))
+                                         (with-current-instance-storage (storage layout object)
+                                           (read-accessor-entry object storage layout entry))))))
                                   (t
                                    ;; Slot not present, fall back on SLOT-VALUE.
                                    (lambda (object)
@@ -2349,15 +2375,20 @@ always match."
                                  (slot-name (slot-definition-name slot-def))
                                  (effective-slot (find-effective-slot instance slot-name)))
                             (cond (effective-slot
-                                   (let* ((location (safe-slot-definition-location effective-slot))
-                                          (typecheck (safe-slot-definition-typecheck effective-slot))
-                                          (type (safe-slot-definition-type effective-slot)))
-                                     (lambda (new-value object)
-                                       (when (and typecheck (not (funcall typecheck new-value)))
-                                         (error 'type-error
-                                                :datum new-value
-                                                :expected-type type))
-                                       (fast-slot-write new-value object location slot-def))))
+                                   (multiple-value-bind (storage layout)
+                                       (fetch-up-to-date-instance-slots-and-layout instance)
+                                     (declare (ignore storage))
+                                     (let ((entry (make-writer-discriminator-entry
+                                                   :layout layout
+                                                   :location (or (slot-location-using-layout slot-name layout)
+                                                                 (safe-slot-definition-location effective-slot))
+                                                   :typecheck (safe-slot-definition-typecheck effective-slot)
+                                                   :type (safe-slot-definition-type effective-slot)
+                                                   :slot-name slot-name)))
+                                       (lambda (new-value object)
+                                         (declare (sys.int::lambda-name cached-slot-writer))
+                                         (with-current-instance-storage (storage layout object)
+                                           (write-accessor-entry new-value object storage layout entry))))))
                                   (t
                                    ;; Slot not present, fall back on SLOT-VALUE.
                                    (lambda (value object)
@@ -3777,10 +3808,8 @@ always match."
 
 (defun update-instance-for-new-layout (instance)
   (let* ((class (class-of instance))
-         (old-potentially-obsolete-layout (sys.int::%instance-layout instance))
-         (old-instance (or (sys.int::layout-new-instance old-potentially-obsolete-layout)
-                           instance))
-         (old-layout (sys.int::%instance-layout old-instance))
+         (old-instance (sys.int::%instance-storage instance))
+         (old-layout (sys.int::%storage-layout old-instance))
          (new-layout (safe-class-slot-storage-layout class))
          (old-layout-slots (layout-instance-slots-list old-layout))
          (new-layout-slots (layout-instance-slots-list new-layout))
@@ -3789,6 +3818,7 @@ always match."
          (new-instance (allocate-instance class))
          (property-list '())
          (old-structure-slots (gethash old-layout *obsolete-structure-layout-slots*)))
+    (assert (null (sys.int::layout-new-instance old-layout)))
     ;; The complicated bit.
     ;; Slots have been added or removed.
     ;; Copy slots that were not added/discarded.

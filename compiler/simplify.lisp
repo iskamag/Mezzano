@@ -1161,14 +1161,23 @@ First return value is a list of elements, second is the final dotted component (
                  (mezzano.clos:class-slots struct-class)
                  :key #'mezzano.clos:slot-definition-name)))))
 
-(defun struct-type-test-form (object struct)
+(defun struct-type-test-form (object struct &optional source-object)
   (if (sys.int::structure-layout-permanent-p struct)
-      `(if (call sys.int::%value-has-tag-p ,object ',sys.int::+tag-object+)
-           (call sys.int::%fast-instance-layout-eq-p
-                 ,object
-                 ',(mezzano.runtime::%make-instance-header
-                    (mezzano.clos:class-layout struct)))
-           'nil)
+      ;; The original argument remains in its binding, including any THE
+      ;; assertion and its type check. Once its type establishes this permanent
+      ;; layout, testing the bound value's tag/header again adds no information.
+      ;; Mutable structures still need the snapshot and layout check below:
+      ;; their declared class does not establish a fixed physical layout.
+      (if (and source-object
+               (match-transform-argument (class-name struct)
+                                         source-object))
+          ''t
+          `(if (call sys.int::%value-has-tag-p ,object ',sys.int::+tag-object+)
+               (call sys.int::%fast-instance-layout-eq-p
+                     ,object
+                     ',(mezzano.runtime::%make-instance-header
+                        (mezzano.clos:class-layout struct)))
+               'nil))
       `(if ,(struct-slot-access-form (find 'sys.int::obsolete
                                            (mezzano.clos:class-slots
                                             (sys.int::get-structure-type 'sys.int::layout))
@@ -1187,24 +1196,77 @@ First return value is a list of elements, second is the final dotted component (
                          ',(mezzano.clos:class-layout struct)))
                'nil))))
 
+(defun struct-storage-operator (operator)
+  ;; Only these primitives interpret an instance pointer as physical storage.
+  (if (consp operator)
+      (let ((base (struct-storage-operator (second operator))))
+        (when base (list (first operator) base)))
+      (case operator
+        (sys.int::%fast-instance-layout-eq-p 'sys.int::%fast-storage-layout-eq-p)
+        (sys.int::structure-layout-compatible-p 'sys.int::structure-storage-layout-compatible-p)
+        (sys.int::%instance-layout 'sys.int::%storage-layout)
+        (sys.int::%dcas-object 'sys.int::%dcas-storage)
+        (sys.int::%xchg-object 'sys.int::%xchg-storage)
+        (sys.int::%atomic-fixnum-add-object 'sys.int::%atomic-fixnum-add-storage)
+        (sys.int::%atomic-fixnum-logand-object 'sys.int::%atomic-fixnum-logand-storage)
+        (sys.int::%atomic-fixnum-logior-object 'sys.int::%atomic-fixnum-logior-storage)
+        (sys.int::%atomic-fixnum-logxor-object 'sys.int::%atomic-fixnum-logxor-storage)
+        (t
+         (when (and (symbolp operator)
+                    (eql (search "%OBJECT-REF-" (symbol-name operator)) 0))
+           (intern (concatenate 'string "%STORAGE-REF-"
+                                (subseq (symbol-name operator) 12))
+                   :mezzano.internals))))))
+
+(defun struct-access-ast (expansion context struct)
+  ;; A layout check and the access it authorizes must refer to the SAME
+  ;; physical storage, even across calls, collection, and class migration.
+  ;; Keep OBJ logical for errors/slow paths; STORAGE is an internal GC root.
+  ;; Permanent layouts cannot migrate and need no additional instruction.
+  (if (sys.int::structure-layout-permanent-p struct)
+      (ast expansion context)
+      (labels ((rewrite (form active)
+                 (cond ((atom form) form)
+                       ((member (car form) '(quote source-fragment notinline-call)) form)
+                       ((and (eq (car form) 'let)
+                             (assoc 'obj (second form)))
+                        `(let ,(second form)
+                           (let ((storage (if (call sys.int::%value-has-tag-p obj
+                                                   ',sys.int::+tag-object+)
+                                              (call sys.int::%instance-storage obj)
+                                              'nil)))
+                             ,@(mapcar (lambda (body) (rewrite body t)) (cddr form)))))
+                       ((and active (eq (car form) 'call)
+                             (member 'obj (cddr form)))
+                        (cond ((eq (second form) 'sys.int::%value-has-tag-p)
+                               `(call sys.int::%value-has-tag-p storage
+                                      ',sys.int::+tag-instance-storage+))
+                              ((struct-storage-operator (second form))
+                               `(call ,(struct-storage-operator (second form))
+                                      ,@(substitute 'storage 'obj (cddr form))))
+                              (t form)))
+                       (t (mapcar (lambda (part) (rewrite part active)) form)))))
+        (ast (rewrite expansion nil) context))))
+
 (defun simplify-struct-slot (form)
   (change-made)
   (destructuring-bind (object structure-name slot-name)
       (arguments form)
     (let ((slot-def (find-struct-slot structure-name slot-name))
           (struct (sys.int::get-structure-type (ast-value structure-name))))
-      (cond ((match-optimize-settings form '((= safety 0) (= speed 3)))
-             (ast (struct-slot-access-form slot-def object nil)
-                  form))
+      (cond ((and (sys.int::structure-layout-permanent-p struct)
+                  (match-optimize-settings form '((= safety 0) (= speed 3))))
+             (struct-access-ast (struct-slot-access-form slot-def object nil)
+                  form struct))
             (t
-             (ast `(let ((obj ,object))
-                     (if ,(struct-type-test-form 'obj struct)
+             (struct-access-ast `(let ((obj ,object))
+                     (if ,(struct-type-test-form 'obj struct object)
                          ,(struct-slot-access-form slot-def 'obj nil)
                          (notinline-call sys.int::%struct-slot
                                          obj
                                          ',(ast-value structure-name)
                                          ',(ast-value slot-name))))
-                  form))))))
+                  form struct))))))
 
 (defun simplify-setf-struct-slot (form)
   (change-made)
@@ -1212,13 +1274,14 @@ First return value is a list of elements, second is the final dotted component (
       (arguments form)
     (let ((slot-def (find-struct-slot structure-name slot-name))
           (struct (sys.int::get-structure-type (ast-value structure-name))))
-      (cond ((match-optimize-settings form '((= safety 0) (= speed 3)))
-             (ast (struct-slot-access-form slot-def object 'setf value)
-                  form))
+      (cond ((and (sys.int::structure-layout-permanent-p struct)
+                  (match-optimize-settings form '((= safety 0) (= speed 3))))
+             (struct-access-ast (struct-slot-access-form slot-def object 'setf value)
+                  form struct))
             (t
-             (ast `(let ((val ,value)
+             (struct-access-ast `(let ((val ,value)
                          (obj ,object))
-                     (if ,(struct-type-test-form 'obj struct)
+                     (if ,(struct-type-test-form 'obj struct object)
                          (progn
                            (if (source-fragment (typep val ',(mezzano.clos:slot-definition-type slot-def)))
                                'nil
@@ -1231,7 +1294,7 @@ First return value is a list of elements, second is the final dotted component (
                                          obj
                                          ',(ast-value structure-name)
                                          ',(ast-value slot-name))))
-                  form))))))
+                  form struct))))))
 
 (defun simplify-cas-struct-slot (form)
   (change-made)
@@ -1239,17 +1302,18 @@ First return value is a list of elements, second is the final dotted component (
       (arguments form)
     (let ((slot-def (find-struct-slot structure-name slot-name))
           (struct (sys.int::get-structure-type (ast-value structure-name))))
-      (cond ((match-optimize-settings form '((= safety 0) (= speed 3)))
-             (ast `(let ((old ,old)
+      (cond ((and (sys.int::structure-layout-permanent-p struct)
+                  (match-optimize-settings form '((= safety 0) (= speed 3))))
+             (struct-access-ast `(let ((old ,old)
                          (new ,new)
                          (obj ,object))
                      ,(struct-slot-access-form slot-def 'obj 'sys.int::cas 'old 'new))
-                  form))
+                  form struct))
             (t
-             (ast `(let ((old ,old)
+             (struct-access-ast `(let ((old ,old)
                          (new ,new)
                          (obj ,object))
-                     (if ,(struct-type-test-form 'obj struct)
+                     (if ,(struct-type-test-form 'obj struct object)
                          (progn
                            (if (source-fragment (typep old ',(mezzano.clos:slot-definition-type slot-def)))
                                'nil
@@ -1268,7 +1332,7 @@ First return value is a list of elements, second is the final dotted component (
                                          obj
                                          ',(ast-value structure-name)
                                          ',(ast-value slot-name))))
-                form))))))
+                form struct))))))
 
 (defun test-atomic-fixnum-op-struct-slot-transform-viability (form)
   (destructuring-bind (object structure-name slot-name value)
@@ -1302,15 +1366,16 @@ First return value is a list of elements, second is the final dotted component (
     (let ((slot-def (find-struct-slot structure-name slot-name))
           (struct (sys.int::get-structure-type (ast-value structure-name)))
           (op (atomic-op-for-atomic-struct-slot-op (name form))))
-      (cond ((match-optimize-settings form '((= safety 0) (= speed 3)))
-             (ast `(let ((obj ,object)
+      (cond ((and (sys.int::structure-layout-permanent-p struct)
+                  (match-optimize-settings form '((= safety 0) (= speed 3))))
+             (struct-access-ast `(let ((obj ,object)
                          (value ,value))
                      (call ,op obj ',(struct-slot-accessor-index slot-def) value))
-                  form))
+                  form struct))
             (t
-             (ast `(let ((obj ,object)
+             (struct-access-ast `(let ((obj ,object)
                          (value ,value))
-                     (if ,(struct-type-test-form 'obj struct)
+                     (if ,(struct-type-test-form 'obj struct object)
                          (progn
                            (if (source-fragment (typep value 'fixnum))
                                'nil
@@ -1323,7 +1388,7 @@ First return value is a list of elements, second is the final dotted component (
                                          ',(ast-value structure-name)
                                          ',(ast-value slot-name)
                                          value)))
-                form))))))
+                form struct))))))
 
 (defun test-atomic-swap-struct-slot-transform-viability (form)
   (destructuring-bind (object structure-name slot-name value)
@@ -1342,18 +1407,19 @@ First return value is a list of elements, second is the final dotted component (
       (arguments form)
     (let ((slot-def (find-struct-slot structure-name slot-name))
           (struct (sys.int::get-structure-type (ast-value structure-name))))
-      (cond ((match-optimize-settings form '((= safety 0) (= speed 3)))
-             (ast `(let ((obj ,object)
+      (cond ((and (sys.int::structure-layout-permanent-p struct)
+                  (match-optimize-settings form '((= safety 0) (= speed 3))))
+             (struct-access-ast `(let ((obj ,object)
                          (value ,value))
                      (call sys.int::%xchg-object
                            obj
                            ',(struct-slot-accessor-index slot-def)
                            value))
-                  form))
+                  form struct))
             (t
-             (ast `(let ((obj ,object)
+             (struct-access-ast `(let ((obj ,object)
                          (value ,value))
-                     (if ,(struct-type-test-form 'obj struct)
+                     (if ,(struct-type-test-form 'obj struct object)
                          (progn
                            (if (source-fragment (typep value ',(mezzano.clos:slot-definition-type slot-def)))
                                'nil
@@ -1369,7 +1435,7 @@ First return value is a list of elements, second is the final dotted component (
                                          ',(ast-value structure-name)
                                          ',(ast-value slot-name)
                                          value)))
-                form))))))
+                form struct))))))
 
 (defun test-dcas-struct-slot-transform-viability
     (structure-name-1 slot-name-1 structure-name-2 slot-name-2)
@@ -1437,17 +1503,18 @@ First return value is a list of elements, second is the final dotted component (
            (struct (if (member struct-2 (mezzano.clos:class-precedence-list struct-1))
                        struct-2
                        struct-1)))
-      (cond ((match-optimize-settings form '((= safety 0) (= speed 3)))
-             (ast `(let ((old-1 ,old-1) (old-2 ,old-2)
+      (cond ((and (sys.int::structure-layout-permanent-p struct)
+                  (match-optimize-settings form '((= safety 0) (= speed 3))))
+             (struct-access-ast `(let ((old-1 ,old-1) (old-2 ,old-2)
                          (new-1 ,new-1) (new-2 ,new-2)
                          (obj ,object))
                      ,(generate-dcas-form slot-def-1 slot-def-2 'obj 'old-1 'old-2 'new-1 'new-2))
-                  form))
+                  form struct))
             (t
-             (ast `(let ((old-1 ,old-1) (old-2 ,old-2)
+             (struct-access-ast `(let ((old-1 ,old-1) (old-2 ,old-2)
                          (new-1 ,new-1) (new-2 ,new-2)
                          (obj ,object))
-                     (if ,(struct-type-test-form 'obj struct)
+                     (if ,(struct-type-test-form 'obj struct object)
                          (progn
                            (if (source-fragment (typep old-1 ',(mezzano.clos:slot-definition-type slot-def-1)))
                                'nil
@@ -1476,7 +1543,7 @@ First return value is a list of elements, second is the final dotted component (
                                          ',(ast-value structure-name-2) ',(ast-value slot-name-2)
                                          old-1 old-2
                                          new-1 new-2)))
-                form))))))
+                form struct))))))
 
 (defun simplify-struct-vector-slot-check-bounds (index slot-def)
   `(tagbody foo
@@ -1524,22 +1591,23 @@ First return value is a list of elements, second is the final dotted component (
       (arguments form)
     (let ((slot-def (find-struct-slot structure-name slot-name))
           (struct (sys.int::get-structure-type (ast-value structure-name))))
-      (cond ((match-optimize-settings form '((= safety 0) (= speed 3)))
-             (ast (struct-vector-slot-access-form slot-def object nil index t)
-                  form))
+      (cond ((and (sys.int::structure-layout-permanent-p struct)
+                  (match-optimize-settings form '((= safety 0) (= speed 3))))
+             (struct-access-ast (struct-vector-slot-access-form slot-def object nil index t)
+                  form struct))
             (t
-             (ast `(let ((obj ,object)
+             (struct-access-ast `(let ((obj ,object)
                          (ind ,index))
                      (progn
                        ,(simplify-struct-vector-slot-check-bounds 'ind slot-def)
-                       (if ,(struct-type-test-form 'obj struct)
+                       (if ,(struct-type-test-form 'obj struct object)
                            ,(struct-vector-slot-access-form slot-def 'obj nil 'ind nil)
                            (notinline-call sys.int::%struct-vector-slot
                                            obj
                                            ',(ast-value structure-name)
                                            ',(ast-value slot-name)
                                            ind))))
-                  form))))))
+                  form struct))))))
 
 (defun simplify-setf-struct-vector-slot (form)
   (change-made)
@@ -1547,16 +1615,17 @@ First return value is a list of elements, second is the final dotted component (
       (arguments form)
     (let ((slot-def (find-struct-slot structure-name slot-name))
           (struct (sys.int::get-structure-type (ast-value structure-name))))
-      (cond ((match-optimize-settings form '((= safety 0) (= speed 3)))
-             (ast (struct-vector-slot-access-form slot-def object 'setf index t value)
-                  form))
+      (cond ((and (sys.int::structure-layout-permanent-p struct)
+                  (match-optimize-settings form '((= safety 0) (= speed 3))))
+             (struct-access-ast (struct-vector-slot-access-form slot-def object 'setf index t value)
+                  form struct))
             (t
-             (ast `(let ((val ,value)
+             (struct-access-ast `(let ((val ,value)
                          (obj ,object)
                          (ind ,index))
                      (progn
                        ,(simplify-struct-vector-slot-check-bounds 'ind slot-def)
-                       (if ,(struct-type-test-form 'obj struct)
+                       (if ,(struct-type-test-form 'obj struct object)
                            (progn
                              (if (source-fragment (typep val ',(mezzano.clos:slot-definition-type slot-def)))
                                  'nil
@@ -1570,7 +1639,7 @@ First return value is a list of elements, second is the final dotted component (
                                            ',(ast-value structure-name)
                                            ',(ast-value slot-name)
                                            ind))))
-                form))))))
+                form struct))))))
 
 (defun simplify-cas-struct-vector-slot (form)
   (change-made)
@@ -1578,21 +1647,22 @@ First return value is a list of elements, second is the final dotted component (
       (arguments form)
     (let ((slot-def (find-struct-slot structure-name slot-name))
           (struct (sys.int::get-structure-type (ast-value structure-name))))
-      (cond ((match-optimize-settings form '((= safety 0) (= speed 3)))
-             (ast `(let ((old ,old)
+      (cond ((and (sys.int::structure-layout-permanent-p struct)
+                  (match-optimize-settings form '((= safety 0) (= speed 3))))
+             (struct-access-ast `(let ((old ,old)
                          (new ,new)
                          (obj ,object)
                          (ind ,index))
                      ,(struct-vector-slot-access-form slot-def 'obj 'sys.int::cas 'ind t 'old 'new))
-                form))
+                form struct))
           (t
-           (ast `(let ((old ,old)
+           (struct-access-ast `(let ((old ,old)
                        (new ,new)
                        (obj ,object)
                        (ind ,index))
                    (progn
                      ,(simplify-struct-vector-slot-check-bounds 'ind slot-def)
-                     (if ,(struct-type-test-form 'obj struct)
+                     (if ,(struct-type-test-form 'obj struct object)
                          (progn
                            (if (source-fragment (typep old ',(mezzano.clos:slot-definition-type slot-def)))
                                'nil
@@ -1612,7 +1682,7 @@ First return value is a list of elements, second is the final dotted component (
                                          ',(ast-value structure-name)
                                          ',(ast-value slot-name)
                                          ind))))
-                form))))))
+                form struct))))))
 
 (defun integer-type-p (type)
   (or (eql type 'integer)

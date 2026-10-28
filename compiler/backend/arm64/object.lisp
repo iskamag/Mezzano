@@ -161,14 +161,14 @@
                                :outputs (list ,scaled-index)))
           ,@body)))))
 
-(defmacro with-builtin-object-access ((effective-address additional-inputs object index scale) &body body)
+(defmacro with-builtin-object-access ((effective-address additional-inputs object index scale &optional (value-tag sys.int::+tag-object+)) &body body)
   "Generate an effective address that deals properly with scaling and constant indices."
   (check-type scale (member 1 2 4 8))
   (let ((disp (gensym "DISP"))
         (disp-reg (gensym "DISP-REG"))
         (scaled-index (gensym "SCALED-INDEX")))
     `(cond ((constant-value-p ,index 'fixnum)
-            (let ((,disp (object-slot-displacement (fetch-constant-value ,index) ',scale)))
+            (let ((,disp (+ 8 (- ,value-tag) (* (fetch-constant-value ,index) ,scale))))
               ; TODO: This could be cleverer based on the transfer size, instructions can support a 12-bit unsigned scaled-by-width immediate
               (cond ((typep ,disp '(signed-byte 6))
                      (let ((,effective-address (list ,object ,disp))
@@ -203,18 +203,18 @@
               (let ((,disp-reg (make-instance 'ir:virtual-register :kind :integer)))
                 (emit (make-instance 'arm64-instruction
                                      :opcode 'lap:sub
-                                     :operands (list ,disp-reg ,scaled-index (- (+ 8 (- sys.int::+tag-object+))))
+                                     :operands (list ,disp-reg ,scaled-index (- ,value-tag 8))
                                      :inputs (list ,scaled-index)
                                      :outputs (list ,disp-reg)))
                 (let ((,effective-address (list ,object ,disp-reg))
                       (,additional-inputs (list ,object ,disp-reg)))
                   ,@body)))))))
 
-(defmacro define-object-ref-integer-accessor (name read-op write-op scale box-op unbox-op &optional (reg-kind :integer))
+(defmacro define-object-ref-integer-accessor (name read-op write-op scale box-op unbox-op &optional (reg-kind :integer) (value-tag sys.int::+tag-object+))
   `(progn
      (define-builtin ,name ((object index) result)
        (let ((temp (make-instance 'ir:virtual-register :kind ,reg-kind)))
-         (with-builtin-object-access (ea ea-inputs object index ,scale)
+         (with-builtin-object-access (ea ea-inputs object index ,scale ,value-tag)
            (emit (make-instance 'arm64-instruction
                                 :opcode ',read-op
                                 :operands (list temp ea)
@@ -228,7 +228,7 @@
          (emit (make-instance ',unbox-op
                               :source value
                               :destination temp))
-         (with-builtin-object-access (ea ea-inputs object index ,scale)
+         (with-builtin-object-access (ea ea-inputs object index ,scale ,value-tag)
            (emit (make-instance 'arm64-instruction
                                 :opcode ',write-op
                                 :operands (list temp ea)
@@ -254,7 +254,7 @@
          (emit (make-instance 'ir:move-instruction
                               :source new-unboxed
                               :destination :rdx))
-         (with-builtin-object-access (ea ea-inputs object index ,scale)
+         (with-builtin-object-access (ea ea-inputs object index ,scale ,value-tag)
            (emit (make-instance 'x86-instruction
                                 :opcode 'lap:cmpxchg
                                 :prefix '(lap:lock)
@@ -503,3 +503,166 @@
                        :old-value result
                        :index offset
                        :rhs delta)))
+
+;;; Internal physical instance-storage references.
+(define-builtin sys.int::%instance-storage ((object) result)
+  (emit (make-instance 'arm64-instruction
+                       :opcode 'lap:orr
+                       :operands (list result object
+                                       (logxor sys.int::+tag-object+
+                                               sys.int::+tag-instance-storage+))
+                       :inputs (list object) :outputs (list result))))
+
+(define-builtin sys.int::%storage-ref-t ((object index) result)
+  (with-builtin-object-access (ea ea-inputs object index 8 sys.int::+tag-instance-storage+)
+    (emit (make-instance 'arm64-instruction
+                         :opcode 'lap:ldr
+                         :operands (list result ea)
+                         :inputs ea-inputs
+                         :outputs (list result)))))
+
+(define-builtin (setf sys.int::%storage-ref-t) ((value object index) result)
+  (with-builtin-object-access (ea ea-inputs object index 8 sys.int::+tag-instance-storage+)
+    (emit (make-instance 'arm64-instruction
+                         :opcode 'lap:str
+                         :operands (list value ea)
+                         :inputs (list* value ea-inputs)
+                         :outputs (list))))
+  (emit (make-instance 'ir:move-instruction
+                       :source value
+                       :destination result)))
+
+(define-builtin sys.int::%storage-layout ((object) result)
+  (let ((temp1 (make-instance 'ir:virtual-register)))
+    (emit (make-instance 'arm64-instruction
+                         :opcode 'lap:ldr
+                         :operands (list temp1 `(,object ,(- sys.int::+tag-instance-storage+)))
+                         :inputs (list object)
+                         :outputs (list temp1)))
+    (emit (make-instance 'arm64-instruction
+                         :opcode 'lap:add
+                         :operands (list result :xzr temp1 :lsr sys.int::+object-data-shift+)
+                         :inputs (list temp1)
+                         :outputs (list result)))
+    ;; The object must be kept live over the shift, as the header will
+    ;; initially be read as a fixnum. If the object is the only thing keeping
+    ;; the structure definition live there is a possibility that it and the
+    ;; structure definition could be end up being GC'd between the load & shift.
+    ;; Then the shift would resurrect a dead object, leading to trouble.
+    (emit (make-instance 'ir:spice-instruction :value object))))
+
+(define-builtin sys.int::%fast-storage-layout-eq-p ((object instance-header) :eq)
+  (let ((temp1 (make-instance 'ir:virtual-register :kind :integer))
+        (temp2 (make-instance 'ir:virtual-register :kind :integer)))
+    ;; Read the object header.
+    (emit (make-instance 'arm64-instruction
+                         :opcode 'lap:ldr
+                         :operands (list temp1 `(,object ,(- sys.int::+tag-instance-storage+)))
+                         :inputs (list object)
+                         :outputs (list temp1)))
+    ;; Set the two low bits to potentially convert the header to a
+    ;; structure-header. This must be performed in an integer register
+    ;; as this will construct some random bad value if the object isn't a
+    ;; structure-object.
+    (emit (make-instance 'arm64-instruction
+                         :opcode 'lap:orr
+                         :operands (list temp2 temp1 3)
+                         :inputs (list temp1)
+                         :outputs (list temp2)))
+    (emit (make-instance 'arm64-instruction
+                         :opcode 'lap:subs
+                         :operands (list :xzr temp2 instance-header)
+                         :inputs (list temp2 instance-header)
+                         :outputs '()))))
+(define-object-ref-integer-accessor sys.int::%%storage-ref-unsigned-byte-8  lap:ldrb  lap:strb  1 ir:box-fixnum-instruction ir:unbox-fixnum-instruction :integer sys.int::+tag-instance-storage+)
+(define-object-ref-integer-accessor sys.int::%%storage-ref-unsigned-byte-16 lap:ldrh  lap:strh  2 ir:box-fixnum-instruction ir:unbox-fixnum-instruction :integer sys.int::+tag-instance-storage+)
+(define-object-ref-integer-accessor sys.int::%%storage-ref-unsigned-byte-32 lap:ldrw  lap:strw  4 ir:box-fixnum-instruction ir:unbox-fixnum-instruction :integer sys.int::+tag-instance-storage+)
+(define-object-ref-integer-accessor sys.int::%%storage-ref-unsigned-byte-64 lap:ldr   lap:str   8 ir:box-unsigned-byte-64-instruction ir:unbox-unsigned-byte-64-instruction :integer sys.int::+tag-instance-storage+)
+(define-object-ref-integer-accessor sys.int::%%storage-ref-signed-byte-8    lap:ldrsb   lap:strb  1 ir:box-fixnum-instruction ir:unbox-fixnum-instruction :integer sys.int::+tag-instance-storage+)
+(define-object-ref-integer-accessor sys.int::%%storage-ref-signed-byte-16   lap:ldrsh   lap:strh  2 ir:box-fixnum-instruction ir:unbox-fixnum-instruction :integer sys.int::+tag-instance-storage+)
+(define-object-ref-integer-accessor sys.int::%%storage-ref-signed-byte-32   lap:ldrsw   lap:strw  4 ir:box-fixnum-instruction ir:unbox-fixnum-instruction :integer sys.int::+tag-instance-storage+)
+(define-object-ref-integer-accessor sys.int::%%storage-ref-signed-byte-64   lap:ldr     lap:str   8 ir:box-signed-byte-64-instruction ir:unbox-signed-byte-64-instruction :integer sys.int::+tag-instance-storage+)
+(define-object-ref-integer-accessor sys.int::%%storage-ref-unsigned-byte-8-unscaled  lap:ldrb  lap:strb  1 ir:box-fixnum-instruction ir:unbox-fixnum-instruction :integer sys.int::+tag-instance-storage+)
+(define-object-ref-integer-accessor sys.int::%%storage-ref-unsigned-byte-16-unscaled lap:ldrh  lap:strh  1 ir:box-fixnum-instruction ir:unbox-fixnum-instruction :integer sys.int::+tag-instance-storage+)
+(define-object-ref-integer-accessor sys.int::%%storage-ref-unsigned-byte-32-unscaled lap:ldrw  lap:strw  1 ir:box-fixnum-instruction ir:unbox-fixnum-instruction :integer sys.int::+tag-instance-storage+)
+(define-object-ref-integer-accessor sys.int::%%storage-ref-unsigned-byte-64-unscaled lap:ldr   lap:str   1 ir:box-unsigned-byte-64-instruction ir:unbox-unsigned-byte-64-instruction :integer sys.int::+tag-instance-storage+)
+(define-object-ref-integer-accessor sys.int::%%storage-ref-signed-byte-8-unscaled    lap:ldrsb   lap:strb  1 ir:box-fixnum-instruction ir:unbox-fixnum-instruction :integer sys.int::+tag-instance-storage+)
+(define-object-ref-integer-accessor sys.int::%%storage-ref-signed-byte-16-unscaled   lap:ldrsh   lap:strh  1 ir:box-fixnum-instruction ir:unbox-fixnum-instruction :integer sys.int::+tag-instance-storage+)
+(define-object-ref-integer-accessor sys.int::%%storage-ref-signed-byte-32-unscaled   lap:ldrsw   lap:strw  1 ir:box-fixnum-instruction ir:unbox-fixnum-instruction :integer sys.int::+tag-instance-storage+)
+(define-object-ref-integer-accessor sys.int::%%storage-ref-signed-byte-64-unscaled   lap:ldr     lap:str   1 ir:box-signed-byte-64-instruction ir:unbox-signed-byte-64-instruction :integer sys.int::+tag-instance-storage+)
+(define-object-ref-integer-accessor sys.int::%%storage-ref-single-float  lap:ldr  lap:str  4 ir:box-single-float-instruction ir:unbox-single-float-instruction :single-float sys.int::+tag-instance-storage+)
+(define-object-ref-integer-accessor sys.int::%%storage-ref-double-float  lap:ldr  lap:str  8 ir:box-double-float-instruction ir:unbox-double-float-instruction :double-float sys.int::+tag-instance-storage+)
+(define-object-ref-integer-accessor sys.int::%%storage-ref-single-float-unscaled  lap:ldr  lap:str  1 ir:box-single-float-instruction ir:unbox-single-float-instruction :single-float sys.int::+tag-instance-storage+)
+(define-object-ref-integer-accessor sys.int::%%storage-ref-double-float-unscaled  lap:ldr  lap:str  1 ir:box-double-float-instruction ir:unbox-double-float-instruction :double-float sys.int::+tag-instance-storage+)
+
+(define-builtin sys.int::%atomic-fixnum-add-storage ((object offset delta) result)
+  (emit (make-instance 'ir:move-instruction
+                       :source object
+                       :destination :x1))
+  (emit (make-instance 'arm64-atomic-instruction
+                       :opcode 'lap:ldaddal
+                       :old-value result
+                       :index offset
+                       :value-tag sys.int::+tag-instance-storage+
+                       :rhs delta)))
+
+(define-builtin sys.int::%atomic-fixnum-logior-storage ((object offset delta) result)
+  (emit (make-instance 'ir:move-instruction
+                       :source object
+                       :destination :x1))
+  (emit (make-instance 'arm64-atomic-instruction
+                       :opcode 'lap:ldsetal
+                       :old-value result
+                       :index offset
+                       :value-tag sys.int::+tag-instance-storage+
+                       :rhs delta)))
+
+(define-builtin sys.int::%atomic-fixnum-logxor-storage ((object offset delta) result)
+  (emit (make-instance 'ir:move-instruction
+                       :source object
+                       :destination :x1))
+  (emit (make-instance 'arm64-atomic-instruction
+                       :opcode 'lap:ldeoral
+                       :old-value result
+                       :index offset
+                       :value-tag sys.int::+tag-instance-storage+
+                       :rhs delta)))
+
+(define-builtin sys.int::%xchg-storage ((object offset new) result)
+  (emit (make-instance 'ir:move-instruction
+                       :source object
+                       :destination :x1))
+  (emit (make-instance 'arm64-atomic-instruction
+                       :opcode 'lap:swpal
+                       :old-value result
+                       :index offset
+                       :value-tag sys.int::+tag-instance-storage+
+                       :rhs new)))
+
+(define-builtin sys.int::%cas-storage ((object offset old new) (result slot-value))
+  (emit (make-instance 'ir:move-instruction
+                       :source object
+                       :destination :x1))
+  (emit (make-instance 'arm64-cas-instruction
+                       :new-value new
+                       :old-value old
+                       :result result
+                       :current-value slot-value
+                       :index offset
+                       :value-tag sys.int::+tag-instance-storage+)))
+
+(define-builtin sys.int::%cas-storage-header ((storage expected replacement) result)
+  (let ((old-raw (make-instance 'ir:virtual-register :kind :integer))
+        (new-raw (make-instance 'ir:virtual-register :kind :integer))
+        (actual (make-instance 'ir:virtual-register :kind :integer))
+        (index (make-instance 'ir:virtual-register)))
+    (emit (make-instance 'ir:unbox-unsigned-byte-64-instruction
+                         :source expected :destination old-raw))
+    (emit (make-instance 'ir:unbox-unsigned-byte-64-instruction
+                         :source replacement :destination new-raw))
+    (emit (make-instance 'ir:constant-instruction :value -1 :destination index))
+    (emit (make-instance 'ir:move-instruction :source storage :destination :x1))
+    (emit (make-instance 'arm64-cas-instruction
+                         :old-value old-raw :new-value new-raw
+                         :result result :current-value actual :index index
+                         :value-tag sys.int::+tag-instance-storage+))))

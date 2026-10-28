@@ -16,7 +16,7 @@ Instance slots immediate follow the header and are described by that instance's 
 
 The `specific layout` is the `LAYOUT` object that exactly describes that instance, not a newer or older layout for the same class.
 
-The layout object for an instance is either a `LAYOUT` struct instance or an `OBSOLETE-INSTANCE-LAYOUT` struct instance, depending on if the original layout had been made obsolete.
+The header always refers to a `LAYOUT`. Superseding an instance installs a private copy of its layout with `NEW-INSTANCE` pointing to the replacement.
 
 ## Layouts
 
@@ -30,6 +30,7 @@ It's a `sealed` structure-object allocated in the `wired` area with the followin
 * `HEAP-LAYOUT` - Used by the GC to know which words of the object contain Lisp values and which contain unboxed data. Either `NIL` meaning no values, `T` meaning all words contain values to be scanned, or a `SIMPLE-BIT-VECTOR` the size of the object with a `1` bit indicating that word contains a Lisp value.
 * `AREA` - Allocation area in which the object should be allocated.
 * `INSTANCE-SLOTS` - A `SIMPLE-VECTOR` containing two adjacent entries per slot in the instance. The first entry is the name of the slot, the second entry is the `location` of the slot in the instance.
+* `NEW-INSTANCE` - `NIL` for current storage, or the logical replacement for a superseded instance. Once published in an instance header, a non-NIL replacement link never changes.
 * `COMPATIBLE` - A wired `SIMPLE-VECTOR` used for direct structure slot access.
   A structure layout records itself followed by its ancestor layouts, in
   order; a normal standard-object layout records only itself. A copied layout
@@ -71,46 +72,78 @@ The representation allows locations to be generic over the actual in-memory repr
 
 ## Superseding instances
 
-A specific instance can be superseded with another instance by replacing the layout in the object header word with one that points to an `OBSOLETE-INSTANCE-LAYOUT` object. This is done with the `SUPERSEDE-INSTANCE` function, which takes the instance to make obsolete, and the new instance that the object should be superseded by.
+`SUPERSEDE-INSTANCE` allocates a private copy of the old storage's layout,
+sets its `NEW-INSTANCE` link, and publishes it by comparing and swapping the
+instance header. Shared class layouts are never modified by supersession.
+This supports both class redefinition and `CHANGE-CLASS`.
 
-This is the mechanism by which both class redefinition and `CHANGE-CLASS` works.
+Published replacement links are immutable. Repeated supersession follows the
+chain to its current end and publishes another link there. A competing
+publication makes the header comparison fail and the operation retries.
+Readers follow the chain; GC shortens ordinary references to its current end.
+This publication protocol does not make concurrent class redefinition or
+migration hooks atomic: users of a class must still be quiescent during its
+redefinition.
 
-The `OBSOLETE-INSTANCE-LAYOUT` structure consists of the following slots:
-
-* `NEW-INSTANCE` - The new instance that the instance has been superseded by.
-* `OLD-LAYOUT` - The `specific layout` for the instance, this exactly matches the layout of the original instance.
-
-As the original instance still exists (and is the only way normal code will refer to that object), the identity of the instance is maintained.
-
-The original instance can be superseded multiple times, this will replace the `NEW-INSTANCE` slot in the obsolete layout with the newer instance. An instance that was used as the new-instance when superseding another object should never be superseded, as that would create a deep chain of superseded instances.
+Funcallable replacements inherit the current function before publication.
+After publication, the old callable storage forwards calls to its replacement.
+The function getter and setter follow replacement links. The collector does
+not copy callable state between instances, so collection order cannot restore
+an older function.
 
 ## Slot access
 
-We will use access via `SLOT-VALUE` as an example, however other ways to access slots (such as struct accessors) follow a similar pattern.
+Slot access separates logical identity from physical storage. Ordinary object
+references identify the instance and may be snapped by GC. The internal
+`+TAG-INSTANCE-STORAGE+` reference identifies the exact allocation whose layout
+was used to select a slot offset. `%INSTANCE-STORAGE` creates this reference by
+changing the pointer tag; it allocates nothing and adds no indirection.
 
-`SLOT-LOCATION-IN-INSTANCE` is called to resolve the both the location of the slot and the actual instance in which the access should occur.
+The storage reference must be acquired **before** reading the layout or
+selecting the offset. `%STORAGE-LAYOUT` and the `%STORAGE-REF-*` operations read
+that allocation. A live storage reference keeps its contents available across
+allocation, calls, and collection, including an intervening supersession.
+It must not escape into ordinary Lisp object operations or user hooks.
 
-It calls `FETCH-UP-TO-DATE-INSTANCE-SLOTS-AND-LAYOUT` with the instance. This fetches the `direct layout` of the instance.
+`FETCH-UP-TO-DATE-INSTANCE-SLOTS-AND-LAYOUT` follows replacement links and
+migrates obsolete layouts, returning physical storage and its layout.
+`SLOT-LOCATION-USING-LAYOUT` resolves a slot name within that layout.
+`STANDARD-INSTANCE-ACCESS` uses the storage and encoded location together.
+The original logical object is retained for errors and user hooks such as
+`SLOT-UNBOUND`.
 
-If this is a `LAYOUT`, then the layout is checked to see if it is obsolete. If it is obsolete, then an instance of the new layout is created, the original instance is superseded with it, and `F-U-T-D-I-S-A-L` is retried. If the layout is up-to-date, then the instance and layout is returned.
+Accessor cache entries couple the layout, slot location, and slot name.
+A cache hit validates that layout against the acquired storage before using
+its offset. Writers retain the storage through slot type checks. A stale
+entry falls back to lookup by its own slot name. These paths are ordinary
+inline Lisp compiled using the storage primitives. A discriminator remembers
+its last matching weak cache cell, so repeated calls on the same class can
+skip the hash probe. It rereads the cell's value on each call. Replacement,
+removal, and clearing invalidate detached cells before publishing the new
+table state; growing a table preserves its live cells. This avoids retaining
+classes strongly or allowing saved discriminators to use detached entries.
 
-Otherwise, if it is an `OBSOLETE-INSTANCE-LAYOUT` then the new instance is fetched from it. The layout of the new instance is examined to see if it is obsolete, if so then another more up-to-date instance is created and the original (not the intermediate) instance is superseded once again and the cycle repeats.
-
-If the new instance is not obsolete then it and it's layout are returned from `F-U-T-D-I-S-A-L`.
-
-Once the up-to-date instance and layout have been located, the slot-name is resolved to a location by calling `SLOT-LOCATION-USING-LAYOUT` with the layout and name. This looks up the slot by name in the layout's `INSTANCE-SLOTS` slot and returns the associated location.
-
-If the slot is not an instance slot or does not exist then `SLOT-LOCATION-USING-LAYOUT` returns `NIL` and a different mechanism is used to locate the slot.
-
-`SLOT-LOCATION-IN-INSTANCE` returns the up-to-date instance and the location to access. `SLOT-VALUE` then calls `STANDARD-INSTANCE-ACCESS` with the instance and location to access the slot.
-
-## Indirection
-
-In the common case, where the instance has not been made obsolete or superseded, there is no indirection when accessing slots. Fast slot accessor methods (including `SLOT-VALUE` with a known slot name) cache the location of their slots, and access the instance directly using it. There is a need to check that the instance hasn't been superseded, however this can be done just by looking at the header word. If the instance has been superseded, then we fall off the cached path and do the full lookup.
+Compiled structure access follows the same rule for mutable layouts. Sealed
+structures whose ancestry also has permanent layouts keep direct accesses;
+those allocations cannot be superseded through class redefinition. When an
+argument's type already proves that permanent layout, the compiler omits a
+redundant layout test while retaining the argument evaluation and assertions.
 
 ## GC snapping
 
-The GC is aware of instances and obsolete instances. When it tries to transport an obsolete instance, instead of transporting the obsolete instance it uses the new instance. This maintains identity as it will update all references to the original obsolete instance so they point to the new instance.
+The collector distinguishes logical references from physical storage references.
+It snaps logical references to the current replacement, allowing superseded
+storage and removed slots to be reclaimed. Physical references instead retain
+and relocate the original storage, preserving previously selected offsets.
+
+Snapping an identity does not overwrite the old header with a forwarding
+pointer to the replacement: another root may still name the old storage.
+Copying the old storage does install a forwarding pointer to its physical
+copy. A logical reference encountered afterwards follows that copy's layout
+replacement link; a physical reference keeps the copy. Thus the result does
+not depend on which kind of root the collector visits first. Once no physical
+references remain, retaining the logical instance does not retain its old
+slots.
 
 ## Structures
 
@@ -141,7 +174,7 @@ This allows for fast type checks when looking for a specific class of instance. 
 
 `header word` - The very first word of an instance (or heap object in general), containing the object tag bits and reference to the direct layout object.
 
-`direct layout` - The layout or obsolete instance layout directly referenced by an instance's header word.
+`direct layout` - The layout directly referenced by an instance's header word, including a private superseded layout.
 
 `specific layout` - The `LAYOUT` object that exactly describes a specific instance, not a newer or older layout for the same class.
 

@@ -22,6 +22,11 @@ to store Lisp values. The GC will scan these registers.
 
 `R15` is not used or scanned by the GC due to historical reasons.
 
+LLF version 38 adds the internal `+TAG-INSTANCE-STORAGE+` reference tag.
+Layout-dependent accesses retain this physical reference before selecting an
+offset; ordinary instance references can be snapped to replacements by GC.
+Earlier compiled accesses are incompatible. Recompile all LLFs.
+
 The direction flag (`RFLAGS.DF`) must be set to zero (forward) on function
 entry and return. Other flags are caller-save.
 

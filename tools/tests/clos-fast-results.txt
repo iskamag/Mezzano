@@ -30,3 +30,37 @@ CLOS-GC-SUPERSESSION-PASSED
 Concurrent access/GC: 3914700 iterations.
 CLOS FAST PATH TESTS PASSED
 COMPILE mode=:AFTER cpu=2763240 bytes=482227616 gc=0.0 units=1000000
+
+Physical-storage CLOS redesign (2026-10-28, ABI 38, x86-64 KVM)
+
+CLOS performance LAP routines removed. Storage primitives are compiler builtins.
+Cold build/boot passed after correcting storage-wrapper macro namespaces.
+Subsequent compiler, cache and weak-key corrections were hotloaded.
+
+Runtime validation passed:
+- Physical slot reads/writes across supersession and full/minor GC.
+- Logical alias snapping, repeated supersession, callable state preservation.
+- Removed 8 MiB payload reclamation, heap and continuation storage roots.
+- Weak logical keys with logical-first and physical-first visitation, dead keys.
+- CLOS cache collisions, shared/unbound/typed slots, method and class changes.
+- Retained reader/writer cells across replacement, removal, growth and clear.
+- Concurrent slot access during GC (4,172,193 iterations in the full suite).
+- Existing structure-reparent regression suite.
+- Proven-fixnum right shift: constant/variable counts 0,61,63,64,1000,
+  including both fixnum extrema.
+
+Broader analysis.lisp compilation profile (331 samples, not a timing trial):
+- Dispatch/accessor/trampoline bodies: approximately 20% direct samples.
+- Array/sequence operations: approximately 19% direct samples.
+- CLASS-TYPEP and its callees: approximately 7% of samples.
+- FILL-KNOWN-ARGS samples belong to array initialization, not argument parsing.
+Recursive inclusive frame counts are not exclusive runtime percentages.
+The profile exposed 336 anonymous SLOT-VALUE GFs missed by named-GF hotload;
+the checked-in hotloader now refreshes both caches as well as named GFs.
+
+Following the profile, the accessor cache probe was kept out of the hit path,
+redundant proven-layout checks removed, and CLASS-OF's layout invariant made
+explicit. Reader disassembly frame size fell from 144 to 96 bytes. Retained
+cache checks passed after these edits. Earlier A/B timings do not represent
+this final hotloaded state; no further timing/image comparisons were run.
+ARM64 backend support is implemented but was not runtime-tested.

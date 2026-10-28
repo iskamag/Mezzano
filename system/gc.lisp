@@ -256,7 +256,10 @@ This is required to make the GC interrupt safe."
                         (transport-object object cycle-kind))))))))
       (#.+address-tag-pinned+
        (when (eql cycle-kind :major)
-         (mark-pinned-object object))
+         (mark-pinned-object
+          (if (%value-has-tag-p object +tag-instance-storage+)
+              (%%assemble-value address +tag-object+)
+              object)))
        object)
       (#.+address-tag-stack+
        ;; Don't scavenge DX objects, handled by scavenge-regular-stack-frame.
@@ -1140,26 +1143,36 @@ This is required to make the GC interrupt safe."
     (t (scan-error object))))
 
 (defun transport-object (object cycle-kind)
-  "Copy OBJECT from oldspace to newspace, preserving its layout.
+  "Move OBJECT, preserving physical storage references and snapping identities.
 Return the new object and leave a forwarding pointer in place."
   (let* ((address (object-base-address object))
-         (first-word (memref-t address 0)))
+         (first-word (memref-t address 0))
+         (storagep (%value-has-tag-p object +tag-instance-storage+)))
     ;; Check for a GC forwarding pointer.
     ;; Do this before getting the length as the forwarding pointer will
     ;; have overwritten the header word.
     (when (%value-has-tag-p first-word +tag-gc-forward+)
-      (return-from transport-object
-        (%%assemble-value (object-base-address first-word)
-                          (%tag-field object))))
-    ;; Do not replace superseded instances with LAYOUT-NEW-INSTANCE here.
-    ;; A stopped thread may already have selected a slot offset for OBJECT's
-    ;; physical layout. Substituting a different instance would resume that
-    ;; access against the wrong layout, including stores into unrelated slots.
-    ;; Copy the original storage and retain its replacement link instead;
-    ;; CLOS resolves that link when starting a new access. This also keeps a
-    ;; pending SUPERSEDE-INSTANCE update attached to the original object.
-    ;; Obsolete storage remains live while the original object is reachable.
+      (let ((new (%%assemble-value (object-base-address first-word)
+                                   (%tag-field object))))
+        (return-from transport-object
+          (if storagep new (snap-instance-identity new cycle-kind)))))
+    (unless storagep
+      (let ((new (snap-instance-identity object cycle-kind)))
+        (unless (eq new object)
+          ;; Do not write a forwarding pointer to the replacement. A physical
+          ;; reference discovered later still needs the original header and
+          ;; storage. Only copying physical storage installs its forwarding
+          ;; pointer; logical aliases follow the copied layout's replacement.
+          (return-from transport-object new))))
     (really-transport-object object cycle-kind)))
+
+(defun snap-instance-identity (object cycle-kind)
+  (when (or (instance-p object) (funcallable-instance-p object))
+    (let ((replacement (layout-new-instance (%instance-layout object))))
+      (when replacement
+        (return-from snap-instance-identity
+          (scavenge-object replacement cycle-kind)))))
+  object)
 
 (defun allocate-for-transport (object address length)
   "Allocate memory in the appropriate area for this object."
@@ -1230,6 +1243,8 @@ Return the new object and leave a forwarding pointer in place."
 
 (defun object-size (object)
   (cond
+    ((%value-has-tag-p object +tag-instance-storage+)
+     (object-size (%%assemble-value (object-base-address object) +tag-object+)))
     ((%value-has-tag-p object +tag-cons+)
      2)
     ((%value-has-tag-p object +tag-object+)
@@ -2264,29 +2279,40 @@ No type information will be provided."
     (ecase address-tag
       ((#.+address-tag-general+
         #.+address-tag-cons+)
-       ;; Look for a forwarding pointer.
-       (let ((header-byte (memref-unsigned-byte-8 address 0)))
-         (cond ((eql (ldb +tag-field+ header-byte) +tag-gc-forward+)
-                ;; Object is still live.
-                (values (%%assemble-value (object-base-address (memref-t address 0))
-                                          (%tag-field key))
-                        t))
-               ;; Look for a heap number, treat these as live so that
-               ;; weak pointers are more useful for arbitrary keys.
-               ;; Thinking about EQL caches for GF discriminators.
-               ;; This object's header is still intact, it's fine
-               ;; to do a type test on it.
+       (let* ((first-word (memref-t address 0))
+              (forwardedp (%value-has-tag-p first-word +tag-gc-forward+))
+              (candidate (if forwardedp
+                             (%%assemble-value (object-base-address first-word)
+                                               (%tag-field key))
+                             key)))
+         ;; Logical identities may have snapped without transporting their old
+         ;; storage, or the forwarding pointer may name a physical copy. Follow
+         ;; logical replacement links in either case, but do not mark anything:
+         ;; a weak-only chain must remain dead. Physical keys name storage.
+         (unless (%value-has-tag-p key +tag-instance-storage+)
+           (when (or (instance-p candidate) (funcallable-instance-p candidate))
+             (let ((replacement (layout-new-instance (%instance-layout candidate))))
+               (when replacement
+                 (return-from examine-weak-pointer-key
+                   (examine-weak-pointer-key replacement))))))
+         (cond ((or forwardedp
+                    ;; A previously scanned layout can already point to the
+                    ;; target's newspace address instead of its old address.
+                    (eql (logand address +address-semispace+)
+                         (if (logtest address +address-old-generation+)
+                             *old-gen-newspace-bit*
+                             *young-gen-newspace-bit*)))
+                (values candidate t))
                ((and (eql address-tag +address-tag-general+)
+                     (%value-has-tag-p key +tag-object+)
                      (numberp key))
-                ;; Value is a heap number. Treat it as live.
+                ;; Heap numbers are treated as live for EQL weak caches.
                 (values (transport-object key :major) t))
-               (t ;; Object is dead.
-                (values nil nil)))))
+               (t (values nil nil)))))
       (#.+address-tag-pinned+
        (cond ((get-mark-bit (if (consp key)
                                 (- address 16)
                                 address))
-              ;; Object is live.
               (values key t))
              (t
               (values nil nil)))))))

@@ -29,7 +29,9 @@
 (defconstant +tag-fixnum-100+       #b1000)
 (defconstant +tag-object+           #b1001)
 (defconstant +tag-fixnum-101+       #b1010)
-;;#b1011
+;; An internal reference to an instance's physical storage. Unlike an ordinary
+;; instance pointer, the collector must preserve this particular layout.
+(defconstant +tag-instance-storage+ #b1011)
 (defconstant +tag-fixnum-110+       #b1100)
 (defconstant +tag-dx-root-object+   #b1101)
 (defconstant +tag-fixnum-111+       #b1110)
@@ -314,7 +316,9 @@ Internal to sg-vec, should not be used by other code.")
 reserved on the disk, but no specific block has been allocated.")
 (defconstant +block-map-id-not-allocated+ 0)
 
-(defparameter *llf-version* 36)
+;; Version 38 uses physical instance-storage references for layout-dependent
+;; accesses. Earlier inline accesses are incompatible with identity snapping.
+(defparameter *llf-version* 38)
 
 (defconstant +llf-arch-x86-64+ 1)
 (defconstant +llf-arch-arm64+ 2)

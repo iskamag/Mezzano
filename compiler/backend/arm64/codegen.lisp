@@ -1331,7 +1331,7 @@
 (defmethod emit-lap (backend-function (instruction arm64-atomic-instruction) uses defs)
   ;; Convert to unboxed integer (scaled appropriately), with tag adjustment.
   (emit `(lap:add :x9 :xzr ,(arm64-atomic-index instruction) :lsl ,(- 3 sys.int::+n-fixnum-bits+))
-        `(lap:sub :x9 :x9 (- (object-slot-displacement 0))))
+        `(lap:sub :x9 :x9 ,(- (arm64-atomic-value-tag instruction) 8)))
   ;; Generate the address.
   (emit `(lap:add :x9 :x1 :x9))
   ;; Move to linked gc mode.
@@ -1348,7 +1348,7 @@
 (defmethod emit-lap (backend-function (instruction arm64-cas-instruction) uses defs)
   ;; Convert to unboxed integer (scaled appropriately), with tag adjustment.
   (emit `(lap:add :x9 :xzr ,(arm64-cas-index instruction) :lsl ,(- 3 sys.int::+n-fixnum-bits+))
-        `(lap:sub :x9 :x9 (- (object-slot-displacement 0))))
+        `(lap:sub :x9 :x9 ,(- (arm64-cas-value-tag instruction) 8)))
   ;; Generate the address.
   (emit `(lap:add :x9 :x1 :x9))
   ;; Move to linked gc mode.
