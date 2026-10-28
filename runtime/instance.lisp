@@ -71,6 +71,7 @@
 (declaim (inline location-offset-t))
 (defun location-offset-t (location)
   "Return the location offset scaled appropriately for %object-ref-t"
+  (declare (type fixnum location))
   (ash location -7))
 
 (declaim (inline location-offset))
@@ -118,35 +119,108 @@
      'sys.int::%object-ref-double-float-unscaled)
     (#.+location-type-short-float+
      'sys.int::%object-ref-short-float-unscaled)))
+
+(defun storage-location-type-accessor (location-type)
+  (intern (concatenate 'string "%STORAGE-REF-"
+                       (subseq (symbol-name (location-type-accessor location-type))
+                               (length "%OBJECT-REF-")))
+          :mezzano.internals))
+
 )
+
+;;; Physical storage is a distinct internal reference to the same allocation.
+;;; Converting before selecting a layout keeps that storage stable across GC.
+(defun sys.int::%instance-storage (object)
+  (sys.int::%instance-storage object))
+(defun sys.int::%storage-layout (storage)
+  (sys.int::%storage-layout storage))
+(defun sys.int::%fast-storage-layout-eq-p (storage instance-header)
+  (sys.int::%fast-storage-layout-eq-p storage instance-header))
+(defun sys.int::%storage-ref-t (storage index)
+  (sys.int::%storage-ref-t storage index))
+(defun (setf sys.int::%storage-ref-t) (value storage index)
+  (setf (sys.int::%storage-ref-t storage index) value))
+(declaim (inline (sys.int::cas sys.int::%storage-ref-t)))
+(defun (sys.int::cas sys.int::%storage-ref-t) (old new storage index)
+  (multiple-value-bind (successp actual-value)
+      (sys.int::%cas-storage storage index old new)
+    (declare (ignore successp))
+    actual-value))
+
+(sys.int::define-object-ref sys.int::%storage-ref-unsigned-byte-8 sys.int::%%storage-ref-unsigned-byte-8
+  sys.int::%storage-ref-unsigned-byte-8-unscaled sys.int::%%storage-ref-unsigned-byte-8-unscaled (unsigned-byte 8))
+(sys.int::define-object-ref sys.int::%storage-ref-unsigned-byte-16 sys.int::%%storage-ref-unsigned-byte-16
+  sys.int::%storage-ref-unsigned-byte-16-unscaled sys.int::%%storage-ref-unsigned-byte-16-unscaled (unsigned-byte 16))
+(sys.int::define-object-ref sys.int::%storage-ref-unsigned-byte-32 sys.int::%%storage-ref-unsigned-byte-32
+  sys.int::%storage-ref-unsigned-byte-32-unscaled sys.int::%%storage-ref-unsigned-byte-32-unscaled (unsigned-byte 32))
+(sys.int::define-object-ref sys.int::%storage-ref-unsigned-byte-64 sys.int::%%storage-ref-unsigned-byte-64
+  sys.int::%storage-ref-unsigned-byte-64-unscaled sys.int::%%storage-ref-unsigned-byte-64-unscaled (unsigned-byte 64))
+(sys.int::define-object-ref sys.int::%storage-ref-signed-byte-8 sys.int::%%storage-ref-signed-byte-8
+  sys.int::%storage-ref-signed-byte-8-unscaled sys.int::%%storage-ref-signed-byte-8-unscaled (signed-byte 8))
+(sys.int::define-object-ref sys.int::%storage-ref-signed-byte-16 sys.int::%%storage-ref-signed-byte-16
+  sys.int::%storage-ref-signed-byte-16-unscaled sys.int::%%storage-ref-signed-byte-16-unscaled (signed-byte 16))
+(sys.int::define-object-ref sys.int::%storage-ref-signed-byte-32 sys.int::%%storage-ref-signed-byte-32
+  sys.int::%storage-ref-signed-byte-32-unscaled sys.int::%%storage-ref-signed-byte-32-unscaled (signed-byte 32))
+(sys.int::define-object-ref sys.int::%storage-ref-signed-byte-64 sys.int::%%storage-ref-signed-byte-64
+  sys.int::%storage-ref-signed-byte-64-unscaled sys.int::%%storage-ref-signed-byte-64-unscaled (signed-byte 64))
+(sys.int::define-object-ref sys.int::%storage-ref-short-float sys.int::%%storage-ref-short-float
+  sys.int::%storage-ref-short-float-unscaled sys.int::%%storage-ref-short-float-unscaled short-float)
+(sys.int::define-object-ref sys.int::%storage-ref-single-float sys.int::%%storage-ref-single-float
+  sys.int::%storage-ref-single-float-unscaled sys.int::%%storage-ref-single-float-unscaled single-float)
+(sys.int::define-object-ref sys.int::%storage-ref-double-float sys.int::%%storage-ref-double-float
+  sys.int::%storage-ref-double-float-unscaled sys.int::%%storage-ref-double-float-unscaled double-float)
+
+(sys.int::define-coercing-float-object-ref
+    sys.int::%%storage-ref-short-float sys.int::%%storage-ref-unsigned-byte-16
+  sys.int::%%storage-ref-short-float-unscaled sys.int::%%storage-ref-unsigned-byte-16-unscaled
+  sys.int::%short-float-as-integer sys.int::%integer-as-short-float)
+#-arm64
+(sys.int::define-coercing-float-object-ref
+    sys.int::%%storage-ref-single-float sys.int::%%storage-ref-unsigned-byte-32
+  sys.int::%%storage-ref-single-float-unscaled sys.int::%%storage-ref-unsigned-byte-32-unscaled
+  sys.int::%single-float-as-integer sys.int::%integer-as-single-float)
+#-arm64
+(sys.int::define-coercing-float-object-ref
+    sys.int::%%storage-ref-double-float sys.int::%%storage-ref-unsigned-byte-64
+  sys.int::%%storage-ref-double-float-unscaled sys.int::%%storage-ref-unsigned-byte-64-unscaled
+  sys.int::%double-float-as-integer sys.int::%integer-as-double-float)
+
+#-x86-64
+(defun sys.int::%atomic-fixnum-logand-storage (storage index mask)
+  (loop for old = (sys.int::%storage-ref-t storage index)
+        when (eql (sys.int::cas (sys.int::%storage-ref-t storage index)
+                               old (logand old mask)) old)
+          do (return (values))))
 
 (macrolet ((def (name-base args)
              `(defun ,(if name-base
                           (list name-base 'instance-access)
                           'instance-access)
                   (,@args object location &optional (index 0))
-                (ecase (location-type location)
+                (let ((storage (sys.int::%instance-storage object)))
+                  (ecase (location-type location)
                   (#.+location-type-t+
                    (funcall
-                    #',(if name-base (list name-base 'sys.int::%object-ref-t) 'sys.int::%object-ref-t)
+                    #',(if name-base (list name-base 'sys.int::%storage-ref-t) 'sys.int::%storage-ref-t)
                     ,@args
-                    object (+ (location-offset-t location) index)))
+                    storage (+ (location-offset-t location) index)))
                   ,@(loop
                        for type in (location-types)
                        when (not (eql type +location-type-t+))
                        collect `(,type (funcall #',(if name-base
-                                                       (list name-base (location-type-accessor type))
-                                                       (location-type-accessor type))
+                                                       (list name-base (storage-location-type-accessor type))
+                                                       (storage-location-type-accessor type))
                                                 ,@args
-                                                object
+                                                storage
                                                 (+ (location-offset location)
-                                                   (* index ,(location-type-scale type))))))))))
+                                                   (* index ,(location-type-scale type)))))))))))
   (def nil ())
   (def setf (value))
   (def sys.int::cas (new old)))
 
 (defun %instance-dcas (instance offset old-1 old-2 new-1 new-2)
-  (sys.int::%dcas-object instance offset old-1 old-2 new-1 new-2))
+  (sys.int::%dcas-storage (sys.int::%instance-storage instance)
+                         offset old-1 old-2 new-1 new-2))
 
 (defun instance-dcas (instance loc-1 loc-2 old-1 old-2 new-1 new-2)
   ;; TODO: Eventually combinations of same-width locations could be supported.
@@ -189,17 +263,21 @@
        finally (error "Instance slot ~S missing from layout ~S" slot-name layout))))
 
 (defun instance-slot-location (object slot-name)
-  (slot-location-in-layout (sys.int::%instance-layout object)
+  (slot-location-in-layout (sys.int::%storage-layout
+                            (sys.int::%instance-storage object))
                            slot-name))
 
 (defun instance-access-by-name (object slot-name &optional (index 0))
-  (instance-access object (instance-slot-location object slot-name) index))
+  (let ((storage (sys.int::%instance-storage object)))
+    (instance-access storage (instance-slot-location storage slot-name) index)))
 
 (defun (setf instance-access-by-name) (value object slot-name &optional (index 0))
-  (setf (instance-access object (instance-slot-location object slot-name) index) value))
+  (let ((storage (sys.int::%instance-storage object)))
+    (setf (instance-access storage (instance-slot-location storage slot-name) index) value)))
 
 (defun (sys.int::cas instance-access-by-name) (old new object slot-name &optional (index 0))
-  (sys.int::cas (instance-access object (instance-slot-location object slot-name) index) old new))
+  (let ((storage (sys.int::%instance-storage object)))
+    (sys.int::cas (instance-access storage (instance-slot-location storage slot-name) index) old new)))
 
 (defun sys.int::instance-header-p (object)
   (sys.int::%value-has-tag-p object sys.int::+tag-instance-header+))
@@ -251,29 +329,55 @@
     new-layout))
 
 (defun supersede-instance (old-instance replacement)
-  (let ((layout (sys.int::%instance-layout old-instance)))
-    (cond ((null (sys.int::layout-new-instance layout))
-           ;; Hasn't been superseded before, we need to replace the layout
-           ;; so it's not shared.
-           (let ((new-layout (copy-layout-with-appropriate-area layout)))
-             (setf (sys.int::layout-new-instance new-layout) replacement)
-             (with-live-objects (new-layout)
-               ;; ###: Should this be a CAS?
-               (setf (sys.int::%object-ref-unsigned-byte-64 old-instance -1)
-                     ;; Construct a new obsolete-instance header containing
-                     ;; our new obsolete layout.
-                     (logior (ash (sys.int::lisp-object-address new-layout)
-                                  sys.int::+object-data-shift+)
-                             (if (sys.int::funcallable-instance-p old-instance)
-                                 (ash sys.int::+object-tag-funcallable-instance+
-                                      sys.int::+object-type-shift+)
-                                 (ash sys.int::+object-tag-instance+
-                                      sys.int::+object-type-shift+)))))))
-          (t
-           ;; This instance has already been superseded, replace it in-place.
-           ;; GC preserves the old instance and this layout, so collection
-           ;; between reading the layout and updating it cannot detach it.
-           (setf (sys.int::layout-new-instance layout) replacement))))
+  ;; Published replacement links are immutable. Follow them to a target which
+  ;; cannot itself be snapped while its new private layout is being prepared.
+  ;; CAS retries if another updater publishes a replacement in the meantime.
+  (when (sys.int::layout-new-instance
+         (sys.int::%storage-layout (sys.int::%instance-storage replacement)))
+    (error "A supersession replacement must not itself be superseded."))
+  (loop with target = old-instance
+        for storage = (sys.int::%instance-storage target)
+        for layout = (sys.int::%storage-layout storage)
+        for next = (sys.int::layout-new-instance layout)
+        do (when (eq target replacement)
+             (error "An instance cannot supersede itself."))
+           (cond (next (setf target next))
+                 (t
+                  (let* ((callablep (sys.int::funcallable-instance-p target))
+                         (function (when callablep
+                                     (sys.int::%storage-ref-t
+                                      storage sys.int::+funcallable-instance-function+)))
+                         (forwarder (when callablep
+                                      (lambda (&rest arguments)
+                                        (apply replacement arguments))))
+                         (new-layout (copy-layout-with-appropriate-area layout))
+                         (tag (ash (if callablep
+                                       sys.int::+object-tag-funcallable-instance+
+                                       sys.int::+object-tag-instance+)
+                                   sys.int::+object-type-shift+))
+                         (expected (logior
+                                    (ash (sys.int::lisp-object-address layout)
+                                         sys.int::+object-data-shift+)
+                                    tag))
+                         (new-header (logior
+                                      (ash (sys.int::lisp-object-address new-layout)
+                                           sys.int::+object-data-shift+)
+                                      tag)))
+                    ;; Callable state belongs to the newest logical instance.
+                    ;; Old callable objects forward until GC snaps their aliases.
+                    ;; The collector never copies stale function state along a
+                    ;; chain, so the result is independent of scanning order.
+                    (when callablep
+                      (setf (sys.int::funcallable-instance-function replacement)
+                            function))
+                    (setf (sys.int::layout-new-instance new-layout) replacement)
+                    (with-live-objects (storage new-layout)
+                      (when (sys.int::%cas-storage-header storage expected new-header)
+                        (when callablep
+                          (setf (sys.int::%storage-ref-t
+                                 storage sys.int::+funcallable-instance-function+)
+                                forwarder))
+                        (return)))))))
   (values))
 
 (in-package :mezzano.internals)

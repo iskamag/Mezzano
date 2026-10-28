@@ -24,6 +24,11 @@ LLF version 37 introduces this x86-64 callee-save convention. Earlier compiled
 code is incompatible: an old non-local exit target can bypass a callee's
 epilogue without restoring the caller's R15. Recompile all LLFs.
 
+LLF version 38 adds the internal `+TAG-INSTANCE-STORAGE+` reference tag.
+Layout-dependent accesses retain this physical reference before selecting an
+offset; ordinary instance references can be snapped to replacements by GC.
+Earlier compiled accesses are incompatible. Recompile all LLFs.
+
 `R15` is callee-save and stores Lisp values. The GC scans it in full saves
 and interrupt frames, and scans its saved stack slot for voluntarily suspended
 threads. Compiled functions that use it save the incoming value in a live stack

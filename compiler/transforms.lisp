@@ -461,6 +461,15 @@
 (define-fast-fixnum-transform-arith-two-arg mezzano.runtime::left-shift %fast-fixnum-left-shift)
 (define-fast-fixnum-transform-arith-two-arg mezzano.runtime::right-shift mezzano.runtime::%fixnum-right-shift)
 
+;; Unlike left shifts and arithmetic, a right shift by a nonnegative count
+;; cannot overflow a fixnum. Proven operand types are sufficient at every
+;; optimization policy. The backend primitive handles counts beyond the word
+;; width by sign extension and preserves the fixnum tag bits.
+(define-transform mezzano.runtime::right-shift
+    ((integer fixnum) (count (and fixnum (integer 0))))
+    ()
+  `(the fixnum (call mezzano.runtime::%fixnum-right-shift ,integer ,count)))
+
 (define-transform mezzano.runtime::%fixnum-right-shift (lhs (rhs (eql 0)))
     ((:optimize (= safety 0) (= speed 3)))
   lhs)

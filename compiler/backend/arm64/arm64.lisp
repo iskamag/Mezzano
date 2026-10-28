@@ -67,7 +67,9 @@
   ((%opcode :initarg :opcode :reader arm64-instruction-opcode)
    (%old-value :initarg :old-value :accessor arm64-atomic-old-value)
    (%index :initarg :index :accessor arm64-atomic-index)
-   (%rhs :initarg :rhs :accessor arm64-atomic-rhs)))
+   (%rhs :initarg :rhs :accessor arm64-atomic-rhs)
+   (%value-tag :initarg :value-tag :initform sys.int::+tag-object+
+               :reader arm64-atomic-value-tag)))
 
 (defmethod ra:instruction-clobbers ((instruction arm64-atomic-instruction) (architecture c:arm64-target))
   '(:x9 :x1))
@@ -96,7 +98,9 @@
    (%old-value :initarg :old-value :accessor arm64-cas-old-value)
    (%result :initarg :result :accessor arm64-cas-result)
    (%current-value :initarg :current-value :accessor arm64-cas-current-value)
-   (%index :initarg :index :accessor arm64-cas-index)))
+   (%index :initarg :index :accessor arm64-cas-index)
+   (%value-tag :initarg :value-tag :initform sys.int::+tag-object+
+               :reader arm64-cas-value-tag)))
 
 (defmethod ra:instruction-clobbers ((instruction arm64-cas-instruction) (architecture c:arm64-target))
   '(:x9 :x1))

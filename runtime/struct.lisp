@@ -40,8 +40,9 @@
       (raise-struct-type-error object class slot-name)
       (sys.int::%%unreachable))
     (let* ((slot (find-struct-slot class slot-name))
-           (loc (mezzano.clos:slot-definition-location slot)))
-      (instance-access (mezzano.clos::fetch-up-to-date-instance-slots-and-layout object) loc))))
+           (storage (mezzano.clos::fetch-up-to-date-instance-slots-and-layout object))
+           (loc (instance-slot-location storage (mezzano.clos:slot-definition-name slot))))
+      (instance-access storage loc))))
 
 (defun (setf sys.int::%struct-slot) (value object class-name slot-name)
   (let ((class (sys.int::get-structure-type class-name)))
@@ -50,10 +51,11 @@
       (sys.int::%%unreachable))
     (let* ((slot (find-struct-slot class slot-name))
            (type (mezzano.clos:slot-definition-type slot))
-           (loc (mezzano.clos:slot-definition-location slot)))
+           (storage (mezzano.clos::fetch-up-to-date-instance-slots-and-layout object))
+           (loc (instance-slot-location storage (mezzano.clos:slot-definition-name slot))))
       (when (not (eq type 't))
         (assert (typep value type)))
-      (setf (instance-access (mezzano.clos::fetch-up-to-date-instance-slots-and-layout object) loc) value))))
+      (setf (instance-access storage loc) value))))
 
 (defun (sys.int::cas sys.int::%struct-slot) (old new object class-name slot-name)
   (let ((class (sys.int::get-structure-type class-name)))
@@ -62,11 +64,12 @@
       (sys.int::%%unreachable))
     (let* ((slot (find-struct-slot class slot-name))
            (type (mezzano.clos:slot-definition-type slot))
-           (loc (mezzano.clos:slot-definition-location slot)))
+           (storage (mezzano.clos::fetch-up-to-date-instance-slots-and-layout object))
+           (loc (instance-slot-location storage (mezzano.clos:slot-definition-name slot))))
       (when (not (eq type 't))
         (assert (typep old type))
         (assert (typep new type)))
-      (sys.int::cas (instance-access (mezzano.clos::fetch-up-to-date-instance-slots-and-layout object) loc)
+      (sys.int::cas (instance-access storage loc)
                     old new))))
 
 (macrolet ((def (name fn)
@@ -78,7 +81,8 @@
                     (sys.int::%%unreachable))
                   (let* ((slot (find-struct-slot class slot-name))
                          (type (mezzano.clos:slot-definition-type slot))
-                         (loc (mezzano.clos:slot-definition-location slot)))
+                         (storage (mezzano.clos::fetch-up-to-date-instance-slots-and-layout object))
+           (loc (instance-slot-location storage (mezzano.clos:slot-definition-name slot))))
                     (when (not (or (eq type 'fixnum)
                                    (and (subtypep type 'fixnum)
                                         (subtypep 'fixnum type))))
@@ -87,13 +91,13 @@
                     (when (mezzano.clos:structure-slot-definition-read-only slot)
                       (error "Slot ~S in structure type ~S is read-only" slot class))
                     (,fn
-                     (mezzano.clos::fetch-up-to-date-instance-slots-and-layout object)
+                     storage
                      (location-offset-t loc)
                      value))))))
-  (def sys.int::%atomic-fixnum-add-struct-slot sys.int::%atomic-fixnum-add-object)
-  (def sys.int::%atomic-fixnum-logand-struct-slot sys.int::%atomic-fixnum-logand-object)
-  (def sys.int::%atomic-fixnum-logior-struct-slot sys.int::%atomic-fixnum-logior-object)
-  (def sys.int::%atomic-fixnum-logxor-struct-slot sys.int::%atomic-fixnum-logxor-object))
+  (def sys.int::%atomic-fixnum-add-struct-slot sys.int::%atomic-fixnum-add-storage)
+  (def sys.int::%atomic-fixnum-logand-struct-slot sys.int::%atomic-fixnum-logand-storage)
+  (def sys.int::%atomic-fixnum-logior-struct-slot sys.int::%atomic-fixnum-logior-storage)
+  (def sys.int::%atomic-fixnum-logxor-struct-slot sys.int::%atomic-fixnum-logxor-storage))
 
 (defun sys.int::%atomic-swap-struct-slot (object class-name slot-name value)
   (let ((class (sys.int::get-structure-type class-name)))
@@ -102,13 +106,14 @@
       (sys.int::%%unreachable))
     (let* ((slot (find-struct-slot class slot-name))
            (type (mezzano.clos:slot-definition-type slot))
-           (loc (mezzano.clos:slot-definition-location slot)))
+           (storage (mezzano.clos::fetch-up-to-date-instance-slots-and-layout object))
+           (loc (instance-slot-location storage (mezzano.clos:slot-definition-name slot))))
       (when (not (eq type 't))
         (assert (typep value type)))
       (when (mezzano.clos:structure-slot-definition-read-only slot)
         (error "Slot ~S in structure type ~S is read-only" slot class))
-      (sys.int::%xchg-object
-       (mezzano.clos::fetch-up-to-date-instance-slots-and-layout object)
+      (sys.int::%xchg-storage
+       storage
        (location-offset-t loc)
        value))))
 
@@ -128,8 +133,9 @@
            (slot-2 (find-struct-slot class-2 place-2-slot-name))
            (type-1 (mezzano.clos:slot-definition-type slot-1))
            (type-2 (mezzano.clos:slot-definition-type slot-2))
-           (loc-1 (mezzano.clos:slot-definition-location slot-1))
-           (loc-2 (mezzano.clos:slot-definition-location slot-2)))
+           (storage (mezzano.clos::fetch-up-to-date-instance-slots-and-layout object))
+           (loc-1 (instance-slot-location storage (mezzano.clos:slot-definition-name slot-1)))
+           (loc-2 (instance-slot-location storage (mezzano.clos:slot-definition-name slot-2))))
       (when (not (eq type-1 't))
         (assert (typep old-1 type-1))
         (assert (typep new-1 type-1)))
@@ -143,7 +149,7 @@
       (when (not (eql (mezzano.clos:structure-slot-definition-dcas-sibling slot-1) place-2-slot-name))
         (error "Slots ~S and ~S in structure types ~S and ~S are not DCAS siblings"
                slot-1 slot-2 class-1 class-2))
-      (instance-dcas (mezzano.clos::fetch-up-to-date-instance-slots-and-layout object)
+      (instance-dcas storage
                      loc-1 loc-2 old-1 old-2 new-1 new-2))))
 
 (defun check-vector-slot-bounds (slot index)
@@ -156,9 +162,10 @@
       (raise-struct-type-error object class slot-name)
       (sys.int::%%unreachable))
     (let* ((slot (find-struct-slot class slot-name))
-           (loc (mezzano.clos:slot-definition-location slot)))
+           (storage (mezzano.clos::fetch-up-to-date-instance-slots-and-layout object))
+           (loc (instance-slot-location storage (mezzano.clos:slot-definition-name slot))))
       (check-vector-slot-bounds slot index)
-      (instance-access (mezzano.clos::fetch-up-to-date-instance-slots-and-layout object) loc index))))
+      (instance-access storage loc index))))
 
 (defun (setf sys.int::%struct-vector-slot) (value object class-name slot-name index)
   (let ((class (sys.int::get-structure-type class-name)))
@@ -167,11 +174,12 @@
       (sys.int::%%unreachable))
     (let* ((slot (find-struct-slot class slot-name))
            (type (mezzano.clos:slot-definition-type slot))
-           (loc (mezzano.clos:slot-definition-location slot)))
+           (storage (mezzano.clos::fetch-up-to-date-instance-slots-and-layout object))
+           (loc (instance-slot-location storage (mezzano.clos:slot-definition-name slot))))
       (check-vector-slot-bounds slot index)
       (when (not (eq type 't))
         (assert (typep value type)))
-      (setf (instance-access (mezzano.clos::fetch-up-to-date-instance-slots-and-layout object) loc index) value))))
+      (setf (instance-access storage loc index) value))))
 
 (defun (sys.int::cas sys.int::%struct-vector-slot) (old new object class-name slot-name index)
   (let ((class (sys.int::get-structure-type class-name)))
@@ -180,12 +188,13 @@
       (sys.int::%%unreachable))
     (let* ((slot (find-struct-slot class slot-name))
            (type (mezzano.clos:slot-definition-type slot))
-           (loc (mezzano.clos:slot-definition-location slot)))
+           (storage (mezzano.clos::fetch-up-to-date-instance-slots-and-layout object))
+           (loc (instance-slot-location storage (mezzano.clos:slot-definition-name slot))))
       (check-vector-slot-bounds slot index)
       (when (not (eq type 't))
         (assert (typep old type))
         (assert (typep new type)))
-      (sys.int::cas (instance-access (mezzano.clos::fetch-up-to-date-instance-slots-and-layout object) loc index) old new))))
+      (sys.int::cas (instance-access storage loc index) old new))))
 
 (defun structure-object-class (object)
   "If OBJECT is a structure object, return the object's class. Otherwise return NIL."
@@ -237,6 +246,23 @@
   "Test if OBJECT's current storage is compatible with LAYOUT."
   (declare (optimize (speed 3) (safety 0) (debug 0)))
   (structure-layout-match-p object layout nil))
+
+(defun sys.int::structure-storage-layout-compatible-p (storage layout)
+  "Test physical STORAGE without allowing GC to substitute another layout."
+  (declare (optimize (speed 3) (safety 0) (debug 0)))
+  (when (and (sys.int::%value-has-tag-p storage sys.int::+tag-instance-storage+)
+             ;; The caller has checked only the pointer tag, not the object type.
+             (eql (logand (sys.int::%storage-ref-unsigned-byte-8-unscaled storage -8)
+                          (ash (1- (ash 1 sys.int::+object-type-size+))
+                               sys.int::+object-type-shift+))
+                  (ash sys.int::+object-tag-instance+ sys.int::+object-type-shift+)))
+    (let ((actual (sys.int::%storage-layout storage)))
+      (unless (sys.int::layout-new-instance actual)
+        (loop with compatible of-type simple-vector = (sys.int::layout-compatible actual)
+              for i of-type fixnum below (length compatible)
+              for candidate = (sys.int::%object-ref-t compatible i)
+              when (sys.int::layout-obsolete candidate) do (return nil)
+              when (eq candidate layout) do (return t))))))
 
 (defun sys.int::structure-layout-typep (object layout)
   "Test structure class membership, falling back only for a stale path."
