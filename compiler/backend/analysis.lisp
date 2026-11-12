@@ -67,38 +67,43 @@
 
 (defun compute-liveness (backend-function target)
   (let ((live-in (make-hash-table :test 'eq))
-        (live-in* (make-hash-table :test 'eq))
         (live-out (make-hash-table :test 'eq))
-        (live-out* (make-hash-table :test 'eq))
         (actual-successors (compute-actual-successors backend-function))
         (mv-regs (list* (mezzano.compiler.backend.register-allocator:target-count-register target)
                         (mezzano.compiler.backend.register-allocator:target-argument-registers target))))
     (multiple-value-bind (bb-inputs bb-outputs basic-blocks terminator-to-bb)
         (compute-basic-block-input-output-sets backend-function mv-regs)
-      ;; Iterate basic-blocks in reverse order, this distantly approximates
-      ;; a reverse post-order traversal of the CFG.
-      (setf basic-blocks (reverse basic-blocks))
-      ;; Iteratively solve for liveness over basic blocks.
-      ;; in[n] = use[n] U (out[n] - def[n])
-      ;; out[n] = union in[s] forall s in successors[n]
-      (loop
-         (dolist (inst basic-blocks)
-           (setf (gethash inst live-in*) (gethash inst live-in)
-                 (gethash inst live-out*) (gethash inst live-out))
-           (let ((uses (gethash inst bb-inputs))
-                 (defs (gethash inst bb-outputs)))
-             (setf (gethash inst live-out) '())
-             (dolist (succ (gethash inst actual-successors))
-               (setf (gethash inst live-out) (union (gethash inst live-out)
-                                                    (gethash succ live-in))))
-             (setf (gethash inst live-in) (union uses
-                                                 (set-difference (gethash inst live-out)
-                                                                 defs)))))
-         (when (dolist (inst basic-blocks t)
-                 (when (not (and (set-equal (gethash inst live-in) (gethash inst live-in*))
-                                 (set-equal (gethash inst live-out) (gethash inst live-out*))))
-                   (return nil)))
-           (return)))
+      ;; Visit blocks backwards initially, so straight-line control flow usually
+      ;; needs only one visit. After that, only revisit predecessors whose
+      ;; successor's live-in set grew. Include the additional NLX edges here.
+      (let ((predecessors (make-hash-table :test 'eq))
+            (pending (make-hash-table :test 'eq))
+            (worklist (reverse basic-blocks)))
+        (dolist (block basic-blocks)
+          (setf (gethash block pending) t)
+          (dolist (successor (gethash block actual-successors))
+            (pushnew block (gethash successor predecessors))))
+        ;; in[n] = use[n] U (out[n] - def[n])
+        ;; out[n] = union in[s] forall s in successors[n]
+        (loop while worklist
+              do (let* ((block (pop worklist))
+                        (old-in (gethash block live-in))
+                        (out '()))
+                   (setf (gethash block pending) nil)
+                   (dolist (successor (gethash block actual-successors))
+                     (setf out (union out (gethash successor live-in))))
+                   (let ((in (union (gethash block bb-inputs)
+                                    (set-difference out (gethash block bb-outputs)))))
+                     (setf (gethash block live-out) out
+                           (gethash block live-in) in)
+                     ;; Starting from empty sets, these monotone equations only
+                     ;; add registers. Cardinality therefore detects all changes
+                     ;; without the quadratic SET-EQUAL membership scans.
+                     (unless (= (length old-in) (length in))
+                       (dolist (predecessor (gethash block predecessors))
+                         (unless (gethash predecessor pending)
+                           (setf (gethash predecessor pending) t)
+                           (push predecessor worklist))))))))
       ;; Compute liveness for individual instructions.
       ;; This requires no iteration as control flow in a basic block is linear.
       (do-reversed-instructions (inst backend-function)
