@@ -353,15 +353,66 @@ Must be performed after SSA conversion."
       (remove-instruction backend-function inst))))
 
 (defun remove-unused-instructions (backend-function)
-  (loop
-     with total = 0
-     do (multiple-value-bind (uses defs)
-            (build-use/def-maps backend-function)
-          (declare (ignore defs))
-          (let ((n (remove-unused-instructions-1 backend-function uses)))
-            (incf total n)
-            (when (zerop n)
-              (return total))))))
+  ;; Most invocations have little or nothing to remove. Count uses first, then
+  ;; try one ordinary scan before paying for the reverse dependency maps.
+  ;; Count occurrences so retiring repeated inputs never scans a use list.
+  (let ((uses (make-hash-table :test 'eq))
+        (total 0)
+        (newly-unused nil))
+    (do-instructions (inst backend-function)
+      (dolist (input (instruction-inputs inst))
+        (when (typep input 'virtual-register)
+          (incf (gethash input uses 0)))))
+    (do* ((inst (first-instruction backend-function) next-inst)
+          (next-inst (and inst (next-instruction backend-function inst))
+                     (and inst (next-instruction backend-function inst))))
+         ((null inst))
+      (when (and (instruction-pure-p inst)
+                 (every (lambda (output)
+                          (and (typep output 'virtual-register)
+                               (zerop (gethash output uses 0))))
+                        (instruction-outputs inst)))
+        (remove-instruction backend-function inst)
+        (incf total)
+        (dolist (input (instruction-inputs inst))
+          (when (and (typep input 'virtual-register)
+                     (zerop (decf (gethash input uses))))
+            (setf newly-unused t)))))
+    ;; Without a newly unused input, the scan cannot have exposed more work.
+    (unless newly-unused
+      (return-from remove-unused-instructions total))
+    (let ((defs (make-hash-table :test 'eq))
+          (live-outputs (make-hash-table :test 'eq))
+          (worklist '()))
+      (do-instructions (inst backend-function)
+        (when (instruction-pure-p inst)
+          (let ((live 0))
+            (dolist (output (instruction-outputs inst))
+              (cond ((not (typep output 'virtual-register))
+                     ;; Physical registers and other outputs always keep an
+                     ;; instruction alive, just as in the scan-based pass.
+                     (incf live))
+                    ((plusp (gethash output uses 0))
+                     (incf live)
+                     ;; Keep every definition, including after SSA destruction.
+                     ;; Repeated outputs have matching entries and live counts.
+                     (push inst (gethash output defs)))))
+            (setf (gethash inst live-outputs) live)
+            (when (zerop live)
+              (push inst worklist)))))
+      (loop while worklist
+            for inst = (pop worklist)
+            do (remove-instruction backend-function inst)
+               (incf total)
+               (dolist (input (instruction-inputs inst))
+                 (when (and (typep input 'virtual-register)
+                            (zerop (decf (gethash input uses))))
+                   ;; A register becomes unused only once. Each output edge is
+                   ;; visited once, avoiding repeated scans of multi-output defs.
+                   (dolist (def (gethash input defs))
+                     (when (zerop (decf (gethash def live-outputs)))
+                       (push def worklist)))))))
+    total))
 
 (defun localize-constants (backend-function)
   "Copy constants to their point of use."
