@@ -273,6 +273,7 @@ structures to exist, and for memory to be allocated, but not much beyond that."
         most-positive-fixnum #.(- (expt 2 (- 64 +n-fixnum-bits+ 1)) 1)
         most-negative-fixnum #.(- (expt 2 (- 64 +n-fixnum-bits+ 1)))
         *gc-epoch* 0
+        *gc-last-major-epoch* 0
         *hash-table-unbound-value* (list "unbound hash-table entry")
         *hash-table-tombstone* (list "hash-table tombstone")
         *deferred-%defpackage-calls* '())

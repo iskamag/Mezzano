@@ -55,6 +55,9 @@
 
 (defglobal *gc-cycles* 0 "Number of collections performed.")
 (defglobal *gc-epoch* 0)
+(defglobal *gc-last-major-epoch* 0
+  "GC epoch of the last completed major collection. Unlike GC statistics,
+this monotonic validity token must not be reset by GC-RESET-STATS.")
 (defglobal *gc-time* 0.0 "Time in seconds taken by the GC so far.")
 
 (defun gc-reset-stats ()
@@ -2205,6 +2208,10 @@ Additionally update the card table offset fields and clear the mark bits."
   (when *gc-enable-logging*
     (gc-dump-area-state))
   (incf *gc-epoch*)
+  ;; The world is still stopped. Publish the major validity boundary before
+  ;; any mutator can resume and trust an old-generation hash-table placement.
+  (when force-major
+    (setf *gc-last-major-epoch* *gc-epoch*))
   (gc-log "GC complete")
   (mezzano.supervisor::set-gc-light nil))
 

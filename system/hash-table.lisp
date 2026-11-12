@@ -28,8 +28,10 @@
   (storage-epoch *gc-epoch*)
   (synchronized nil :read-only t)
   lock
-  ;; If true, then all keys are stable over GCs and no rehashing is required
-  ;; when the GC epoch changes.
+  ;; T and :MANDATORY mean all keys are stable over every GC.
+  ;; :OLD-GENERATION means a strong EQ/EQL table was rebuilt entirely from
+  ;; old-generation or fully invariant keys in one GC epoch. Minor collections
+  ;; cannot invalidate its placement, but a major collection can.
   (gc-invariant t)
   (weakness nil :read-only t :type (member nil :key :value :key-or-value :key-and-value)))
 
@@ -130,6 +132,16 @@
 (defun hash-table-enforce-gc-invariant-keys (hash-table)
   (eql (hash-table-gc-invariant hash-table) :mandatory))
 
+(defun object-hash-minor-gc-invariant-p (object test)
+  ;; Only EQ/EQL are eligible. An old EQUAL cons, for example, can contain a
+  ;; young object whose address participates recursively in its hash.
+  (or (object-hash-gc-invariant-under-test object test)
+      (let* ((address (lisp-object-address object))
+             (tag (ldb +address-tag+ address)))
+        (and (or (eql tag +address-tag-general+)
+                 (eql tag +address-tag-cons+))
+             (logtest address +address-old-generation+)))))
+
 (defmacro with-hash-table-lock ((hash-table) &body body)
   (let ((sym (gensym)))
     `(let ((,sym ,hash-table))
@@ -144,7 +156,8 @@
              (doit))))))
 
 ;;; Unsynchronized hash-tables are safe for use with concurrent readers
-;;; as long as they only contains gc-invariant keys.
+;;; as long as they only contain fully GC-invariant keys. The old-generation
+;;; optimization does not extend this concurrent-reader guarantee.
 (defun make-hash-table (&key (test 'eql) (size 128) (rehash-size 2.5) (rehash-threshold 0.5) synchronized enforce-gc-invariant-keys weakness)
   ;; Canonicalize and check the test function
   (cond ((eql test #'eq) (setf test 'eq))
@@ -214,7 +227,10 @@
     (when (eql (hash-table-gc-invariant hash-table) :mandatory)
       (error "Hash-table key ~S is not gc-invariant under hash-table test ~S"
              key (hash-table-test hash-table)))
-    ;; Hash table is no longer invariant.
+    ;; Be conservative even if KEY is currently old. A collection between
+    ;; finding its insertion slot and inspecting KEY might have promoted it,
+    ;; leaving that slot computed from its previous young-generation address.
+    ;; Only a complete, epoch-checked rehash establishes :OLD-GENERATION.
     (setf (hash-table-gc-invariant hash-table) nil)))
 
 (defun gethash (key hash-table &optional default)
@@ -249,7 +265,7 @@
     (setf (hash-table-%count hash-table) 0
           (hash-table-used hash-table) 0
           ;; Make sure to preserve :MANDATORY.
-          (hash-table-gc-invariant hash-table) (or (hash-table-gc-invariant hash-table) t)
+          (hash-table-gc-invariant hash-table) (if (hash-table-enforce-gc-invariant-keys hash-table) :mandatory t)
           (hash-table-storage hash-table) (make-array (length (hash-table-storage hash-table))
                                                       :initial-element *hash-table-unbound-value*))
     hash-table))
@@ -485,14 +501,19 @@ The second return value is the first available/empty slot in the hash-table for 
 Requires at least one completely unbound slot to terminate."
          (declare (optimize speed (safety 0))
                   (type hash-table hash-table))
-         (if (hash-table-gc-invariant hash-table)
+         (if (member (hash-table-gc-invariant hash-table) '(t :mandatory))
              (,find-hash-table-slot-1 key hash-table)
              (loop
-               (let ((epoch *gc-epoch*))
+               (let ((epoch *gc-epoch*)
+                     (major-epoch *gc-last-major-epoch*)
+                     (old-generation-p (eq (hash-table-gc-invariant hash-table) :old-generation)))
                  (multiple-value-bind (offset free-slot)
                      (,find-hash-table-slot-1 key hash-table)
-                   (when (and (eql epoch *gc-epoch*)
-                              (eql (hash-table-storage-epoch hash-table) *gc-epoch*))
+                   (when (if old-generation-p
+                             (and (>= (hash-table-storage-epoch hash-table) major-epoch)
+                                  (eql major-epoch *gc-last-major-epoch*))
+                             (and (eql epoch *gc-epoch*)
+                                  (eql (hash-table-storage-epoch hash-table) *gc-epoch*)))
                      (return (values offset free-slot)))
                    (,hash-table-rehash hash-table nil))))))
        (defun ,hash-table-rehash (hash-table resize-p)
@@ -508,7 +529,9 @@ is below the rehash-threshold."
                                (if (floatp (hash-table-rehash-size hash-table))
                                    (ceiling (* old-size (hash-table-rehash-size hash-table)))
                                    (+ old-size (hash-table-rehash-size hash-table)))
-                               old-size))))
+                               old-size)))
+                ;; Weak tables retain their existing GC/dead-entry policy.
+                (minor-invariant-p ,(if weakp nil `(member (hash-table-test hash-table) '(eq eql)))))
            (setf (hash-table-storage hash-table) (make-array ,(if weakp
                                                                   'new-size
                                                                   '(* new-size 2))
@@ -516,9 +539,9 @@ is below the rehash-threshold."
                  (hash-table-%count hash-table) 0
                  (hash-table-used hash-table) 0
                  ;; Make sure to preserve :MANDATORY.
-                 (hash-table-gc-invariant hash-table) (or (hash-table-gc-invariant hash-table) t)
+                 (hash-table-gc-invariant hash-table) (if (hash-table-enforce-gc-invariant-keys hash-table) :mandatory t)
                  (hash-table-storage-epoch hash-table) *gc-epoch*)
-           (dotimes (i old-size hash-table)
+           (dotimes (i old-size)
              ,(if weakp
                   `(let ((entry (aref old-storage i)))
                      (unless (or (eq entry *hash-table-unbound-value*)
@@ -541,6 +564,9 @@ is below the rehash-threshold."
                          (value (aref old-storage (1+ (* i 2)))))
                      (unless (or (eq key *hash-table-unbound-value*)
                                  (eq key *hash-table-tombstone*))
+                       (when (and minor-invariant-p
+                                  (not (object-hash-minor-gc-invariant-p key (hash-table-test hash-table))))
+                         (setf minor-invariant-p nil))
                        (when (and (hash-table-gc-invariant hash-table)
                                   (not (object-hash-gc-invariant-under-test key (hash-table-test hash-table))))
                          ;; Hash table is no longer invariant.
@@ -552,7 +578,17 @@ is below the rehash-threshold."
                          (incf (hash-table-used hash-table))
                          (incf (hash-table-%count hash-table))
                          (setf (hash-table-key-at hash-table free-slot) key
-                               (hash-table-value-at hash-table free-slot) value)))))))))))
+                               (hash-table-value-at hash-table free-slot) value))))))
+           (when (and minor-invariant-p
+                      (null (hash-table-gc-invariant hash-table))
+                      (eql (hash-table-storage-epoch hash-table) *gc-epoch*))
+             ;; Every address-dependent key was already old at placement,
+             ;; without an intervening collection. A minor between this test
+             ;; and publication cannot move these keys. A major makes the
+             ;; placement epoch older than *GC-LAST-MAJOR-EPOCH*, so readers
+             ;; will reject it even if publication occurs after that GC.
+             (setf (hash-table-gc-invariant hash-table) :old-generation))
+           hash-table)))))
 
 (defmacro define-optimized-hash-table-functions (name test-fn hash-fn)
   `(progn
@@ -620,7 +656,13 @@ is below the rehash-threshold."
 
 (declaim (inline eq-hash))
 (defun eq-hash (object)
-  (lisp-object-address object))
+  ;; Heap pointers have four tag bits, so their low bits alone distribute
+  ;; poorly across the power-of-two hash-table sizes. Fold address bits into
+  ;; those bits without discarding the tags (or the low bits of immediates).
+  ;; This remains address-dependent: moving keys still use the GC-epoch
+  ;; rehash machinery, while immediate and pinned keys remain invariant.
+  (let ((address (lisp-object-address object)))
+    (logxor address (ash address -4))))
 
 (defun hash-bignum (bignum)
   (let ((n (logxor (%n-bignum-fragments bignum)
