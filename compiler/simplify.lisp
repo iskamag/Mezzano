@@ -1296,6 +1296,94 @@ First return value is a list of elements, second is the final dotted component (
                                          ',(ast-value slot-name))))
                   form struct))))))
 
+(defun unconstrained-scalar-struct-slot-p (struct-name slot-name)
+  (let ((slot (find-struct-slot struct-name slot-name)))
+    (and slot
+         (eq (mezzano.clos:slot-definition-type slot) t)
+         (null (mezzano.clos:structure-slot-definition-fixed-vector slot)))))
+
+(defun simplify-incf-struct-slot (form)
+  (change-made)
+  (destructuring-bind (object structure-name slot-name delta) (arguments form)
+    (let ((slot (find-struct-slot structure-name slot-name))
+          (struct (sys.int::get-structure-type (ast-value structure-name))))
+      (struct-access-ast
+       `(let ((obj ,object) (delta ,delta))
+          (if ,(if (and (sys.int::structure-layout-permanent-p struct)
+                        (match-optimize-settings form '((= safety 0) (= speed 3))))
+                   ''t
+                   (struct-type-test-form 'obj struct object))
+              ;; Bind the sum separately so both accesses are rewritten to
+              ;; physical storage. Addition may allocate a bignum; STORAGE
+              ;; remains a GC root across that call, retaining the selected slot.
+              (let ((new (call sys.int::binary-+
+                               ,(struct-slot-access-form slot 'obj nil) delta)))
+                ,(struct-slot-access-form slot 'obj 'setf 'new))
+              (notinline-call sys.int::%incf-struct-slot
+                              obj ,structure-name ,slot-name delta)))
+       form struct))))
+
+(defun struct-initialization-slots (form)
+  (let ((args (arguments form)))
+    (when (and (>= (length args) 4) (evenp (length args)))
+      (loop for pair on (cddr args) by #'cddr
+            for slot = (find-struct-slot (second args) (first pair))
+            ;; Limit batching to unconstrained scalar slots: user type tests
+            ;; must not redefine a class between a shared check and a store.
+            unless (and slot
+                        (eq (mezzano.clos:slot-definition-type slot) t)
+                        (null (mezzano.clos:structure-slot-definition-fixed-vector slot)))
+              do (return nil)
+            collect slot))))
+
+(defun simplify-initialize-struct-slots (form slots)
+  (change-made)
+  (let* ((args (arguments form))
+         (struct (sys.int::get-structure-type (ast-value (second args))))
+         (values (loop for pair on (cddr args) by #'cddr collect (gensym "VALUE"))))
+    (struct-access-ast
+     `(let ((obj ,(first args))
+            ,@(loop for pair on (cddr args) by #'cddr for value in values
+                    collect `(,value ,(second pair))))
+        (progn
+          (if ,(if (and (sys.int::structure-layout-permanent-p struct)
+                        (match-optimize-settings form '((= safety 0) (= speed 3))))
+                   ''t
+                   (struct-type-test-form 'obj struct (first args)))
+            (progn
+              ,@(loop for slot in slots for value in values
+                      collect (struct-slot-access-form slot 'obj 'setf value)))
+            (progn
+              ,@(loop for pair on (cddr args) by #'cddr for value in values
+                      collect `(notinline-call (setf sys.int::%struct-slot)
+                                               ,value obj ,(second args) ,(first pair)))))
+          obj))
+     form struct)))
+
+(defun simplify-allocate-struct (form class)
+  ;; Cross compilation can have a structure definition without a target layout
+  ;; object yet. In that case retain the existing known-class allocation path.
+  (when (match-optimize-settings form '((= safety 0) (= speed 3)))
+    (let ((layout (mezzano.clos:class-layout class)))
+      (when (and (ignore-errors (typep layout 'sys.int::layout))
+             (boundp 'mezzano.runtime::*structure-class-slot-storage-layout-location*)
+             (null (sys.int::layout-area layout))
+             (typep (sys.int::layout-heap-size layout) '(integer 0 #.most-positive-fixnum)))
+        (let ((offset (mezzano.runtime::location-offset-t
+                       mezzano.runtime::*structure-class-slot-storage-layout-location*))
+              (size (sys.int::layout-heap-size layout)))
+          ;; The class slot is mutable under redefinition. Guard the constants
+          ;; against its current layout, and use the ordinary current-layout
+          ;; allocator when an old compiled constructor is called afterwards.
+          (return-from simplify-allocate-struct
+            (ast `(let ((current-layout (call sys.int::%object-ref-t ',class ',offset)))
+                    (if (call eql current-layout ',layout)
+                        (call mezzano.runtime::%allocate-general-instance-known-size
+                              current-layout ',size)
+                        (call sys.int::%allocate-instance current-layout)))
+                 form))))))
+  (ast `(call mezzano.runtime::%allocate-struct-known-class ',class) form))
+
 (defun simplify-cas-struct-slot (form)
   (change-made)
   (destructuring-bind (old new object structure-name slot-name)
@@ -1934,6 +2022,16 @@ least one value."
           (= (length (arguments form)) 4)
           (find-struct-slot (third (arguments form)) (fourth (arguments form))))
      (simplify-setf-struct-slot form))
+    ((and (eq (name form) 'sys.int::%incf-struct-slot)
+          (local-inlining-permitted-p form)
+          (= (length (arguments form)) 4)
+          (unconstrained-scalar-struct-slot-p (second (arguments form))
+                                             (third (arguments form))))
+     (simplify-incf-struct-slot form))
+    ((and (eq (name form) 'sys.int::%initialize-struct-slots)
+          (local-inlining-permitted-p form)
+          (struct-initialization-slots form))
+     (simplify-initialize-struct-slots form (struct-initialization-slots form)))
     ;; ((cas %struct-slot) old new s 'def 'slot) => fast-cas
     ((and (equal (name form) '(sys.int::cas sys.int::%struct-slot))
           (local-inlining-permitted-p form)
@@ -1991,8 +2089,8 @@ least one value."
           (symbolp (ast-value (first (arguments form))))
           (sys.int::get-structure-type (ast-value (first (arguments form))) nil))
      (change-made)
-     (ast `(call mezzano.runtime::%allocate-struct-known-class ',(sys.int::get-structure-type (ast-value (first (arguments form)))))
-          form))
+     (simplify-allocate-struct
+      form (sys.int::get-structure-type (ast-value (first (arguments form))))))
     ((and (eql (name form) 'mezzano.runtime::%fixnum-<)
           (local-inlining-permitted-p form)
           (= (length (arguments form)) 2)
