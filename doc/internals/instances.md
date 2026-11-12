@@ -53,10 +53,21 @@ slow path after their class changes; current constructors keep a fast check.
 Small standard keyword constructors are declared inline by default so known
 keyword calls can avoid building and scanning an argument list. A local
 `NOTINLINE` declaration still requests an ordinary call.
+At speed 3 and safety 0, allocation of a known general-area structure can
+compare its current layout with the compiled layout and use its constant heap
+size on a match. A mismatch allocates using the current layout, so an old
+compiled constructor remains valid after class redefinition.
 When compiling a separate file, an imported constructor expansion containing
 an uninterned version token remains a named call: serializing a copy of that
 token would break redefinition checks. Definitions in the current file can
 share their original token and still inline.
+Constructors whose scalar slots all have type `T` and whose values are bound
+before allocation initialize those slots with one physical-storage/layout
+check. The resulting storage reference remains rooted until all stores finish.
+Stale layouts fall back to the ordinary named setters. Constructors with typed
+slots, fixed vectors, or slot initforms evaluated after allocation retain
+per-slot initialization, preserving type checks and initform evaluation order.
+
 A sealed structure that includes an unsealed parent can still acquire a new
 layout when that parent changes, so its compiled accesses must check for an
 obsolete layout.
@@ -153,6 +164,17 @@ structures whose ancestry also has permanent layouts keep direct accesses;
 those allocations cannot be superseded through class redefinition. When an
 argument's type already proves that permanent layout, the compiler omits a
 redundant layout test while retaining the argument evaluation and assertions.
+
+The allocator uses the architecture-specific CPU accessor for its allocation
+counter. A local CPU has that concrete layout, so its guarded header comparison
+succeeds directly. Access through the generic CPU ancestor would instead need
+a compatibility-vector lookup on every read and write. Both paths retain the
+same obsolete-layout and physical-storage safeguards. The allocator's internal
+`%INCF-STRUCT-SLOT` operation shares one such check for its read/add/write. For
+unconstrained scalar slots, the physical reference remains rooted through
+numeric addition, including bignum allocation and GC. Typed slots and stale
+layouts use the ordinary named accessors. This operation is not atomic; class
+redefinition still requires users of the class to be quiescent.
 
 ## GC snapping
 

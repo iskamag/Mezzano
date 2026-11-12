@@ -258,6 +258,14 @@
 (defun (setf sys.int::%struct-slot) (value struct def slot-name)
   (setf (aref (cross-struct-data struct) (sys.int::structure-slot-index def slot-name)) value))
 
+(defun sys.int::%incf-struct-slot (struct definition slot-name delta)
+  (incf (sys.int::%struct-slot struct definition slot-name) delta))
+
+(defun sys.int::%initialize-struct-slots (struct definition &rest names-and-values)
+  (loop for (name value) on names-and-values by #'cddr
+        do (setf (sys.int::%struct-slot struct definition name) value))
+  struct)
+
 (defun sys.int::get-structure-type (name &optional (errorp t))
   (or (gethash name *structure-types*)
       (and errorp

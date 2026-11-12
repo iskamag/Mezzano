@@ -57,6 +57,21 @@
         (assert (typep value type)))
       (setf (instance-access storage loc) value))))
 
+(defun sys.int::%incf-struct-slot (object class-name slot-name delta)
+  ;; A non-atomic numeric read/modify/write. The compiler can share a physical
+  ;; storage snapshot for unconstrained scalar slots. Like other structure
+  ;; accesses, this requires users of the class to be quiescent on redefinition.
+  (incf (sys.int::%struct-slot object class-name slot-name) delta))
+
+(defun sys.int::%initialize-struct-slots (object class-name &rest names-and-values)
+  ;; Internal constructor operation: OBJECT is fresh and unpublished, and
+  ;; every value has already been evaluated. Keep the ordinary named setters
+  ;; as the fallback for obsolete constructor expansions and layouts.
+  (declare (dynamic-extent names-and-values))
+  (loop for (name value) on names-and-values by #'cddr
+        do (setf (sys.int::%struct-slot object class-name name) value))
+  object)
+
 (defun (sys.int::cas sys.int::%struct-slot) (old new object class-name slot-name)
   (let ((class (sys.int::get-structure-type class-name)))
     (when (not (sys.int::structure-type-p object class))
