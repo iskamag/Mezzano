@@ -464,16 +464,75 @@
     (and (<= new-bump sys.int::*general-area-young-gen-limit*)
          old-bump)))
 
+(sys.int::defglobal *prefault-general-tlabs* t)
+
+;; COLD-ARRAY-INITIALIZATION allocates before INITIALIZE-LISP replays the
+;; toplevel DEFGLOBAL initializers, so this symbol is still unbound in the
+;; first TLAB refills. Skip prefaulting until it is bound.
+(declaim (inline prefault-general-tlabs-p))
+(defun prefault-general-tlabs-p ()
+  (and (boundp '*prefault-general-tlabs*)
+       *prefault-general-tlabs*))
+
+(defun %prefault-general-tlab (thread bump limit space)
+  ;; Avoid speculative work when physical memory is already scarce. This is
+  ;; only an admission heuristic: other threads may allocate concurrently.
+  ;; Ordinary faults handle any part of the TLAB that was not prepared.
+  (multiple-value-bind (free-pages total-pages)
+      (mezzano.supervisor:physical-memory-statistics)
+    (when (< free-pages (+ (truncate (* sys.int::+tlab-size+ 8) #x1000)
+                           (max 512 (truncate total-pages 32))))
+      (return-from %prefault-general-tlab nil)))
+  (let ((base (logior bump space
+                      (ash sys.int::+address-tag-general+ sys.int::+address-tag-shift+))))
+    ;; Keep the stop-the-world delay bounded. GC may run between chunks, so
+    ;; revalidate the TLAB and semispace before using its raw address again.
+    ;; Leave the first page to ordinary demand paging. The fast path below is
+    ;; nonblocking; a missing page-table leaf or frame simply ends prefetch.
+    (loop for page from 1 below (truncate (* sys.int::+tlab-size+ 8) #x1000) by 16
+          for start = (+ base (* page #x1000))
+          for end = (+ base (* (min (truncate (* sys.int::+tlab-size+ 8) #x1000)
+                                    (+ page 16)) #x1000))
+          for ok = (mezzano.supervisor:with-pseudo-atomic
+                     (when (and (eql space sys.int::*young-gen-newspace-bit*)
+                                (eql bump (mezzano.supervisor::thread-tlab-bump thread))
+                                (eql limit (mezzano.supervisor::thread-tlab-limit thread)))
+                       (mezzano.supervisor::safe-without-interrupts (start end)
+                         (loop for address from start below end by #x1000
+                               always (mezzano.supervisor::wait-for-page-fast-path address nil)))))
+          unless ok do (return))))
+
 (defun %get-new-tlab (words)
   (when (or (zerop sys.int::*general-area-young-gen-bump*)
             (> words sys.int::+tlab-object-size-limit+))
     (return-from %get-new-tlab nil))
-  (let ((result (%do-get-new-tlab)))
-    (when result
-      (let ((thread (mezzano.supervisor::current-thread))
-            (limit (+ result (* sys.int::+tlab-size+ 8))))
-        (setf (mezzano.supervisor::thread-tlab-bump thread) result
-              (mezzano.supervisor::thread-tlab-limit thread) limit)
+  ;; Entering pseudo-atomic a second time can deadlock against a pending world
+  ;; stop. Preserve the existing refill behavior and skip prefetch in that case.
+  (when mezzano.supervisor::*pseudo-atomic*
+    (let ((result (%do-get-new-tlab)))
+      (return-from %get-new-tlab
+        (when result
+          (let ((thread (mezzano.supervisor:current-thread)))
+            (setf (mezzano.supervisor::thread-tlab-bump thread) result
+                  (mezzano.supervisor::thread-tlab-limit thread)
+                  (+ result (* sys.int::+tlab-size+ 8)))
+            t)))))
+  (mezzano.supervisor:without-footholds
+    (let ((thread (mezzano.supervisor:current-thread))
+          (result nil) (limit nil) (space nil) (previous-limit nil))
+      (mezzano.supervisor:with-pseudo-atomic
+        (setf previous-limit (mezzano.supervisor::thread-tlab-limit thread)
+              result (%do-get-new-tlab))
+        (when result
+          (setf limit (+ result (* sys.int::+tlab-size+ 8))
+                space sys.int::*young-gen-newspace-bit*
+                (mezzano.supervisor::thread-tlab-bump thread) result
+                (mezzano.supervisor::thread-tlab-limit thread) limit)))
+      (when result
+        ;; A thread that exhausted a prior TLAB has demonstrated sustained
+        ;; allocation. Avoid faulting in 2 MiB for short-lived threads.
+        (when (and (prefault-general-tlabs-p) (plusp previous-limit))
+          (%prefault-general-tlab thread result limit space))
         t))))
 
 (defun %slow-allocate-from-general-area (tag data words)
@@ -523,6 +582,8 @@
        (sys.int::%gc :reason :general :full (not (eql gc-count 1)))
        (go OUTER-LOOP))))
 
+;; Keep the expansion available for explicit, narrowly scoped inlining.
+(declaim (sys.int::maybe-inline %allocate-object))
 (defun %allocate-object (tag data size area)
   (declare (optimize (speed 3) (safety 0) (debug 0)))
   (when sys.int::*gc-in-progress*
@@ -534,8 +595,14 @@
     (let ((bytes (* words 8))
           (local-cpu (mezzano.supervisor::local-cpu)))
       (declare (type mezzano.supervisor::cpu local-cpu))
-      (incf (mezzano.supervisor::cpu-bytes-consed local-cpu)
-            bytes)
+      ;; Match the concrete CPU layout and share one checked physical storage
+      ;; snapshot for the read/add/write. The counter remains a general integer.
+      (sys.int::%incf-struct-slot
+       local-cpu
+       '#+x86-64 mezzano.supervisor::x86-64-cpu
+        #+arm64 mezzano.supervisor::arm64-cpu
+        #-(or x86-64 arm64) mezzano.supervisor::cpu
+       'mezzano.supervisor::bytes-consed bytes)
       (incf (mezzano.supervisor:thread-bytes-consed
              (mezzano.supervisor:current-thread))
             bytes))
@@ -861,6 +928,15 @@
                     (sys.int::lisp-object-address layout)
                     (sys.int::layout-heap-size layout)
                     (sys.int::layout-area layout)))
+
+;; SIZE is guarded by the caller's check of the current layout. Making it a
+;; constant at that call site also makes the aligned allocation size constant.
+(declaim (inline %allocate-general-instance-known-size))
+(defun %allocate-general-instance-known-size (layout size)
+  (declare (inline %allocate-object))
+  (%allocate-object sys.int::+object-tag-instance+
+                    (sys.int::lisp-object-address layout)
+                    size nil))
 
 (declaim (special sys.int::*funcallable-instance-trampoline*))
 

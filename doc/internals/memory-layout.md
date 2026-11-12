@@ -64,6 +64,20 @@ Cons buffers contain absolute, untagged virtual addresses in unboxed 64-bit
 slots, excluded from the thread's GC pointer layout. Both pairs initially
 contain zero.
 
+For sustained general allocation, refill can prepare the new buffer's pages
+through the nonblocking pager fast path. It skips a thread's first buffer and
+does not speculate when physical memory is already scarce. The free-memory
+check is a heuristic, not a reservation against concurrent allocators. The
+first page remains demand-paged; a missing page-table leaf or unavailable
+frame stops preparation and ordinary faults handle the rest.
+
+Reservation and publication are pseudo-atomic. Preparation uses separate
+16-page pseudo-atomic chunks, rechecking the thread's bump, limit, and young
+semispace each time. GC can invalidate the buffer between chunks. An already
+pseudo-atomic caller uses the ordinary refill path without prefetching, avoiding
+a nested entry behind a pending world stop. Footholds are inhibited across
+refill so an injected allocation cannot change the buffer being prepared.
+
 Cons buffers reserve 64 KiB (4096 conses) at a time. The slow path reserves a
 buffer from the global cons bump pointer under the allocator mutex, with
 footholds inhibited and pseudo-atomic execution covering both reservation and
@@ -77,8 +91,9 @@ aligned raw address which looks like a fixnum to the register walker, including
 when it points just past an exhausted buffer. Only an in-bounds address receives
 the cons tag. The current semispace is already part of the buffer address. The backing memory is zero-filled, so the cons is valid
 before its CAR and CDR are initialized outside the restart region.
-The x86-64 fast paths issue `PREFETCHNTA` at the next bump address, as the
-general-object allocator does.
+The x86-64 cons fast paths issue `PREFETCHNTA` at the next bump address. The
+general-object allocator also issues `PREFETCHNTA`, but its operand is the
+next bump as a byte offset, without the address tag or semispace bit.
 
 Before converting a full thread save to an interrupt frame for a foothold or
 pager call, the supervisor also rewinds wired restart regions, locating
